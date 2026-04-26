@@ -1,3 +1,30 @@
-.venv/
+# Byte-compiled / optimized / DLL files
 __pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables and local secrets
+.env
+.envrc
+.streamlit/secrets.toml
+
+# macOS
 .DS_Store
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Test / cache output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
