@@ -147,44 +147,64 @@ def main() -> None:
     st.caption("Electrochemistry data analysis + research communication assistant")
 
     st.markdown(
-        "Upload a CSV file containing potential and current/current-density data. "
+        "Upload one or more CSV files containing potential and current/current-density data. "
         "This MVP estimates the operational ESW using a user-defined current-density threshold."
     )
 
-    uploaded_file = st.file_uploader("Upload electrochemistry CSV", type=["csv"])
+    uploaded_files = st.file_uploader(
+        "Upload electrochemistry CSV files",
+        type=["csv"],
+        accept_multiple_files=True,
+    )
 
-    if uploaded_file is None:
-        st.info("Upload a CSV file to begin.")
+    if not uploaded_files:
+        st.info("Upload one or more CSV files to begin.")
         st.stop()
         return
 
-    try:
-        df = pd.read_csv(uploaded_file)
-    except Exception as exc:
-        st.error(f"Could not read CSV file: {exc}")
-        st.stop()
-        return
+    datasets = []
+    for uploaded_file in uploaded_files:
+        try:
+            df = pd.read_csv(uploaded_file)
+        except Exception as exc:
+            st.error(f"Could not read {uploaded_file.name}: {exc}")
+            st.stop()
+            return
+
+        numeric_columns = df.select_dtypes(include=[np.number]).columns.tolist()
+        if len(numeric_columns) < 2:
+            st.error(f"{uploaded_file.name} must contain at least two numeric columns.")
+            st.stop()
+            return
+
+        datasets.append(
+            {
+                "file_name": uploaded_file.name,
+                "sample_name": uploaded_file.name.rsplit(".", 1)[0],
+                "df": df,
+                "numeric_columns": numeric_columns,
+            }
+        )
+
+    first_dataset = datasets[0]
+    numeric_columns = first_dataset["numeric_columns"]
 
     st.subheader("Raw data preview")
-    st.dataframe(df.head(20), use_container_width=True)
+    preview_name = st.selectbox(
+        "Preview file",
+        [dataset["file_name"] for dataset in datasets],
+    )
+    preview_df = next(dataset["df"] for dataset in datasets if dataset["file_name"] == preview_name)
+    st.dataframe(preview_df.head(20), use_container_width=True)
 
-    numeric_columns = df.select_dtypes(include=[np.number]).columns.tolist()
+    st.subheader("Column selection")
+    st.caption("For multi-file analysis, each uploaded CSV should use the same selected column names.")
 
-    if len(numeric_columns) < 2:
-        st.error("The CSV must contain at least two numeric columns.")
-        st.stop()
-        return
-
-    col1, col2, col3 = st.columns(3)
-
+    col1, col2 = st.columns(2)
     with col1:
         potential_col = st.selectbox("Potential column", numeric_columns)
-
     with col2:
         current_col = st.selectbox("Current or current-density column", numeric_columns)
-
-    with col3:
-        sample_name = st.text_input("Sample name", value="Sample 1")
 
     st.subheader("Current conversion")
     current_is_density = st.radio(
@@ -193,32 +213,20 @@ def main() -> None:
         horizontal=True,
     )
 
-    working = df[[potential_col, current_col]].dropna().copy()
-    potential = working[potential_col].to_numpy(dtype=float)
-    current_values = working[current_col].to_numpy(dtype=float)
-
-    if current_is_density == "Yes, already mA/cm^2":
-        current_density = current_values
-        y_label = "Current density (mA/cm^2)"
-    else:
-        area = st.number_input(
-            "Electrode geometric area (cm^2)",
-            min_value=0.000001,
-            value=1.0,
-            step=0.1,
-            format="%.6f",
-        )
-        current_unit = st.selectbox("Current unit in uploaded file", ["mA", "A", "uA"])
-
-        if current_unit == "A":
-            current_mA = current_values * 1000.0
-        elif current_unit == "uA":
-            current_mA = current_values / 1000.0
-        else:
-            current_mA = current_values
-
-        current_density = current_mA / area
-        y_label = "Current density (mA/cm^2)"
+    area = None
+    current_unit = None
+    if current_is_density == "No, convert current to mA/cm^2":
+        convert_col1, convert_col2 = st.columns(2)
+        with convert_col1:
+            area = st.number_input(
+                "Electrode geometric area (cm^2)",
+                min_value=0.000001,
+                value=1.0,
+                step=0.1,
+                format="%.6f",
+            )
+        with convert_col2:
+            current_unit = st.selectbox("Current unit in uploaded files", ["mA", "A", "uA"])
 
     threshold = st.number_input(
         "Threshold current density (mA/cm^2)",
@@ -228,82 +236,111 @@ def main() -> None:
         format="%.6f",
     )
 
-    result = calculate_esw(potential, current_density, threshold)
+    show_markers = st.checkbox("Show data markers", value=True)
+    trace_mode = "lines+markers" if show_markers else "lines"
 
     st.subheader("Plot")
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=potential,
-            y=current_density,
-            mode="lines+markers",
-            name=sample_name,
+    results = []
+    interpretations = []
+
+    for dataset in datasets:
+        df = dataset["df"]
+        file_name = dataset["file_name"]
+        sample_name = dataset["sample_name"]
+
+        missing_columns = [col for col in [potential_col, current_col] if col not in df.columns]
+        if missing_columns:
+            st.warning(
+                f"Skipping {file_name} because it is missing: {', '.join(missing_columns)}"
+            )
+            continue
+
+        working = df[[potential_col, current_col]].dropna().copy()
+        if working.empty:
+            st.warning(f"Skipping {file_name} because the selected columns have no usable rows.")
+            continue
+
+        potential = working[potential_col].to_numpy(dtype=float)
+        current_values = working[current_col].to_numpy(dtype=float)
+
+        if current_is_density == "Yes, already mA/cm^2":
+            current_density = current_values
+        else:
+            if current_unit == "A":
+                current_mA = current_values * 1000.0
+            elif current_unit == "uA":
+                current_mA = current_values / 1000.0
+            else:
+                current_mA = current_values
+            current_density = current_mA / area
+
+        result = calculate_esw(potential, current_density, threshold)
+        interpretation = build_interpretation(sample_name, threshold, result)
+
+        fig.add_trace(
+            go.Scatter(
+                x=potential,
+                y=current_density,
+                mode=trace_mode,
+                name=sample_name,
+            )
         )
-    )
+
+        results.append(
+            {
+                "sample_name": sample_name,
+                "file_name": file_name,
+                "threshold_mA_cm2": threshold,
+                "cathodic_limit_V": result.cathodic_limit,
+                "anodic_limit_V": result.anodic_limit,
+                "operational_ESW_V": result.esw,
+                "interpretation": interpretation,
+            }
+        )
+        interpretations.append((sample_name, interpretation))
+
+    if not results:
+        st.error("No uploaded files could be analyzed with the selected settings.")
+        st.stop()
+        return
+
     fig.add_hline(y=threshold, line_dash="dash", annotation_text=f"+{threshold:g} mA/cm^2")
     fig.add_hline(y=-threshold, line_dash="dash", annotation_text=f"-{threshold:g} mA/cm^2")
-
-    if result.anodic_limit is not None:
-        fig.add_vline(
-            x=result.anodic_limit,
-            line_dash="dot",
-            annotation_text=f"Anodic: {result.anodic_limit:.3f} V",
-        )
-
-    if result.cathodic_limit is not None:
-        fig.add_vline(
-            x=result.cathodic_limit,
-            line_dash="dot",
-            annotation_text=f"Cathodic: {result.cathodic_limit:.3f} V",
-        )
-
     fig.update_layout(
         xaxis_title=f"Potential ({potential_col})",
-        yaxis_title=y_label,
+        yaxis_title="Current density (mA/cm^2)",
         template="plotly_white",
         height=550,
+        legend_title_text="Sample",
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Calculated ESW")
-    metric_cols = st.columns(3)
-    metric_cols[0].metric(
-        "Cathodic limit",
-        "Not found" if result.cathodic_limit is None else f"{result.cathodic_limit:.3f} V",
-    )
-    metric_cols[1].metric(
-        "Anodic limit",
-        "Not found" if result.anodic_limit is None else f"{result.anodic_limit:.3f} V",
-    )
-    metric_cols[2].metric(
-        "Operational ESW",
-        "Not found" if result.esw is None else f"{result.esw:.3f} V",
+    plot_html = fig.to_html(full_html=True, include_plotlyjs="cdn")
+    st.download_button(
+        "Download plot as HTML",
+        data=plot_html,
+        file_name="voltscope_esw_plot.html",
+        mime="text/html",
     )
 
-    st.subheader("Generated interpretation")
-    interpretation = build_interpretation(sample_name, threshold, result)
-    st.write(interpretation)
-
-    export_df = pd.DataFrame(
-        {
-            "sample_name": [sample_name],
-            "threshold_mA_cm2": [threshold],
-            "cathodic_limit_V": [result.cathodic_limit],
-            "anodic_limit_V": [result.anodic_limit],
-            "operational_ESW_V": [result.esw],
-            "interpretation": [interpretation],
-        }
-    )
+    st.subheader("ESW comparison table")
+    results_df = pd.DataFrame(results)
+    st.dataframe(results_df, use_container_width=True)
 
     csv_buffer = io.StringIO()
-    export_df.to_csv(csv_buffer, index=False)
-
+    results_df.to_csv(csv_buffer, index=False)
     st.download_button(
-        "Download ESW results as CSV",
+        "Download ESW comparison as CSV",
         data=csv_buffer.getvalue(),
-        file_name="voltscope_esw_results.csv",
+        file_name="voltscope_esw_comparison.csv",
         mime="text/csv",
     )
+
+    st.subheader("Generated interpretations")
+    for sample_name, interpretation in interpretations:
+        st.markdown(f"**{sample_name}**")
+        st.write(interpretation)
 
 
 if __name__ == "__main__":
