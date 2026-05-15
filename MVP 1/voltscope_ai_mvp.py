@@ -19,8 +19,10 @@ Run locally:
 """
 
 import io
+import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -31,6 +33,7 @@ import streamlit as st
 
 POTENTIAL_UNITS_TO_V = {"V": 1.0, "mV": 1e-3}
 CURRENT_UNITS_TO_A = {"A": 1.0, "mA": 1e-3, "uA": 1e-6, "nA": 1e-9}
+WORKSPACE_STORE_PATH = Path(__file__).with_name("voltscope_project_workspaces.json")
 
 
 @dataclass
@@ -855,21 +858,130 @@ def metrics_table(metrics: dict[str, Optional[float]], display_unit: str) -> pd.
 # ---------- Streamlit UI ----------
 
 
+def load_project_workspaces() -> dict[str, dict[str, Any]]:
+    if not WORKSPACE_STORE_PATH.exists():
+        return {}
+
+    try:
+        with WORKSPACE_STORE_PATH.open("r", encoding="utf-8") as file:
+            stored = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    workspaces: dict[str, dict[str, Any]] = {}
+    for project_name, workspace in stored.items():
+        if not isinstance(workspace, dict):
+            continue
+        workspaces[project_name] = {
+            "analyses": {},
+            "analysis_summaries": workspace.get("analysis_summaries", {}),
+            "notes": workspace.get("notes", {}),
+        }
+    return workspaces
+
+
+def save_project_workspaces() -> None:
+    stored: dict[str, dict[str, Any]] = {}
+    for project_name, workspace in st.session_state.get("project_workspaces", {}).items():
+        stored[project_name] = {
+            "analysis_summaries": workspace.get("analysis_summaries", {}),
+            "notes": workspace.get("notes", {}),
+        }
+
+    try:
+        with WORKSPACE_STORE_PATH.open("w", encoding="utf-8") as file:
+            json.dump(stored, file, indent=2)
+    except OSError as exc:
+        st.warning(f"Could not save project workspace data: {exc}")
+
+
 def get_project_workspace(project_name: str) -> dict[str, Any]:
     if "project_workspaces" not in st.session_state:
-        st.session_state.project_workspaces = {}
+        st.session_state.project_workspaces = load_project_workspaces()
 
     workspaces = st.session_state.project_workspaces
     if project_name not in workspaces:
-        workspaces[project_name] = {"analyses": {}, "notes": {}}
+        workspaces[project_name] = {"analyses": {}, "analysis_summaries": {}, "notes": {}}
+        save_project_workspaces()
 
     return workspaces[project_name]
 
 
+def summarize_analysis(dataset: AnalyzedDataset) -> dict[str, Any]:
+    potential = dataset.potential_v[np.isfinite(dataset.potential_v)]
+    current = dataset.raw_current_a[np.isfinite(dataset.raw_current_a)]
+    return {
+        "filename": dataset.filename,
+        "sample_name": dataset.sample_name,
+        "potential_col": dataset.potential_col,
+        "current_col": dataset.current_col,
+        "potential_unit": dataset.potential_unit,
+        "current_unit": dataset.current_unit,
+        "points": int(len(dataset.potential_v)),
+        "potential_min_v": float(np.min(potential)) if potential.size else None,
+        "potential_max_v": float(np.max(potential)) if potential.size else None,
+        "current_min_a": float(np.min(current)) if current.size else None,
+        "current_max_a": float(np.max(current)) if current.size else None,
+        "warnings": dataset.warnings,
+    }
+
+
 def store_project_analyses(project_workspace: dict[str, Any], analyzed: list[AnalyzedDataset]) -> None:
     analyses = project_workspace.setdefault("analyses", {})
+    analysis_summaries = project_workspace.setdefault("analysis_summaries", {})
     for dataset in analyzed:
         analyses[dataset.filename] = dataset
+        analysis_summaries[dataset.filename] = summarize_analysis(dataset)
+    save_project_workspaces()
+
+
+def project_file_names(project_workspace: dict[str, Any]) -> list[str]:
+    filenames = set(project_workspace.get("analysis_summaries", {}).keys())
+    filenames.update(project_workspace.get("analyses", {}).keys())
+    filenames.update(project_workspace.get("notes", {}).keys())
+    return sorted(filenames)
+
+
+def project_summary_dataframe(project_workspace: dict[str, Any]) -> pd.DataFrame:
+    summaries = project_workspace.get("analysis_summaries", {})
+    rows = []
+    for filename in project_file_names(project_workspace):
+        summary = summaries.get(filename, {})
+        rows.append(
+            {
+                "file": filename,
+                "sample": summary.get("sample_name", ""),
+                "points": summary.get("points", ""),
+                "potential_range_V": (
+                    f"{summary.get('potential_min_v'):.4g} to {summary.get('potential_max_v'):.4g}"
+                    if summary.get("potential_min_v") is not None and summary.get("potential_max_v") is not None
+                    else ""
+                ),
+                "current_range_A": (
+                    f"{summary.get('current_min_a'):.4g} to {summary.get('current_max_a'):.4g}"
+                    if summary.get("current_min_a") is not None and summary.get("current_max_a") is not None
+                    else ""
+                ),
+                "notes": "yes" if project_workspace.get("notes", {}).get(filename) else "",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def render_project_notebook(project_name: str, project_workspace: dict[str, Any], selected_filename: str) -> None:
+    st.subheader("Project notebook")
+    st.caption(f"Notes for {selected_filename} in {project_name}")
+    notes = project_workspace.setdefault("notes", {})
+    note_key = f"project_note::{project_name}::{selected_filename}"
+    if note_key not in st.session_state:
+        st.session_state[note_key] = notes.get(selected_filename, "")
+    notes[selected_filename] = st.text_area(
+        "File notes",
+        key=note_key,
+        height=180,
+        placeholder="Record observations, electrolyte details, electrode prep, follow-up steps, or interpretation notes.",
+    )
+    save_project_workspaces()
 
 
 def main() -> None:
@@ -878,18 +990,26 @@ def main() -> None:
     st.title("VoltScope AI MVP")
     st.caption("Cyclic voltammetry upload, plotting, peak detection, and baseline correction")
 
+    if "project_workspaces" not in st.session_state:
+        st.session_state.project_workspaces = load_project_workspaces()
+
     with st.sidebar:
         st.header("Project workspace")
-        project_name_input = st.text_input("Project name", value="Untitled project")
+        existing_projects = sorted(st.session_state.project_workspaces.keys())
+        default_project = existing_projects[0] if existing_projects else "Untitled project"
+        if existing_projects:
+            selected_project = st.selectbox("Open saved project", existing_projects)
+            default_project = selected_project
+        project_name_input = st.text_input("Project name", value=default_project)
         project_name = project_name_input.strip() or "Untitled project"
         project_workspace = get_project_workspace(project_name)
-        stored_files = sorted(project_workspace.get("analyses", {}).keys())
+        stored_files = project_file_names(project_workspace)
         st.caption(f"Active project: {project_name}")
         if stored_files:
-            st.write(f"Stored analyses: {len(stored_files)}")
+            st.write(f"Stored experiments: {len(stored_files)}")
             st.dataframe(pd.DataFrame({"file": stored_files}), use_container_width=True, hide_index=True)
         else:
-            st.write("No analyses stored in this project yet.")
+            st.write("No experiments stored in this project yet.")
 
     uploaded_files = st.file_uploader(
         "Upload CV data files",
@@ -898,7 +1018,12 @@ def main() -> None:
     )
 
     if not uploaded_files:
-        st.info("Upload one or more .csv, .txt, .tsv, or .dat files to begin.")
+        st.info("Upload one or more .csv, .txt, .tsv, or .dat files to analyze new experiments.")
+        if stored_files:
+            st.subheader("Saved project experiments")
+            st.dataframe(project_summary_dataframe(project_workspace), use_container_width=True, hide_index=True)
+            selected_saved_file = st.selectbox("Notebook file", stored_files)
+            render_project_notebook(project_name, project_workspace, selected_saved_file)
         st.stop()
         return
 
