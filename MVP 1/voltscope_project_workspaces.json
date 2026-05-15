@@ -1,0 +1,41 @@
+{
+  "Untitled project": {
+    "analysis_summaries": {},
+    "notes": {}
+  },
+  "LOL": {
+    "analysis_summaries": {
+      "voltscope_sample_B_narrower_window.csv": {
+        "filename": "voltscope_sample_B_narrower_window.csv",
+        "sample_name": "voltscope_sample_B_narrower_window",
+        "potential_col": "Potential_V",
+        "current_col": "CurrentDensity_mA_cm2",
+        "potential_unit": "V",
+        "current_unit": "mA",
+        "points": 101,
+        "potential_min_v": -2.5,
+        "potential_max_v": 2.5,
+        "current_min_a": -0.0006964,
+        "current_max_a": 0.0008004900000000001,
+        "warnings": []
+      },
+      "voltscope_sample_A_stable_electrolyte.csv": {
+        "filename": "voltscope_sample_A_stable_electrolyte.csv",
+        "sample_name": "voltscope_sample_A_stable_electrolyte",
+        "potential_col": "Potential_V",
+        "current_col": "CurrentDensity_mA_cm2",
+        "potential_unit": "V",
+        "current_unit": "mA",
+        "points": 101,
+        "potential_min_v": -2.5,
+        "potential_max_v": 2.5,
+        "current_min_a": -0.00069814,
+        "current_max_a": 0.00079846,
+        "warnings": []
+      }
+    },
+    "notes": {
+      "voltscope_sample_B_narrower_window.csv": "klfdmklasmdfklmsda\n\n"
+    }
+  }
+}
