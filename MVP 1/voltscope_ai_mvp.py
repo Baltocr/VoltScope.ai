@@ -19,9 +19,11 @@ Run locally:
 """
 
 import io
+import html
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -858,6 +860,93 @@ def metrics_table(metrics: dict[str, Optional[float]], display_unit: str) -> pd.
 # ---------- Streamlit UI ----------
 
 
+def now_timestamp() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def format_timestamp(timestamp: Optional[str]) -> str:
+    if not timestamp:
+        return ""
+    try:
+        return datetime.fromisoformat(timestamp).strftime("%b %d, %Y %I:%M %p")
+    except ValueError:
+        return timestamp
+
+
+def escape_html(value: Any) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def to_jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return to_jsonable(value.tolist())
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        value = float(value)
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    return value
+
+
+def dataframe_records(dataframe: pd.DataFrame) -> list[dict[str, Any]]:
+    return to_jsonable(dataframe.to_dict(orient="records"))
+
+
+def empty_project() -> dict[str, Any]:
+    timestamp = now_timestamp()
+    return {"created_at": timestamp, "last_opened_at": timestamp, "experiments": {}}
+
+
+def normalize_project_workspace(project_name: str, workspace: Any) -> dict[str, Any]:
+    if not isinstance(workspace, dict):
+        return empty_project()
+
+    if "experiments" in workspace:
+        workspace.setdefault("created_at", now_timestamp())
+        workspace.setdefault("last_opened_at", workspace["created_at"])
+        if not isinstance(workspace.get("experiments"), dict):
+            workspace["experiments"] = {}
+        for experiment in workspace["experiments"].values():
+            if not isinstance(experiment, dict):
+                continue
+            experiment.setdefault("created_at", now_timestamp())
+            experiment.setdefault("updated_at", experiment["created_at"])
+            experiment.setdefault("files", {})
+            experiment.setdefault("analysis_outputs", {})
+            experiment.setdefault("notes", "")
+        return workspace
+
+    timestamp = now_timestamp()
+    project = {"created_at": timestamp, "last_opened_at": timestamp, "experiments": {}}
+    summaries = workspace.get("analysis_summaries", {})
+    notes = workspace.get("notes", {})
+    legacy_filenames = sorted(set(summaries.keys()) | set(notes.keys()))
+
+    if legacy_filenames:
+        imported_notes = []
+        for filename in legacy_filenames:
+            if notes.get(filename):
+                imported_notes.append(f"## {filename}\n{notes[filename]}")
+        project["experiments"]["imported-files"] = {
+            "name": "Imported files",
+            "created_at": now_timestamp(),
+            "updated_at": now_timestamp(),
+            "files": {
+                filename: {"summary": summaries.get(filename, {}), "trace": {}, "metadata": {}}
+                for filename in legacy_filenames
+            },
+            "analysis_outputs": {},
+            "notes": "\n\n".join(imported_notes),
+        }
+
+    return project
+
+
 def load_project_workspaces() -> dict[str, dict[str, Any]]:
     if not WORKSPACE_STORE_PATH.exists():
         return {}
@@ -868,26 +957,14 @@ def load_project_workspaces() -> dict[str, dict[str, Any]]:
     except (OSError, json.JSONDecodeError):
         return {}
 
-    workspaces: dict[str, dict[str, Any]] = {}
-    for project_name, workspace in stored.items():
-        if not isinstance(workspace, dict):
-            continue
-        workspaces[project_name] = {
-            "analyses": {},
-            "analysis_summaries": workspace.get("analysis_summaries", {}),
-            "notes": workspace.get("notes", {}),
-        }
-    return workspaces
+    return {
+        project_name: normalize_project_workspace(project_name, workspace)
+        for project_name, workspace in stored.items()
+    }
 
 
 def save_project_workspaces() -> None:
-    stored: dict[str, dict[str, Any]] = {}
-    for project_name, workspace in st.session_state.get("project_workspaces", {}).items():
-        stored[project_name] = {
-            "analysis_summaries": workspace.get("analysis_summaries", {}),
-            "notes": workspace.get("notes", {}),
-        }
-
+    stored = to_jsonable(st.session_state.get("project_workspaces", {}))
     try:
         with WORKSPACE_STORE_PATH.open("w", encoding="utf-8") as file:
             json.dump(stored, file, indent=2)
@@ -898,13 +975,77 @@ def save_project_workspaces() -> None:
 def get_project_workspace(project_name: str) -> dict[str, Any]:
     if "project_workspaces" not in st.session_state:
         st.session_state.project_workspaces = load_project_workspaces()
+    else:
+        st.session_state.project_workspaces = {
+            project_name: normalize_project_workspace(project_name, workspace)
+            for project_name, workspace in st.session_state.project_workspaces.items()
+        }
 
     workspaces = st.session_state.project_workspaces
     if project_name not in workspaces:
-        workspaces[project_name] = {"analyses": {}, "analysis_summaries": {}, "notes": {}}
+        workspaces[project_name] = empty_project()
         save_project_workspaces()
 
     return workspaces[project_name]
+
+
+def slugify_name(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    return slug or "experiment"
+
+
+def create_experiment(project_workspace: dict[str, Any], experiment_name: str) -> str:
+    experiments = project_workspace.setdefault("experiments", {})
+    base_id = slugify_name(experiment_name)
+    experiment_id = base_id
+    suffix = 2
+    while experiment_id in experiments:
+        experiment_id = f"{base_id}-{suffix}"
+        suffix += 1
+
+    created_at = now_timestamp()
+    experiments[experiment_id] = {
+        "name": experiment_name.strip() or "Untitled experiment",
+        "created_at": created_at,
+        "updated_at": created_at,
+        "files": {},
+        "analysis_outputs": {},
+        "notes": "",
+    }
+    save_project_workspaces()
+    return experiment_id
+
+
+def clear_session_keys_containing(fragment: str) -> None:
+    for key in list(st.session_state.keys()):
+        if fragment in str(key):
+            st.session_state.pop(key, None)
+
+
+def delete_project(project_name: str) -> None:
+    st.session_state.get("project_workspaces", {}).pop(project_name, None)
+    if st.session_state.get("active_project_name") == project_name:
+        st.session_state.pop("active_project_name", None)
+    clear_session_keys_containing(f"::{project_name}")
+    clear_session_keys_containing(f"::{project_name}::")
+    save_project_workspaces()
+
+
+def delete_experiment(project_name: str, project_workspace: dict[str, Any], experiment_id: str) -> None:
+    project_workspace.get("experiments", {}).pop(experiment_id, None)
+    active_key = active_experiment_key(project_name)
+    if st.session_state.get(active_key) == experiment_id:
+        st.session_state.pop(active_key, None)
+    clear_session_keys_containing(f"::{project_name}::{experiment_id}")
+    save_project_workspaces()
+
+
+def experiment_options(project_workspace: dict[str, Any]) -> dict[str, str]:
+    experiments = project_workspace.get("experiments", {})
+    return {
+        f"{experiment.get('name', experiment_id)} · {format_timestamp(experiment.get('created_at'))}": experiment_id
+        for experiment_id, experiment in experiments.items()
+    }
 
 
 def summarize_analysis(dataset: AnalyzedDataset) -> dict[str, Any]:
@@ -926,105 +1067,580 @@ def summarize_analysis(dataset: AnalyzedDataset) -> dict[str, Any]:
     }
 
 
-def store_project_analyses(project_workspace: dict[str, Any], analyzed: list[AnalyzedDataset]) -> None:
-    analyses = project_workspace.setdefault("analyses", {})
-    analysis_summaries = project_workspace.setdefault("analysis_summaries", {})
+def serialize_analyzed_dataset(dataset: AnalyzedDataset) -> dict[str, Any]:
+    return {
+        "summary": summarize_analysis(dataset),
+        "metadata": dataset.metadata,
+        "warnings": dataset.warnings,
+        "trace": {
+            "potential_v": dataset.potential_v.tolist(),
+            "raw_current_a": dataset.raw_current_a.tolist(),
+            "smoothed_current_a": (
+                dataset.smoothed_current_a.tolist() if dataset.smoothed_current_a is not None else None
+            ),
+        },
+    }
+
+
+def store_experiment_analysis(
+    project_workspace: dict[str, Any],
+    experiment_id: str,
+    analyzed: list[AnalyzedDataset],
+    parser_summary_df: pd.DataFrame,
+    esw_df: pd.DataFrame,
+    peak_metric_df: pd.DataFrame,
+    compact_metrics_df: pd.DataFrame,
+    settings: dict[str, Any],
+) -> None:
+    experiment = project_workspace.setdefault("experiments", {}).setdefault(
+        experiment_id,
+        {
+            "name": "Untitled experiment",
+            "created_at": now_timestamp(),
+            "updated_at": now_timestamp(),
+            "files": {},
+            "analysis_outputs": {},
+            "notes": "",
+        },
+    )
+    files = experiment.setdefault("files", {})
     for dataset in analyzed:
-        analyses[dataset.filename] = dataset
-        analysis_summaries[dataset.filename] = summarize_analysis(dataset)
+        files[dataset.filename] = serialize_analyzed_dataset(dataset)
+
+    experiment["updated_at"] = now_timestamp()
+    experiment["analysis_outputs"] = {
+        "parser_summary": dataframe_records(parser_summary_df),
+        "esw_summary": dataframe_records(esw_df),
+        "peak_metrics": dataframe_records(peak_metric_df),
+        "compact_metrics": dataframe_records(compact_metrics_df),
+        "settings": settings,
+    }
     save_project_workspaces()
 
 
-def project_file_names(project_workspace: dict[str, Any]) -> list[str]:
-    filenames = set(project_workspace.get("analysis_summaries", {}).keys())
-    filenames.update(project_workspace.get("analyses", {}).keys())
-    filenames.update(project_workspace.get("notes", {}).keys())
-    return sorted(filenames)
-
-
-def project_summary_dataframe(project_workspace: dict[str, Any]) -> pd.DataFrame:
-    summaries = project_workspace.get("analysis_summaries", {})
+def experiments_dataframe(project_workspace: dict[str, Any]) -> pd.DataFrame:
     rows = []
-    for filename in project_file_names(project_workspace):
-        summary = summaries.get(filename, {})
+    for experiment_id, experiment in project_workspace.get("experiments", {}).items():
+        files = experiment.get("files", {})
         rows.append(
             {
-                "file": filename,
-                "sample": summary.get("sample_name", ""),
-                "points": summary.get("points", ""),
-                "potential_range_V": (
-                    f"{summary.get('potential_min_v'):.4g} to {summary.get('potential_max_v'):.4g}"
-                    if summary.get("potential_min_v") is not None and summary.get("potential_max_v") is not None
-                    else ""
-                ),
-                "current_range_A": (
-                    f"{summary.get('current_min_a'):.4g} to {summary.get('current_max_a'):.4g}"
-                    if summary.get("current_min_a") is not None and summary.get("current_max_a") is not None
-                    else ""
-                ),
-                "notes": "yes" if project_workspace.get("notes", {}).get(filename) else "",
+                "experiment": experiment.get("name", experiment_id),
+                "created": format_timestamp(experiment.get("created_at")),
+                "updated": format_timestamp(experiment.get("updated_at")),
+                "files": len(files),
+                "notes": "yes" if experiment.get("notes") else "",
             }
         )
     return pd.DataFrame(rows)
 
 
-def render_project_notebook(project_name: str, project_workspace: dict[str, Any], selected_filename: str) -> None:
-    st.subheader("Project notebook")
-    st.caption(f"Notes for {selected_filename} in {project_name}")
-    notes = project_workspace.setdefault("notes", {})
-    note_key = f"project_note::{project_name}::{selected_filename}"
+def render_experiment_notes(project_name: str, project_workspace: dict[str, Any], experiment_id: str) -> None:
+    experiment = project_workspace["experiments"][experiment_id]
+    st.subheader("Experiment notes")
+    st.caption(f"{experiment.get('name', experiment_id)} · {project_name}")
+    note_key = f"experiment_notes::{project_name}::{experiment_id}"
     if note_key not in st.session_state:
-        st.session_state[note_key] = notes.get(selected_filename, "")
-    notes[selected_filename] = st.text_area(
-        "File notes",
+        st.session_state[note_key] = experiment.get("notes", "")
+    experiment["notes"] = st.text_area(
+        "Notes and comments",
         key=note_key,
-        height=180,
-        placeholder="Record observations, electrolyte details, electrode prep, follow-up steps, or interpretation notes.",
+        height=190,
+        placeholder="Record observations, electrode prep, electrolyte details, interpretation, or follow-up steps.",
     )
+    experiment["updated_at"] = now_timestamp()
     save_project_workspaces()
+
+
+def apply_app_theme() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --ink: #0b0b0b;
+            --muted: #555555;
+            --line: #e6e6e6;
+            --panel: #ffffff;
+            --accent: #111111;
+            --accent-dark: #000000;
+            --shadow: rgba(0, 0, 0, 0.12);
+        }
+        .stApp {
+            background: #ffffff;
+            color: var(--ink);
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        h1, h2, h3, h4, p, label, span {
+            color: var(--ink);
+            letter-spacing: 0;
+        }
+        [data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #ffffff 0%, #f7f7f7 100%);
+            border-right: 1px solid #dedede;
+            box-shadow:
+                14px 0 34px rgba(0, 0, 0, 0.12),
+                inset -1px 0 0 rgba(255, 255, 255, 0.8);
+        }
+        div[data-testid="stMetric"],
+        .project-hero,
+        .workspace-card,
+        .experiment-card {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            box-shadow: 0 16px 36px var(--shadow), 0 2px 0 rgba(255,255,255,0.95) inset;
+        }
+        .project-hero {
+            padding: 2.6rem 2.8rem;
+            margin: 0.7rem 0 1.3rem;
+        }
+        .project-hero h1 {
+            font-size: clamp(2.1rem, 4vw, 4.8rem);
+            line-height: 0.98;
+            margin: 0.15rem 0 0.8rem;
+        }
+        .project-hero p {
+            color: var(--muted);
+            max-width: 760px;
+            font-size: 1.04rem;
+            line-height: 1.55;
+            margin: 0;
+        }
+        .eyebrow {
+            color: var(--muted);
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+        .workspace-card,
+        .experiment-card {
+            padding: 1.1rem 1.2rem;
+            margin: 0.6rem 0 1rem;
+        }
+        .workspace-card h3,
+        .experiment-card h3 {
+            margin: 0 0 0.35rem;
+        }
+        .workspace-card p,
+        .experiment-card p {
+            color: var(--muted);
+            margin: 0;
+        }
+        .home-action-label {
+            color: var(--muted);
+            font-size: 0.92rem;
+            margin: 0.3rem 0 1rem;
+        }
+        .stButton {
+            transition: transform 160ms ease, filter 160ms ease;
+        }
+        .stButton > button {
+            width: 100%;
+            min-height: 2.75rem;
+            border-radius: 10px;
+            border: 1px solid #d4d4d4;
+            background: #ffffff;
+            color: var(--ink);
+            font-weight: 700;
+            box-shadow: 0 7px 18px rgba(0, 0, 0, 0.08), 0 1px 0 rgba(255,255,255,0.9) inset;
+            transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease, background 160ms ease;
+        }
+        .stButton > button:hover {
+            transform: translateY(-3px) scale(1.01);
+            border-color: #111111;
+            box-shadow: 0 16px 30px rgba(0, 0, 0, 0.15), 0 1px 0 rgba(255,255,255,0.95) inset;
+            background: #ffffff;
+        }
+        .stButton > button[kind="primary"] {
+            background: #f2f2f2;
+            color: var(--ink);
+            border: 1px solid #111111;
+            box-shadow: 0 12px 26px rgba(0, 0, 0, 0.14), 0 1px 0 rgba(255,255,255,0.95) inset;
+        }
+        .stButton > button[kind="primary"] * {
+            color: var(--ink);
+        }
+        [data-testid="stFileUploader"],
+        div[data-baseweb="select"] > div,
+        textarea,
+        input {
+            transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+        }
+        [data-testid="stFileUploader"]:hover,
+        div[data-baseweb="select"] > div:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 26px rgba(0, 0, 0, 0.10);
+        }
+        textarea:focus,
+        input:focus {
+            box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.08);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def set_active_project(project_name: str) -> None:
+    st.session_state.active_project_name = project_name
+    st.session_state.pop("active_upload_experiment_id", None)
+    if "project_workspaces" in st.session_state and project_name in st.session_state.project_workspaces:
+        st.session_state.project_workspaces[project_name]["last_opened_at"] = now_timestamp()
+        save_project_workspaces()
+
+
+def sorted_project_names(workspaces: dict[str, dict[str, Any]]) -> list[str]:
+    return sorted(
+        workspaces,
+        key=lambda project_name: workspaces[project_name].get(
+            "last_opened_at",
+            workspaces[project_name].get("created_at", ""),
+        ),
+        reverse=True,
+    )
+
+
+def render_home_project_sidebar() -> None:
+    workspaces = st.session_state.project_workspaces
+
+    with st.sidebar:
+        st.header("Projects")
+        st.caption("Most recently opened")
+
+        if not workspaces:
+            st.write("No saved projects yet.")
+            return
+
+        for project_name in sorted_project_names(workspaces):
+            workspace = workspaces[project_name]
+            if st.button(
+                project_name,
+                key=f"home_open_project::{project_name}",
+            ):
+                set_active_project(project_name)
+                st.rerun()
+            st.caption(
+                f"{len(workspace.get('experiments', {}))} experiments · "
+                f"{format_timestamp(workspace.get('last_opened_at') or workspace.get('created_at'))}"
+            )
+
+        st.divider()
+        with st.expander("Delete project"):
+            selected_project = st.selectbox(
+                "Project",
+                sorted_project_names(workspaces),
+                key="home_delete_project_select",
+            )
+            st.warning(
+                "Deleting this project permanently removes its experiments, saved analyses, files, notes, and comments."
+            )
+            confirm_project_name = st.text_input(
+                f'Type "{selected_project}" to confirm',
+                key=f"home_delete_project_confirm::{selected_project}",
+            )
+            if st.button(
+                "Delete project permanently",
+                disabled=confirm_project_name != selected_project,
+                key=f"home_delete_project::{selected_project}",
+            ):
+                delete_project(selected_project)
+                st.rerun()
+
+
+def active_experiment_key(project_name: str) -> str:
+    return f"active_experiment_id::{project_name}"
+
+
+def set_active_experiment(project_name: str, experiment_id: str) -> None:
+    st.session_state[active_experiment_key(project_name)] = experiment_id
+
+
+def get_active_experiment_id(project_name: str, project_workspace: dict[str, Any]) -> Optional[str]:
+    experiment_id = st.session_state.get(active_experiment_key(project_name))
+    if experiment_id in project_workspace.get("experiments", {}):
+        return experiment_id
+    return None
+
+
+def render_project_sidebar(project_name: str, project_workspace: dict[str, Any]) -> Optional[str]:
+    experiments = project_workspace.get("experiments", {})
+
+    with st.sidebar:
+        st.header("Project")
+        st.write(project_name)
+        st.caption(f"{len(experiments)} experiments")
+        if st.button("Switch project", key="switch_project"):
+            st.session_state.pop("active_project_name", None)
+            st.rerun()
+
+        st.divider()
+        st.subheader("Experiments")
+        with st.expander("New experiment", expanded=not experiments):
+            default_name = f"Experiment {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            experiment_name = st.text_input(
+                "Experiment name",
+                value=default_name,
+                key=f"sidebar_new_experiment::{project_name}",
+            )
+            if st.button("Create", type="primary", key=f"create_experiment::{project_name}"):
+                cleaned_name = experiment_name.strip()
+                if cleaned_name:
+                    experiment_id = create_experiment(project_workspace, cleaned_name)
+                    set_active_experiment(project_name, experiment_id)
+                    st.rerun()
+                st.error("Enter an experiment name.")
+
+        active_experiment_id = get_active_experiment_id(project_name, project_workspace)
+        if not experiments:
+            st.caption("No experiments yet.")
+
+        for experiment_id, experiment in sorted(
+            experiments.items(),
+            key=lambda item: item[1].get("updated_at", item[1].get("created_at", "")),
+            reverse=True,
+        ):
+            experiment_name = experiment.get("name", experiment_id)
+            is_active = experiment_id == active_experiment_id
+            label = f"● {experiment_name}" if is_active else experiment_name
+            if st.button(
+                label,
+                key=f"open_experiment::{project_name}::{experiment_id}",
+                type="primary" if is_active else "secondary",
+            ):
+                set_active_experiment(project_name, experiment_id)
+                st.rerun()
+            st.caption(format_timestamp(experiment.get("updated_at") or experiment.get("created_at")))
+
+        st.divider()
+        with st.expander("Delete"):
+            if active_experiment_id in experiments:
+                active_experiment = experiments[active_experiment_id]
+                active_experiment_name = active_experiment.get("name", active_experiment_id)
+                st.warning(
+                    "Deleting this experiment permanently removes its uploaded files, saved analyses, notes, and comments."
+                )
+                confirm_experiment_name = st.text_input(
+                    f'Type "{active_experiment_name}" to delete the selected experiment',
+                    key=f"delete_experiment_confirm::{project_name}::{active_experiment_id}",
+                )
+                if st.button(
+                    "Delete selected experiment",
+                    disabled=confirm_experiment_name != active_experiment_name,
+                    key=f"delete_experiment::{project_name}::{active_experiment_id}",
+                ):
+                    delete_experiment(project_name, project_workspace, active_experiment_id)
+                    st.rerun()
+
+            st.warning(
+                "Deleting this project permanently removes every experiment, saved analysis, note, and comment in it."
+            )
+            confirm_project_name = st.text_input(
+                f'Type "{project_name}" to delete this project',
+                key=f"delete_active_project_confirm::{project_name}",
+            )
+            if st.button(
+                "Delete project",
+                disabled=confirm_project_name != project_name,
+                key=f"delete_active_project::{project_name}",
+            ):
+                delete_project(project_name)
+                st.rerun()
+
+    return active_experiment_id
+
+
+def render_project_home() -> None:
+    render_home_project_sidebar()
+    st.markdown(
+        """
+        <section class="project-hero">
+            <div class="eyebrow">VoltScope workspace</div>
+            <h1>Open your electrochemistry workbench.</h1>
+            <p>Create a project for a new study, or open an existing project from the sidebar to continue experiments, notes, and saved analysis results.</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="home-action-label">Saved projects are listed in the sidebar by most recently opened.</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        "<div class='workspace-card'><h3>Create new project</h3><p>Name the workspace that will hold experiments, files, outputs, and notes.</p></div>",
+        unsafe_allow_html=True,
+    )
+    project_name = st.text_input("Project name", placeholder="Example: Nickel electrolyte screening")
+    if st.button("Create project", type="primary"):
+        cleaned_name = project_name.strip()
+        if not cleaned_name:
+            st.error("Enter a project name before continuing.")
+        else:
+            get_project_workspace(cleaned_name)
+            set_active_project(cleaned_name)
+            st.rerun()
+
+
+def render_saved_experiment(
+    project_name: str,
+    project_workspace: dict[str, Any],
+    experiment_id: str,
+    show_header: bool = True,
+) -> None:
+    experiment = project_workspace["experiments"][experiment_id]
+    files = experiment.get("files", {})
+    outputs = experiment.get("analysis_outputs", {})
+
+    if show_header:
+        st.markdown(
+            f"""
+            <div class="experiment-card">
+                <h3>{escape_html(experiment.get("name", experiment_id))}</h3>
+                <p>Created {format_timestamp(experiment.get("created_at"))} · {len(files)} files</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if files:
+        file_rows = []
+        fig = go.Figure()
+        display_unit = st.selectbox(
+            "Saved trace display unit",
+            ["uA", "mA", "A", "nA"],
+            key=f"saved_display_unit::{project_name}::{experiment_id}",
+        )
+        for filename, file_record in files.items():
+            summary = file_record.get("summary", {})
+            file_rows.append(
+                {
+                    "file": filename,
+                    "sample": summary.get("sample_name", ""),
+                    "points": summary.get("points", ""),
+                    "potential_range_V": (
+                        f"{summary.get('potential_min_v'):.4g} to {summary.get('potential_max_v'):.4g}"
+                        if summary.get("potential_min_v") is not None and summary.get("potential_max_v") is not None
+                        else ""
+                    ),
+                    "current_range_A": (
+                        f"{summary.get('current_min_a'):.4g} to {summary.get('current_max_a'):.4g}"
+                        if summary.get("current_min_a") is not None and summary.get("current_max_a") is not None
+                        else ""
+                    ),
+                }
+            )
+            trace = file_record.get("trace", {})
+            potential_v = trace.get("potential_v") or []
+            raw_current_a = trace.get("raw_current_a") or []
+            if potential_v and raw_current_a:
+                fig.add_trace(
+                    go.Scatter(
+                        x=potential_v,
+                        y=current_from_amps(np.array(raw_current_a, dtype=float), display_unit),
+                        mode="lines",
+                        name=summary.get("sample_name") or filename,
+                    )
+                )
+
+        st.dataframe(pd.DataFrame(file_rows), width="stretch", hide_index=True)
+        if fig.data:
+            fig.update_layout(
+                xaxis_title="Potential / V",
+                yaxis_title=f"Current / {display_unit}",
+                template="plotly_white",
+                height=420,
+                legend_title_text="Saved trace",
+            )
+            st.plotly_chart(fig, width="stretch")
+
+    output_tabs = st.tabs(["ESW", "Peak metrics", "Parser summary"])
+    with output_tabs[0]:
+        st.dataframe(pd.DataFrame(outputs.get("esw_summary", [])), width="stretch", hide_index=True)
+    with output_tabs[1]:
+        st.dataframe(pd.DataFrame(outputs.get("peak_metrics", [])), width="stretch", hide_index=True)
+        compact_metrics = outputs.get("compact_metrics", [])
+        if compact_metrics:
+            st.dataframe(pd.DataFrame(compact_metrics), width="stretch", hide_index=True)
+    with output_tabs[2]:
+        st.dataframe(pd.DataFrame(outputs.get("parser_summary", [])), width="stretch", hide_index=True)
+
+    render_experiment_notes(project_name, project_workspace, experiment_id)
+
+
+def render_project_header(project_name: str, project_workspace: dict[str, Any]) -> None:
+    experiments = project_workspace.get("experiments", {})
+    st.markdown(
+        f"""
+        <section class="project-hero">
+            <div class="eyebrow">Active project</div>
+            <h1>{escape_html(project_name)}</h1>
+            <p>{len(experiments)} experiments · created {format_timestamp(project_workspace.get("created_at"))}</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_project_dashboard(project_name: str, project_workspace: dict[str, Any]) -> None:
+    experiments = project_workspace.get("experiments", {})
+    if experiments:
+        st.subheader("Project experiments")
+        st.dataframe(experiments_dataframe(project_workspace), width="stretch", hide_index=True)
+        st.info("Select an experiment from the sidebar to view notes, saved analysis, and upload more files.")
+    else:
+        st.info("Create the first experiment from the sidebar, then upload data files into it.")
 
 
 def main() -> None:
     st.set_page_config(page_title="VoltScope AI MVP", layout="wide")
-
-    st.title("VoltScope AI MVP")
-    st.caption("Cyclic voltammetry upload, plotting, peak detection, and baseline correction")
+    apply_app_theme()
 
     if "project_workspaces" not in st.session_state:
         st.session_state.project_workspaces = load_project_workspaces()
+    st.session_state.project_workspaces = {
+        project_name: normalize_project_workspace(project_name, workspace)
+        for project_name, workspace in st.session_state.project_workspaces.items()
+    }
 
-    with st.sidebar:
-        st.header("Project workspace")
-        existing_projects = sorted(st.session_state.project_workspaces.keys())
-        default_project = existing_projects[0] if existing_projects else "Untitled project"
-        if existing_projects:
-            selected_project = st.selectbox("Open saved project", existing_projects)
-            default_project = selected_project
-        project_name_input = st.text_input("Project name", value=default_project)
-        project_name = project_name_input.strip() or "Untitled project"
-        project_workspace = get_project_workspace(project_name)
-        stored_files = project_file_names(project_workspace)
-        st.caption(f"Active project: {project_name}")
-        if stored_files:
-            st.write(f"Stored experiments: {len(stored_files)}")
-            st.dataframe(pd.DataFrame({"file": stored_files}), use_container_width=True, hide_index=True)
-        else:
-            st.write("No experiments stored in this project yet.")
+    active_project_name = st.session_state.get("active_project_name")
+    if not active_project_name:
+        render_project_home()
+        return
+
+    project_workspace = get_project_workspace(active_project_name)
+    active_experiment_id = render_project_sidebar(active_project_name, project_workspace)
+
+    render_project_header(active_project_name, project_workspace)
+
+    if not active_experiment_id:
+        render_project_dashboard(active_project_name, project_workspace)
+        return
+
+    experiment_id = active_experiment_id
+    experiment = project_workspace["experiments"][experiment_id]
+    st.markdown(
+        f"""
+        <div class="experiment-card">
+            <h3>{escape_html(experiment.get("name", experiment_id))}</h3>
+            <p>Created {format_timestamp(experiment.get("created_at"))} · updated {format_timestamp(experiment.get("updated_at"))}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.subheader("Upload files to this experiment")
+    st.caption("CSV, TXT, TSV, and DAT files are supported. Uploaded files are saved into the selected experiment.")
 
     uploaded_files = st.file_uploader(
         "Upload CV data files",
         type=["csv", "txt", "tsv", "dat"],
         accept_multiple_files=True,
+        key=f"upload::{active_project_name}::{experiment_id}",
     )
 
     if not uploaded_files:
-        st.info("Upload one or more .csv, .txt, .tsv, or .dat files to analyze new experiments.")
-        if stored_files:
-            st.subheader("Saved project experiments")
-            st.dataframe(project_summary_dataframe(project_workspace), use_container_width=True, hide_index=True)
-            selected_saved_file = st.selectbox("Notebook file", stored_files)
-            render_project_notebook(project_name, project_workspace, selected_saved_file)
-        st.stop()
+        render_saved_experiment(active_project_name, project_workspace, experiment_id, show_header=False)
         return
 
     parsed_datasets: list[ParsedDataset] = []
@@ -1054,7 +1670,7 @@ def main() -> None:
             for dataset in parsed_datasets
         ]
     )
-    st.dataframe(parser_summary, use_container_width=True)
+    st.dataframe(parser_summary, width="stretch")
 
     selected_filename = st.selectbox(
         "Preview / detailed analysis file",
@@ -1063,7 +1679,7 @@ def main() -> None:
     selected_dataset = next(dataset for dataset in parsed_datasets if dataset.filename == selected_filename)
 
     with st.expander("Raw parsed data preview", expanded=True):
-        st.dataframe(selected_dataset.dataframe.head(30), use_container_width=True)
+        st.dataframe(selected_dataset.dataframe.head(30), width="stretch")
 
     with st.expander("Detected metadata"):
         if selected_dataset.metadata:
@@ -1161,8 +1777,6 @@ def main() -> None:
         st.stop()
         return
 
-    store_project_analyses(project_workspace, analyzed)
-
     for dataset in analyzed:
         for warning in dataset.warnings:
             st.warning(warning)
@@ -1227,7 +1841,7 @@ def main() -> None:
         }
         for peak in peaks
     ]
-    st.dataframe(pd.DataFrame(peak_rows), use_container_width=True)
+    st.dataframe(pd.DataFrame(peak_rows), width="stretch")
 
     oxidation_peaks = [peak for peak in peaks if peak.peak_type == "oxidation"]
     reduction_peaks = [peak for peak in peaks if peak.peak_type == "reduction"]
@@ -1333,7 +1947,7 @@ def main() -> None:
                 },
             ]
         )
-        st.dataframe(anchor_summary, use_container_width=True)
+        st.dataframe(anchor_summary, width="stretch")
 
     fig = go.Figure()
     trace_mode = "lines+markers" if show_markers else "lines"
@@ -1455,7 +2069,7 @@ def main() -> None:
     )
 
     st.subheader("Interactive CV plot")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     plot_html = fig.to_html(full_html=True, include_plotlyjs="cdn")
     st.download_button(
@@ -1488,7 +2102,7 @@ def main() -> None:
             }
         )
     esw_df = pd.DataFrame(esw_rows)
-    st.dataframe(esw_df, use_container_width=True)
+    st.dataframe(esw_df, width="stretch")
 
     st.subheader("Peak metrics")
     peak_metric_rows, metrics = build_peak_metrics_rows(
@@ -1500,10 +2114,12 @@ def main() -> None:
     )
     if peak_metric_rows:
         peak_metric_df = pd.DataFrame(peak_metric_rows)
-        st.dataframe(peak_metric_df, use_container_width=True)
-        st.dataframe(metrics_table(metrics, current_display_unit), use_container_width=True)
+        compact_metrics_df = metrics_table(metrics, current_display_unit)
+        st.dataframe(peak_metric_df, width="stretch")
+        st.dataframe(compact_metrics_df, width="stretch")
     else:
         peak_metric_df = pd.DataFrame()
+        compact_metrics_df = pd.DataFrame()
         st.info("Select or manually define peaks to calculate Epa, ipa, Epc, ipc, Delta Ep, and ipa/ipc.")
 
     export_buffer = io.StringIO()
@@ -1511,7 +2127,7 @@ def main() -> None:
     export_sections.append("# ESW summary\n" + esw_df.to_csv(index=False))
     if peak_metric_rows:
         export_sections.append("# Peak metrics\n" + peak_metric_df.to_csv(index=False))
-        export_sections.append("# Compact metrics\n" + metrics_table(metrics, current_display_unit).to_csv(index=False))
+        export_sections.append("# Compact metrics\n" + compact_metrics_df.to_csv(index=False))
     export_buffer.write("\n".join(export_sections))
 
     st.download_button(
@@ -1521,18 +2137,31 @@ def main() -> None:
         mime="text/csv",
     )
 
-    st.subheader("Project notebook")
-    st.caption(f"Notes for {selected_filename} in {project_name}")
-    notes = project_workspace.setdefault("notes", {})
-    note_key = f"project_note::{project_name}::{selected_filename}"
-    if note_key not in st.session_state:
-        st.session_state[note_key] = notes.get(selected_filename, "")
-    notes[selected_filename] = st.text_area(
-        "File notes",
-        key=note_key,
-        height=180,
-        placeholder="Record observations, electrolyte details, electrode prep, follow-up steps, or interpretation notes.",
+    store_experiment_analysis(
+        project_workspace,
+        experiment_id,
+        analyzed,
+        parser_summary,
+        esw_df,
+        peak_metric_df,
+        compact_metrics_df,
+        {
+            "selected_file": selected_filename,
+            "column_mode": column_mode,
+            "potential_unit": selected_potential_unit,
+            "current_unit": selected_current_unit,
+            "current_display_unit": current_display_unit,
+            "smoothing_method": smoothing_method,
+            "smoothing_window": smoothing_window,
+            "use_smoothed_for_peaks": use_smoothed_for_peaks,
+            "peak_min_prominence": min_prominence_display,
+            "peak_min_distance": int(min_distance),
+            "peak_min_abs_current": min_abs_current_display,
+            "baseline_method": baseline_method,
+            "esw_threshold": threshold_display,
+        },
     )
+    render_experiment_notes(active_project_name, project_workspace, experiment_id)
 
 
 if __name__ == "__main__":
