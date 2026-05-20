@@ -35,7 +35,42 @@ import streamlit as st
 
 POTENTIAL_UNITS_TO_V = {"V": 1.0, "mV": 1e-3}
 CURRENT_UNITS_TO_A = {"A": 1.0, "mA": 1e-3, "uA": 1e-6, "nA": 1e-9}
+TIME_UNITS_TO_S = {"s": 1.0, "ms": 1e-3, "min": 60.0, "h": 3600.0}
+FREQUENCY_UNITS_TO_HZ = {"Hz": 1.0, "kHz": 1e3, "MHz": 1e6}
+IMPEDANCE_UNITS_TO_OHM = {"ohm": 1.0, "kohm": 1e3, "Mohm": 1e6}
+PHASE_UNITS_TO_DEG = {"deg": 1.0, "rad": 180.0 / np.pi}
 WORKSPACE_STORE_PATH = Path(__file__).with_name("voltscope_project_workspaces.json")
+
+
+EXPERIMENT_TYPES = {
+    "cv": {
+        "label": "Cyclic voltammetry (CV)",
+        "short_label": "CV",
+        "description": "Potential-current scans with CV peak detection, ESW, and baseline correction.",
+    },
+    "lsv": {
+        "label": "Linear sweep voltammetry (LSV)",
+        "short_label": "LSV",
+        "description": "Linear sweep voltammetry data with threshold-based ESW analysis.",
+    },
+    "ca": {
+        "label": "Chronoamperometry (CA)",
+        "short_label": "CA",
+        "description": "Current vs time data with steady-state current and charge estimates.",
+    },
+    "cp": {
+        "label": "Chronopotentiometry (CP)",
+        "short_label": "CP",
+        "description": "Potential vs time data with drift/slope summaries.",
+    },
+    "eis": {
+        "label": "Electrochemical impedance spectroscopy (EIS)",
+        "short_label": "EIS",
+        "description": "Impedance data with Nyquist and optional Bode plots.",
+    },
+}
+EXPERIMENT_TYPE_LABELS = [config["label"] for config in EXPERIMENT_TYPES.values()]
+EXPERIMENT_TYPE_BY_LABEL = {config["label"]: key for key, config in EXPERIMENT_TYPES.items()}
 
 
 @dataclass
@@ -252,6 +287,42 @@ def detect_unit_from_header(header: str, role: str) -> Optional[str]:
             return "A"
         return None
 
+    if role == "time":
+        if "ms" in label:
+            return "ms"
+        if "min" in label:
+            return "min"
+        if label.endswith("/h") or label.endswith("(h)") or label in {"h", "hour", "hours"}:
+            return "h"
+        if "/s" in label or "(s)" in label or label in {"s", "t", "time"}:
+            return "s"
+        return None
+
+    if role == "frequency":
+        if "mhz" in label:
+            return "MHz"
+        if "khz" in label:
+            return "kHz"
+        if "hz" in label or "freq" in label:
+            return "Hz"
+        return None
+
+    if role in {"zreal", "zimag", "zmod", "impedance"}:
+        if "mohm" in label or "megaohm" in label:
+            return "Mohm"
+        if "kohm" in label or "komega" in label:
+            return "kohm"
+        if "ohm" in label or "omega" in label or "\u03a9" in header:
+            return "ohm"
+        return None
+
+    if role == "phase":
+        if "rad" in label:
+            return "rad"
+        if "deg" in label or "degree" in label or "phase" in label:
+            return "deg"
+        return None
+
     return None
 
 
@@ -340,6 +411,168 @@ def detect_column_roles(df: pd.DataFrame) -> tuple[Optional[str], Optional[str],
     return potential_col, current_col, time_col
 
 
+
+
+def score_time_column(header: str, values: np.ndarray) -> float:
+    label = normalize_label(header)
+    finite = values[np.isfinite(values)]
+    score = 0.0
+
+    if "time" in label or label in {"t", "s", "time/s", "seconds"}:
+        score += 8
+    if detect_unit_from_header(header, "time"):
+        score += 2
+    if any(term in label for term in ["potential", "voltage", "current", "freq", "zreal", "zimag"]):
+        score -= 4
+
+    if finite.size:
+        differences = np.diff(finite)
+        nonzero = differences[np.abs(differences) > 1e-15]
+        if nonzero.size and np.mean(nonzero > 0) > 0.85:
+            score += 4
+        if np.nanmin(finite) >= 0:
+            score += 1
+
+    return score
+
+
+def score_frequency_column(header: str, values: np.ndarray) -> float:
+    label = normalize_label(header)
+    finite = values[np.isfinite(values)]
+    score = 0.0
+
+    if any(term in label for term in ["frequency", "freq", "hz"]):
+        score += 9
+    if label in {"f", "freq/hz"}:
+        score += 4
+    if any(term in label for term in ["time", "current", "potential", "zreal", "zimag"]):
+        score -= 4
+    if detect_unit_from_header(header, "frequency"):
+        score += 2
+
+    if finite.size:
+        positive_fraction = float(np.mean(finite > 0))
+        if positive_fraction > 0.95:
+            score += 2
+        if np.nanmax(finite) / max(np.nanmin(finite[finite > 0]), 1e-30) > 10 if np.any(finite > 0) else False:
+            score += 1
+
+    return score
+
+
+def score_impedance_column(header: str, values: np.ndarray, role: str) -> float:
+    label = normalize_label(header)
+    finite = values[np.isfinite(values)]
+    score = 0.0
+
+    if role == "zreal":
+        keywords = ["zreal", "zre", "z'", "real", "rez", "z_real"]
+        wrong_keywords = ["imag", "zimag", "phase", "freq"]
+    elif role == "zimag":
+        keywords = ["zimag", "zim", "z''", "imag", "imz", "z_imag", "-z"]
+        wrong_keywords = ["real", "zreal", "phase", "freq"]
+    elif role == "zmod":
+        keywords = ["zmod", "|z|", "modz", "magnitude", "impedance", "z/ohm"]
+        wrong_keywords = ["real", "imag", "phase", "freq"]
+    else:
+        keywords = ["phase", "theta", "deg"]
+        wrong_keywords = ["real", "imag", "zmod", "freq"]
+
+    if any(keyword in label for keyword in keywords):
+        score += 9
+    if any(keyword in label for keyword in wrong_keywords):
+        score -= 5
+    if detect_unit_from_header(header, role):
+        score += 2
+
+    if finite.size:
+        if role in {"zreal", "zmod"} and np.mean(finite >= 0) > 0.75:
+            score += 1
+        if role == "phase" and np.nanmax(np.abs(finite)) <= 360:
+            score += 2
+        if np.unique(np.round(finite, 12)).size > 3:
+            score += 1
+
+    return score
+
+
+def score_column_for_role(header: str, values: np.ndarray, role: str) -> float:
+    if role == "potential":
+        return score_potential_column(header, values)
+    if role == "current":
+        return score_current_column(header, values)
+    if role == "time":
+        return score_time_column(header, values)
+    if role == "frequency":
+        return score_frequency_column(header, values)
+    if role in {"zreal", "zimag", "zmod", "phase"}:
+        return score_impedance_column(header, values, role)
+    return 0.0
+
+
+def detect_column_by_role(
+    df: pd.DataFrame,
+    role: str,
+    excluded: Optional[set[str]] = None,
+    min_score: float = 2.0,
+) -> Optional[str]:
+    excluded = excluded or set()
+    scores = {}
+    for column in df.columns:
+        if column in excluded:
+            continue
+        scores[column] = score_column_for_role(column, df[column].to_numpy(dtype=float), role)
+
+    if not scores:
+        return None
+    best_column = max(scores, key=scores.get)
+    return best_column if scores[best_column] >= min_score else None
+
+
+def detect_experiment_columns(dataset: ParsedDataset, experiment_type: str) -> dict[str, Optional[str]]:
+    df = dataset.dataframe
+    columns: dict[str, Optional[str]] = {}
+    excluded: set[str] = set()
+
+    if experiment_type in {"cv", "lsv"}:
+        columns["potential"] = dataset.detected_potential_col or detect_column_by_role(df, "potential", excluded)
+        if columns["potential"]:
+            excluded.add(columns["potential"])
+        columns["current"] = dataset.detected_current_col or detect_column_by_role(df, "current", excluded)
+        return columns
+
+    if experiment_type == "ca":
+        columns["time"] = dataset.detected_time_col or detect_column_by_role(df, "time", excluded)
+        if columns["time"]:
+            excluded.add(columns["time"])
+        columns["current"] = dataset.detected_current_col or detect_column_by_role(df, "current", excluded)
+        return columns
+
+    if experiment_type == "cp":
+        columns["time"] = dataset.detected_time_col or detect_column_by_role(df, "time", excluded)
+        if columns["time"]:
+            excluded.add(columns["time"])
+        columns["potential"] = dataset.detected_potential_col or detect_column_by_role(df, "potential", excluded)
+        return columns
+
+    if experiment_type == "eis":
+        columns["frequency"] = detect_column_by_role(df, "frequency", excluded, min_score=3.0)
+        if columns["frequency"]:
+            excluded.add(columns["frequency"])
+        columns["zreal"] = detect_column_by_role(df, "zreal", excluded, min_score=3.0)
+        if columns["zreal"]:
+            excluded.add(columns["zreal"])
+        columns["zimag"] = detect_column_by_role(df, "zimag", excluded, min_score=3.0)
+        if columns["zimag"]:
+            excluded.add(columns["zimag"])
+        columns["zmod"] = detect_column_by_role(df, "zmod", excluded, min_score=3.0)
+        if columns["zmod"]:
+            excluded.add(columns["zmod"])
+        columns["phase"] = detect_column_by_role(df, "phase", excluded, min_score=3.0)
+        return columns
+
+    return columns
+
 def read_uploaded_text(uploaded_file: Any) -> str:
     raw = uploaded_file.getvalue()
     for encoding in ["utf-8-sig", "utf-16", "latin-1"]:
@@ -386,20 +619,23 @@ def parse_electrochem_file(uploaded_file: Any) -> ParsedDataset:
     potential_col, current_col, time_col = detect_column_roles(df)
     detected_units: dict[str, str] = {}
     for column in headers:
-        potential_unit = detect_unit_from_header(column, "potential")
-        current_unit = detect_unit_from_header(column, "current")
-        if potential_unit:
-            detected_units[f"potential:{column}"] = potential_unit
-        if current_unit:
-            detected_units[f"current:{column}"] = current_unit
+        for role in [
+            "potential",
+            "current",
+            "time",
+            "frequency",
+            "zreal",
+            "zimag",
+            "zmod",
+            "phase",
+        ]:
+            unit = detect_unit_from_header(column, role)
+            if unit:
+                detected_units[f"{role}:{column}"] = unit
 
     warnings = []
     if not has_header:
         warnings.append("No header row was detected; generated generic column names.")
-    if potential_col is None:
-        warnings.append("Potential column could not be detected automatically.")
-    if current_col is None:
-        warnings.append("Current column could not be detected automatically.")
 
     return ParsedDataset(
         filename=uploaded_file.name,
@@ -438,12 +674,128 @@ def convert_current_to_amps(values: np.ndarray, unit: str) -> np.ndarray:
     return values * CURRENT_UNITS_TO_A.get(unit, 1.0)
 
 
-def current_from_amps(values: np.ndarray, display_unit: str) -> np.ndarray:
+CURRENT_DENSITY_UNIT = "mA/cm^2"
+
+
+def current_from_amps(
+    values: np.ndarray,
+    display_unit: str,
+    electrode_area_cm2: float = 1.0,
+) -> np.ndarray:
+    if display_unit == CURRENT_DENSITY_UNIT:
+        return values * 1000.0 / electrode_area_cm2
     return values / CURRENT_UNITS_TO_A.get(display_unit, 1.0)
 
 
-def current_value_to_amps(value: float, display_unit: str) -> float:
+def current_value_to_amps(
+    value: float,
+    display_unit: str,
+    electrode_area_cm2: float = 1.0,
+) -> float:
+    if display_unit == CURRENT_DENSITY_UNIT:
+        return value * electrode_area_cm2 / 1000.0
     return value * CURRENT_UNITS_TO_A.get(display_unit, 1.0)
+
+
+def current_axis_label(display_unit: str) -> str:
+    if display_unit == CURRENT_DENSITY_UNIT:
+        return f"Current density / {CURRENT_DENSITY_UNIT}"
+    return f"Current / {display_unit}"
+
+
+def current_hover_label(display_unit: str) -> str:
+    return "Current density" if display_unit == CURRENT_DENSITY_UNIT else "Current"
+
+
+
+def unit_options_for_role(role: str) -> list[str]:
+    if role == "potential":
+        return ["Auto", "V", "mV"]
+    if role == "current":
+        return ["Auto", "A", "mA", "uA", "nA"]
+    if role == "time":
+        return ["Auto", "s", "ms", "min", "h"]
+    if role == "frequency":
+        return ["Auto", "Hz", "kHz", "MHz"]
+    if role in {"zreal", "zimag", "zmod", "impedance"}:
+        return ["Auto", "ohm", "kohm", "Mohm"]
+    if role == "phase":
+        return ["Auto", "deg", "rad"]
+    return ["Auto"]
+
+
+def default_base_unit_for_role(role: str) -> str:
+    defaults = {
+        "potential": "V",
+        "current": "A",
+        "time": "s",
+        "frequency": "Hz",
+        "zreal": "ohm",
+        "zimag": "ohm",
+        "zmod": "ohm",
+        "impedance": "ohm",
+        "phase": "deg",
+    }
+    return defaults.get(role, "")
+
+
+def display_unit_options_for_role(role: str) -> list[str]:
+    if role == "potential":
+        return ["V", "mV"]
+    if role == "current":
+        return ["uA", "mA", "A", "nA"]
+    if role == "time":
+        return ["s", "ms", "min", "h"]
+    if role == "frequency":
+        return ["Hz", "kHz", "MHz"]
+    if role in {"zreal", "zimag", "zmod", "impedance"}:
+        return ["ohm", "kohm", "Mohm"]
+    if role == "phase":
+        return ["deg", "rad"]
+    return [""]
+
+
+def unit_factor_for_role(role: str, unit: str) -> float:
+    if role == "potential":
+        return POTENTIAL_UNITS_TO_V.get(unit, 1.0)
+    if role == "current":
+        return CURRENT_UNITS_TO_A.get(unit, 1.0)
+    if role == "time":
+        return TIME_UNITS_TO_S.get(unit, 1.0)
+    if role == "frequency":
+        return FREQUENCY_UNITS_TO_HZ.get(unit, 1.0)
+    if role in {"zreal", "zimag", "zmod", "impedance"}:
+        return IMPEDANCE_UNITS_TO_OHM.get(unit, 1.0)
+    if role == "phase":
+        return PHASE_UNITS_TO_DEG.get(unit, 1.0)
+    return 1.0
+
+
+def convert_role_to_base(values: np.ndarray, role: str, unit: str) -> np.ndarray:
+    return values * unit_factor_for_role(role, unit)
+
+
+def convert_role_from_base(values: np.ndarray, role: str, display_unit: str) -> np.ndarray:
+    return values / unit_factor_for_role(role, display_unit)
+
+
+def resolve_role_unit(selected_unit: str, dataset: ParsedDataset, role: str, column: Optional[str]) -> str:
+    if selected_unit != "Auto":
+        return selected_unit
+    if column:
+        detected = dataset.detected_units.get(f"{role}:{column}")
+        if detected:
+            return detected
+    return default_base_unit_for_role(role)
+
+
+def finite_pair_mask(*arrays: np.ndarray) -> np.ndarray:
+    if not arrays:
+        return np.array([], dtype=bool)
+    mask = np.ones(len(arrays[0]), dtype=bool)
+    for array in arrays:
+        mask &= np.isfinite(array)
+    return mask
 
 
 def validate_cv_data(filename: str, potential_v: np.ndarray, current_a: np.ndarray) -> list[str]:
@@ -762,9 +1114,9 @@ def calculate_linear_baseline(
     return slope * potential + intercept
 
 
-def peak_label(peak: Peak, display_unit: str) -> str:
-    current_display = current_from_amps(np.array([peak.raw_current]), display_unit)[0]
-    prominence_display = current_from_amps(np.array([peak.prominence]), display_unit)[0]
+def peak_label(peak: Peak, display_unit: str, electrode_area_cm2: float = 1.0) -> str:
+    current_display = current_from_amps(np.array([peak.raw_current]), display_unit, electrode_area_cm2)[0]
+    prominence_display = current_from_amps(np.array([peak.prominence]), display_unit, electrode_area_cm2)[0]
     return (
         f"{peak.id}: {peak.peak_type}, E={peak.potential:.4g} V, "
         f"I={current_display:.4g} {display_unit}, prom={prominence_display:.4g} {display_unit}"
@@ -791,6 +1143,7 @@ def build_peak_metrics_rows(
     baseline_current: Optional[np.ndarray],
     analysis_current: np.ndarray,
     display_unit: str,
+    electrode_area_cm2: float = 1.0,
 ) -> tuple[list[dict[str, Any]], dict[str, Optional[float]]]:
     rows = []
     metrics: dict[str, Optional[float]] = {
@@ -808,9 +1161,9 @@ def build_peak_metrics_rows(
         baseline_at_peak = 0.0 if baseline_current is None else float(baseline_current[peak.index])
         raw_current = float(analysis_current[peak.index])
         corrected_current = raw_current - baseline_at_peak
-        raw_display = current_from_amps(np.array([raw_current]), display_unit)[0]
-        baseline_display = current_from_amps(np.array([baseline_at_peak]), display_unit)[0]
-        corrected_display = current_from_amps(np.array([corrected_current]), display_unit)[0]
+        raw_display = current_from_amps(np.array([raw_current]), display_unit, electrode_area_cm2)[0]
+        baseline_display = current_from_amps(np.array([baseline_at_peak]), display_unit, electrode_area_cm2)[0]
+        corrected_display = current_from_amps(np.array([corrected_current]), display_unit, electrode_area_cm2)[0]
 
         rows.append(
             {
@@ -838,23 +1191,749 @@ def build_peak_metrics_rows(
     return rows, metrics
 
 
-def metrics_table(metrics: dict[str, Optional[float]], display_unit: str) -> pd.DataFrame:
+def metrics_table(
+    metrics: dict[str, Optional[float]],
+    display_unit: str,
+    electrode_area_cm2: float = 1.0,
+) -> pd.DataFrame:
     rows = []
     if metrics["epa_V"] is not None:
         rows.append({"metric": "Epa", "value": f"{metrics['epa_V']:.4g} V"})
     if metrics["ipa_A"] is not None:
-        ipa_display = current_from_amps(np.array([metrics["ipa_A"]]), display_unit)[0]
+        ipa_display = current_from_amps(np.array([metrics["ipa_A"]]), display_unit, electrode_area_cm2)[0]
         rows.append({"metric": "ipa", "value": f"{ipa_display:.4g} {display_unit}"})
     if metrics["epc_V"] is not None:
         rows.append({"metric": "Epc", "value": f"{metrics['epc_V']:.4g} V"})
     if metrics["ipc_A"] is not None:
-        ipc_display = current_from_amps(np.array([metrics["ipc_A"]]), display_unit)[0]
+        ipc_display = current_from_amps(np.array([metrics["ipc_A"]]), display_unit, electrode_area_cm2)[0]
         rows.append({"metric": "ipc", "value": f"{ipc_display:.4g} {display_unit}"})
     if metrics["delta_ep_V"] is not None:
         rows.append({"metric": "Delta Ep", "value": f"{metrics['delta_ep_V']:.4g} V"})
     if metrics["ipa_ipc_ratio"] is not None:
         rows.append({"metric": "ipa/ipc", "value": f"{metrics['ipa_ipc_ratio']:.4g}"})
     return pd.DataFrame(rows)
+
+
+
+# ---------- Multi-experiment analysis helpers ----------
+
+
+def experiment_label(experiment_type: str) -> str:
+    return EXPERIMENT_TYPES.get(experiment_type, EXPERIMENT_TYPES["cv"])["label"]
+
+
+def experiment_short_label(experiment_type: str) -> str:
+    return EXPERIMENT_TYPES.get(experiment_type, EXPERIMENT_TYPES["cv"])["short_label"]
+
+
+def role_label(role: str) -> str:
+    labels = {
+        "potential": "Potential",
+        "current": "Current",
+        "time": "Time",
+        "frequency": "Frequency",
+        "zreal": "Z real",
+        "zimag": "Z imaginary",
+        "zmod": "|Z| magnitude",
+        "phase": "Phase",
+    }
+    return labels.get(role, role)
+
+
+def required_roles_for_experiment(experiment_type: str) -> list[str]:
+    if experiment_type == "ca":
+        return ["time", "current"]
+    if experiment_type == "cp":
+        return ["time", "potential"]
+    if experiment_type == "lsv":
+        return ["potential", "current"]
+    if experiment_type == "eis":
+        return ["zreal", "zimag"]
+    return ["potential", "current"]
+
+
+def optional_roles_for_experiment(experiment_type: str) -> list[str]:
+    if experiment_type == "eis":
+        return ["frequency", "zmod", "phase"]
+    return []
+
+
+def make_parser_summary(parsed_datasets: list[ParsedDataset], experiment_type: str) -> pd.DataFrame:
+    rows = []
+    roles = required_roles_for_experiment(experiment_type) + optional_roles_for_experiment(experiment_type)
+    for dataset in parsed_datasets:
+        detected = detect_experiment_columns(dataset, experiment_type)
+        row = {
+            "file": dataset.filename,
+            "rows": len(dataset.dataframe),
+            "columns": len(dataset.headers),
+            "delimiter": dataset.delimiter,
+            "metadata_fields": len(dataset.metadata),
+            "warnings": "; ".join(dataset.warnings),
+        }
+        for role in roles:
+            row[f"detected_{role}"] = detected.get(role)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def column_is_negative_imaginary(column: Optional[str]) -> bool:
+    if not column:
+        return False
+    label = normalize_label(column)
+    return label.startswith("-") or "-z" in label or "minus" in label
+
+
+def normalize_generic_dataset(
+    dataset: ParsedDataset,
+    experiment_type: str,
+    role_columns: dict[str, Optional[str]],
+    selected_units: dict[str, str],
+) -> Optional[dict[str, Any]]:
+    warnings = list(dataset.warnings)
+    sample_name = dataset.filename.rsplit(".", 1)[0]
+
+    if experiment_type == "eis":
+        zreal_col = role_columns.get("zreal")
+        zimag_col = role_columns.get("zimag")
+        zmod_col = role_columns.get("zmod")
+        phase_col = role_columns.get("phase")
+        frequency_col = role_columns.get("frequency")
+
+        if zreal_col and zimag_col:
+            used_cols = [zreal_col, zimag_col]
+            if frequency_col:
+                used_cols.append(frequency_col)
+            working = dataset.dataframe[used_cols].dropna().copy()
+            zreal_unit = resolve_role_unit(selected_units.get("zreal", "Auto"), dataset, "zreal", zreal_col)
+            zimag_unit = resolve_role_unit(selected_units.get("zimag", "Auto"), dataset, "zimag", zimag_col)
+            zreal_ohm = convert_role_to_base(working[zreal_col].to_numpy(dtype=float), "zreal", zreal_unit)
+            zimag_ohm = convert_role_to_base(working[zimag_col].to_numpy(dtype=float), "zimag", zimag_unit)
+            if column_is_negative_imaginary(zimag_col):
+                zimag_ohm = -zimag_ohm
+            units = {"zreal": zreal_unit, "zimag": zimag_unit}
+            columns = {"zreal": zreal_col, "zimag": zimag_col}
+        elif zmod_col and phase_col:
+            used_cols = [zmod_col, phase_col]
+            if frequency_col:
+                used_cols.append(frequency_col)
+            working = dataset.dataframe[used_cols].dropna().copy()
+            zmod_unit = resolve_role_unit(selected_units.get("zmod", "Auto"), dataset, "zmod", zmod_col)
+            phase_unit = resolve_role_unit(selected_units.get("phase", "Auto"), dataset, "phase", phase_col)
+            zmod_ohm = convert_role_to_base(working[zmod_col].to_numpy(dtype=float), "zmod", zmod_unit)
+            phase_deg = convert_role_to_base(working[phase_col].to_numpy(dtype=float), "phase", phase_unit)
+            phase_rad = np.deg2rad(phase_deg)
+            zreal_ohm = zmod_ohm * np.cos(phase_rad)
+            zimag_ohm = zmod_ohm * np.sin(phase_rad)
+            units = {"zmod": zmod_unit, "phase": phase_unit}
+            columns = {"zmod": zmod_col, "phase": phase_col}
+            warnings.append("Calculated Z real and Z imaginary from |Z| and phase.")
+        else:
+            warnings.append("EIS requires Z real + Z imaginary, or |Z| + phase columns.")
+            return None
+
+        frequency_hz = None
+        if frequency_col and frequency_col in working.columns:
+            frequency_unit = resolve_role_unit(selected_units.get("frequency", "Auto"), dataset, "frequency", frequency_col)
+            frequency_hz = convert_role_to_base(working[frequency_col].to_numpy(dtype=float), "frequency", frequency_unit)
+            units["frequency"] = frequency_unit
+            columns["frequency"] = frequency_col
+
+        mask = finite_pair_mask(zreal_ohm, zimag_ohm)
+        if frequency_hz is not None:
+            mask &= np.isfinite(frequency_hz)
+            frequency_hz = frequency_hz[mask]
+        zreal_ohm = zreal_ohm[mask]
+        zimag_ohm = zimag_ohm[mask]
+        if len(zreal_ohm) < 3:
+            warnings.append("Too few EIS rows for reliable plotting.")
+
+        return {
+            "experiment_type": experiment_type,
+            "filename": dataset.filename,
+            "sample_name": sample_name,
+            "columns": columns,
+            "units": units,
+            "metadata": dataset.metadata,
+            "warnings": warnings,
+            "data": {
+                "zreal_ohm": zreal_ohm,
+                "zimag_ohm": zimag_ohm,
+                "frequency_hz": frequency_hz,
+            },
+        }
+
+    required_roles = required_roles_for_experiment(experiment_type)
+    missing = [role for role in required_roles if not role_columns.get(role)]
+    if missing:
+        warnings.append("Missing required columns: " + ", ".join(role_label(role) for role in missing))
+        return None
+
+    used_cols = [role_columns[role] for role in required_roles if role_columns.get(role)]
+    if len(set(used_cols)) != len(used_cols):
+        warnings.append("Required roles must use different columns.")
+        return None
+
+    working = dataset.dataframe[used_cols].dropna().copy()
+    if working.empty:
+        warnings.append("Selected columns have no usable numeric rows.")
+        return None
+
+    normalized_data: dict[str, np.ndarray] = {}
+    columns: dict[str, str] = {}
+    units: dict[str, str] = {}
+    for role in required_roles:
+        column = role_columns[role]
+        unit = resolve_role_unit(selected_units.get(role, "Auto"), dataset, role, column)
+        values = working[column].to_numpy(dtype=float)
+        normalized_data[role] = convert_role_to_base(values, role, unit)
+        columns[role] = column
+        units[role] = unit
+
+    mask = finite_pair_mask(*normalized_data.values())
+    normalized_data = {role: values[mask] for role, values in normalized_data.items()}
+    if len(next(iter(normalized_data.values()))) < 5:
+        warnings.append("Too few numeric rows for reliable analysis.")
+
+    return {
+        "experiment_type": experiment_type,
+        "filename": dataset.filename,
+        "sample_name": sample_name,
+        "columns": columns,
+        "units": units,
+        "metadata": dataset.metadata,
+        "warnings": warnings,
+        "data": normalized_data,
+    }
+
+
+def summarize_generic_record(record: dict[str, Any]) -> dict[str, Any]:
+    data = record.get("data", {})
+    summary = {
+        "filename": record.get("filename"),
+        "sample_name": record.get("sample_name"),
+        "experiment_type": record.get("experiment_type"),
+        "points": 0,
+        "warnings": record.get("warnings", []),
+    }
+
+    for key, values in data.items():
+        if values is None:
+            continue
+        array = np.asarray(values, dtype=float)
+        summary["points"] = max(summary["points"], int(len(array)))
+        finite = array[np.isfinite(array)]
+        if finite.size:
+            summary[f"{key}_min"] = float(np.min(finite))
+            summary[f"{key}_max"] = float(np.max(finite))
+
+    return summary
+
+
+def serialize_generic_record(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "summary": summarize_generic_record(record),
+        "metadata": record.get("metadata", {}),
+        "warnings": record.get("warnings", []),
+        "columns": record.get("columns", {}),
+        "units": record.get("units", {}),
+        "trace": to_jsonable(record.get("data", {})),
+    }
+
+
+def store_generic_experiment_analysis(
+    project_workspace: dict[str, Any],
+    experiment_id: str,
+    experiment_type: str,
+    records: list[dict[str, Any]],
+    parser_summary_df: pd.DataFrame,
+    results_df: pd.DataFrame,
+    settings: dict[str, Any],
+) -> None:
+    experiment = project_workspace.setdefault("experiments", {}).setdefault(
+        experiment_id,
+        {
+            "name": "Untitled experiment",
+            "created_at": now_timestamp(),
+            "updated_at": now_timestamp(),
+            "files": {},
+            "analysis_outputs": {},
+            "notes": "",
+            "experiment_type": experiment_type,
+        },
+    )
+    experiment["experiment_type"] = experiment_type
+    files = experiment.setdefault("files", {})
+    for record in records:
+        files[record["filename"]] = serialize_generic_record(record)
+
+    experiment["updated_at"] = now_timestamp()
+    experiment["analysis_outputs"] = {
+        "experiment_type": experiment_type,
+        "parser_summary": dataframe_records(parser_summary_df),
+        "results": dataframe_records(results_df),
+        "settings": settings,
+    }
+    save_project_workspaces()
+
+
+def build_generic_results(
+    records: list[dict[str, Any]],
+    experiment_type: str,
+    lsv_threshold_a: Optional[float] = None,
+    lsv_threshold_display: Optional[float] = None,
+    lsv_threshold_unit: Optional[str] = None,
+) -> pd.DataFrame:
+    rows = []
+    for record in records:
+        data = record["data"]
+        row: dict[str, Any] = {
+            "sample_name": record["sample_name"],
+            "file_name": record["filename"],
+            "points": int(max(len(values) for values in data.values() if values is not None)),
+        }
+
+        if experiment_type == "ca":
+            time_s = data["time"]
+            current_a = data["current"]
+            tail_start = max(0, int(len(current_a) * 0.9) - 1)
+            row.update(
+                {
+                    "duration_s": float(np.nanmax(time_s) - np.nanmin(time_s)),
+                    "initial_current_A": float(current_a[0]),
+                    "final_current_A": float(current_a[-1]),
+                    "steady_state_current_A": float(np.nanmean(current_a[tail_start:])),
+                    "charge_C": float(np.trapezoid(current_a, time_s)) if len(time_s) > 1 else None,
+                }
+            )
+        elif experiment_type == "cp":
+            time_s = data["time"]
+            potential_v = data["potential"]
+            duration = float(np.nanmax(time_s) - np.nanmin(time_s)) if len(time_s) else 0.0
+            row.update(
+                {
+                    "duration_s": duration,
+                    "initial_potential_V": float(potential_v[0]),
+                    "final_potential_V": float(potential_v[-1]),
+                    "delta_potential_V": float(potential_v[-1] - potential_v[0]),
+                    "average_slope_V_s": float((potential_v[-1] - potential_v[0]) / duration) if duration else None,
+                }
+            )
+        elif experiment_type == "lsv":
+            potential_v = data["potential"]
+            current_a = data["current"]
+            row.update(
+                {
+                    "potential_min_V": float(np.nanmin(potential_v)),
+                    "potential_max_V": float(np.nanmax(potential_v)),
+                    "current_min_A": float(np.nanmin(current_a)),
+                    "current_max_A": float(np.nanmax(current_a)),
+                }
+            )
+            if lsv_threshold_a is not None and lsv_threshold_a > 0:
+                result = calculate_esw(potential_v, current_a, lsv_threshold_a)
+                row.update(
+                    {
+                        f"threshold_{lsv_threshold_unit or 'display'}": lsv_threshold_display,
+                        "cathodic_limit_V": result.cathodic_limit,
+                        "anodic_limit_V": result.anodic_limit,
+                        "operational_ESW_V": result.esw,
+                    }
+                )
+        elif experiment_type == "eis":
+            zreal = data["zreal_ohm"]
+            zimag = data["zimag_ohm"]
+            minus_zimag = -zimag
+            row.update(
+                {
+                    "zreal_min_ohm": float(np.nanmin(zreal)),
+                    "zreal_max_ohm": float(np.nanmax(zreal)),
+                    "max_minus_zimag_ohm": float(np.nanmax(minus_zimag)),
+                    "estimated_rs_ohm": float(zreal[int(np.nanargmin(np.abs(minus_zimag)))]),
+                    "estimated_diameter_ohm": float(np.nanmax(zreal) - np.nanmin(zreal)),
+                }
+            )
+            frequency = data.get("frequency_hz")
+            if frequency is not None and len(frequency):
+                row["frequency_min_Hz"] = float(np.nanmin(frequency))
+                row["frequency_max_Hz"] = float(np.nanmax(frequency))
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def add_generic_trace(
+    fig: go.Figure,
+    record: dict[str, Any],
+    experiment_type: str,
+    display_units: dict[str, str],
+    show_markers: bool,
+) -> None:
+    mode = "lines+markers" if show_markers else "lines"
+    data = record["data"]
+    sample_name = record["sample_name"]
+
+    if experiment_type == "ca":
+        x_unit = display_units["time"]
+        y_unit = display_units["current"]
+        fig.add_trace(
+            go.Scatter(
+                x=convert_role_from_base(data["time"], "time", x_unit),
+                y=convert_role_from_base(data["current"], "current", y_unit),
+                mode=mode,
+                name=sample_name,
+                hovertemplate=f"Time: %{{x:.4g}} {x_unit}<br>Current: %{{y:.4g}} {y_unit}<extra></extra>",
+            )
+        )
+    elif experiment_type == "cp":
+        x_unit = display_units["time"]
+        y_unit = display_units["potential"]
+        fig.add_trace(
+            go.Scatter(
+                x=convert_role_from_base(data["time"], "time", x_unit),
+                y=convert_role_from_base(data["potential"], "potential", y_unit),
+                mode=mode,
+                name=sample_name,
+                hovertemplate=f"Time: %{{x:.4g}} {x_unit}<br>Potential: %{{y:.4g}} {y_unit}<extra></extra>",
+            )
+        )
+    elif experiment_type == "lsv":
+        x_unit = display_units["potential"]
+        y_unit = display_units["current"]
+        electrode_area_cm2 = float(display_units.get("electrode_area_cm2", 1.0))
+        fig.add_trace(
+            go.Scatter(
+                x=convert_role_from_base(data["potential"], "potential", x_unit),
+                y=current_from_amps(data["current"], y_unit, electrode_area_cm2),
+                mode=mode,
+                name=sample_name,
+                hovertemplate=(
+                    f"Potential: %{{x:.4g}} {x_unit}<br>"
+                    f"{current_hover_label(y_unit)}: %{{y:.4g}} {y_unit}<extra></extra>"
+                ),
+            )
+        )
+    elif experiment_type == "eis":
+        z_unit = display_units["impedance"]
+        fig.add_trace(
+            go.Scatter(
+                x=convert_role_from_base(data["zreal_ohm"], "zreal", z_unit),
+                y=convert_role_from_base(-data["zimag_ohm"], "zimag", z_unit),
+                mode=mode,
+                name=sample_name,
+                hovertemplate=f"Z real: %{{x:.4g}} {z_unit}<br>-Z imaginary: %{{y:.4g}} {z_unit}<extra></extra>",
+            )
+        )
+
+
+def render_generic_experiment_analysis(
+    project_name: str,
+    project_workspace: dict[str, Any],
+    experiment_id: str,
+    experiment_type: str,
+    parsed_datasets: list[ParsedDataset],
+) -> None:
+    parser_summary = make_parser_summary(parsed_datasets, experiment_type)
+    st.subheader("Parser summary")
+    st.dataframe(parser_summary, width="stretch", hide_index=True)
+
+    selected_filename = st.selectbox(
+        "Preview / detailed analysis file",
+        [dataset.filename for dataset in parsed_datasets],
+        key=f"generic_preview::{project_name}::{experiment_id}",
+    )
+    selected_dataset = next(dataset for dataset in parsed_datasets if dataset.filename == selected_filename)
+    selected_detected = detect_experiment_columns(selected_dataset, experiment_type)
+
+    with st.expander("Raw parsed data preview", expanded=True):
+        st.dataframe(selected_dataset.dataframe.head(30), width="stretch")
+
+    with st.expander("Detected metadata"):
+        if selected_dataset.metadata:
+            st.json(selected_dataset.metadata)
+        else:
+            st.write("No metadata rows detected before the numeric table.")
+
+    st.subheader("Column and unit controls")
+    st.caption(EXPERIMENT_TYPES[experiment_type]["description"])
+    column_mode = st.radio(
+        "Column selection mode",
+        ["Use detected columns per file", "Manually select columns"],
+        horizontal=True,
+        key=f"generic_column_mode::{project_name}::{experiment_id}",
+    )
+
+    manual_columns: dict[str, Optional[str]] = {}
+    roles = required_roles_for_experiment(experiment_type) + optional_roles_for_experiment(experiment_type)
+    column_count = 3 if experiment_type == "eis" else 2
+    for idx, role in enumerate(roles):
+        if idx % column_count == 0:
+            cols = st.columns(column_count)
+        options = selected_dataset.headers if role in required_roles_for_experiment(experiment_type) else ["None"] + selected_dataset.headers
+        detected_column = selected_detected.get(role)
+        if detected_column in options:
+            default_index = options.index(detected_column)
+        else:
+            default_index = 0
+        with cols[idx % column_count]:
+            selected_column = st.selectbox(
+                f"{role_label(role)} column",
+                options,
+                index=default_index,
+                disabled=column_mode == "Use detected columns per file",
+                key=f"generic_col::{project_name}::{experiment_id}::{role}",
+            )
+        manual_columns[role] = None if selected_column == "None" else selected_column
+
+    selected_units: dict[str, str] = {}
+    unit_cols = st.columns(min(3, len(roles)))
+    for idx, role in enumerate(roles):
+        with unit_cols[idx % len(unit_cols)]:
+            selected_units[role] = st.selectbox(
+                f"{role_label(role)} input unit",
+                unit_options_for_role(role),
+                key=f"generic_unit::{project_name}::{experiment_id}::{role}",
+            )
+
+    st.subheader("Display controls")
+    display_units: dict[str, str] = {}
+    if experiment_type == "ca":
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            display_units["time"] = st.selectbox("Time display unit", display_unit_options_for_role("time"), key=f"disp_time::{project_name}::{experiment_id}")
+        with col2:
+            display_units["current"] = st.selectbox("Current display unit", display_unit_options_for_role("current"), key=f"disp_current::{project_name}::{experiment_id}")
+        with col3:
+            show_markers = st.checkbox("Show data markers", value=False, key=f"generic_markers::{project_name}::{experiment_id}")
+    elif experiment_type == "cp":
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            display_units["time"] = st.selectbox("Time display unit", display_unit_options_for_role("time"), key=f"disp_time::{project_name}::{experiment_id}")
+        with col2:
+            display_units["potential"] = st.selectbox("Potential display unit", display_unit_options_for_role("potential"), key=f"disp_potential::{project_name}::{experiment_id}")
+        with col3:
+            show_markers = st.checkbox("Show data markers", value=False, key=f"generic_markers::{project_name}::{experiment_id}")
+    elif experiment_type == "eis":
+        col1, col2 = st.columns(2)
+        with col1:
+            display_units["impedance"] = st.selectbox("Impedance display unit", display_unit_options_for_role("impedance"), key=f"disp_impedance::{project_name}::{experiment_id}")
+        with col2:
+            show_markers = st.checkbox("Show data markers", value=True, key=f"generic_markers::{project_name}::{experiment_id}")
+    elif experiment_type == "lsv":
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            display_units["potential"] = st.selectbox("Potential display unit", display_unit_options_for_role("potential"), key=f"disp_potential::{project_name}::{experiment_id}")
+        with col2:
+            y_axis_quantity = st.selectbox(
+                "Y-axis quantity",
+                ["Current", "Current density"],
+                key=f"lsv_y_axis_quantity::{project_name}::{experiment_id}",
+            )
+        with col3:
+            show_markers = st.checkbox("Show data markers", value=False, key=f"generic_markers::{project_name}::{experiment_id}")
+
+        if y_axis_quantity == "Current density":
+            display_units["current"] = CURRENT_DENSITY_UNIT
+            display_units["electrode_area_cm2"] = st.number_input(
+                "Electrode surface area (cm^2)",
+                min_value=0.000001,
+                value=1.0,
+                step=0.1,
+                format="%.6f",
+                key=f"lsv_electrode_area::{project_name}::{experiment_id}",
+            )
+        else:
+            display_units["current"] = st.selectbox(
+                "Current display unit",
+                display_unit_options_for_role("current"),
+                key=f"disp_current::{project_name}::{experiment_id}",
+            )
+            display_units["electrode_area_cm2"] = 1.0
+    else:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            display_units["potential"] = st.selectbox("Potential display unit", display_unit_options_for_role("potential"), key=f"disp_potential::{project_name}::{experiment_id}")
+        with col2:
+            display_units["current"] = st.selectbox("Current display unit", display_unit_options_for_role("current"), key=f"disp_current::{project_name}::{experiment_id}")
+        with col3:
+            show_markers = st.checkbox("Show data markers", value=False, key=f"generic_markers::{project_name}::{experiment_id}")
+
+    records: list[dict[str, Any]] = []
+    for dataset in parsed_datasets:
+        role_columns = detect_experiment_columns(dataset, experiment_type) if column_mode == "Use detected columns per file" else manual_columns
+        record = normalize_generic_dataset(dataset, experiment_type, role_columns, selected_units)
+        if record is None:
+            st.warning(f"Skipping {dataset.filename}: required columns could not be normalized for {experiment_short_label(experiment_type)}.")
+            continue
+        records.append(record)
+
+    if not records:
+        st.error("No uploaded files could be analyzed with the selected experiment type and column settings.")
+        st.stop()
+        return
+
+    for record in records:
+        for warning in record.get("warnings", []):
+            st.warning(f"{record['filename']}: {warning}")
+
+    lsv_threshold_display = None
+    lsv_threshold_a = None
+    lsv_threshold_unit = None
+    if experiment_type == "lsv":
+        y_unit = display_units["current"]
+        electrode_area_cm2 = float(display_units.get("electrode_area_cm2", 1.0))
+        all_lsv_y = np.concatenate(
+            [
+                np.abs(current_from_amps(record["data"]["current"], y_unit, electrode_area_cm2))
+                for record in records
+            ]
+        )
+        finite_lsv_y = all_lsv_y[np.isfinite(all_lsv_y)]
+        default_threshold = float(np.nanmax(finite_lsv_y) * 0.1) if finite_lsv_y.size else 0.5
+        if default_threshold <= 0:
+            default_threshold = 0.5
+        lsv_threshold_unit = y_unit
+        lsv_threshold_display = st.number_input(
+            f"Current threshold ({y_unit})",
+            min_value=0.0,
+            value=default_threshold,
+            step=max(default_threshold * 0.1, 1e-9),
+            format="%.6e",
+            key=f"lsv_threshold::{project_name}::{experiment_id}",
+        )
+        lsv_threshold_a = current_value_to_amps(lsv_threshold_display, y_unit, electrode_area_cm2)
+
+    st.subheader(f"Interactive {experiment_short_label(experiment_type)} plot")
+    fig = go.Figure()
+    for record in records:
+        add_generic_trace(fig, record, experiment_type, display_units, show_markers)
+
+    if experiment_type == "lsv" and lsv_threshold_display is not None and lsv_threshold_display > 0:
+        fig.add_hline(
+            y=lsv_threshold_display,
+            line_dash="dot",
+            annotation_text=f"+{lsv_threshold_display:g} {lsv_threshold_unit}",
+        )
+        fig.add_hline(
+            y=-lsv_threshold_display,
+            line_dash="dot",
+            annotation_text=f"-{lsv_threshold_display:g} {lsv_threshold_unit}",
+        )
+
+    if experiment_type == "ca":
+        fig.update_layout(xaxis_title=f"Time / {display_units['time']}", yaxis_title=f"Current / {display_units['current']}")
+    elif experiment_type == "cp":
+        fig.update_layout(xaxis_title=f"Time / {display_units['time']}", yaxis_title=f"Potential / {display_units['potential']}")
+    elif experiment_type == "eis":
+        fig.update_layout(xaxis_title=f"Z real / {display_units['impedance']}", yaxis_title=f"-Z imaginary / {display_units['impedance']}")
+        fig.update_yaxes(scaleanchor="x", scaleratio=1)
+    elif experiment_type == "lsv":
+        fig.update_layout(
+            xaxis_title=f"Potential / {display_units['potential']}",
+            yaxis_title=current_axis_label(display_units["current"]),
+        )
+    else:
+        fig.update_layout(xaxis_title=f"Potential / {display_units['potential']}", yaxis_title=f"Current / {display_units['current']}")
+
+    fig.update_layout(template="plotly_white", height=620, legend_title_text="Sample")
+    st.plotly_chart(fig, width="stretch")
+
+    if experiment_type == "eis" and any(record["data"].get("frequency_hz") is not None for record in records):
+        bode_mag = go.Figure()
+        bode_phase = go.Figure()
+        z_unit = display_units["impedance"]
+        for record in records:
+            frequency = record["data"].get("frequency_hz")
+            if frequency is None or not len(frequency):
+                continue
+            zreal = record["data"]["zreal_ohm"]
+            zimag = record["data"]["zimag_ohm"]
+            zmod = np.sqrt(zreal**2 + zimag**2)
+            phase = np.rad2deg(np.arctan2(zimag, zreal))
+            bode_mag.add_trace(
+                go.Scatter(
+                    x=frequency,
+                    y=convert_role_from_base(zmod, "zmod", z_unit),
+                    mode="lines+markers" if show_markers else "lines",
+                    name=record["sample_name"],
+                )
+            )
+            bode_phase.add_trace(
+                go.Scatter(
+                    x=frequency,
+                    y=phase,
+                    mode="lines+markers" if show_markers else "lines",
+                    name=record["sample_name"],
+                )
+            )
+        if bode_mag.data:
+            bode_tabs = st.tabs(["Bode magnitude", "Bode phase"])
+            with bode_tabs[0]:
+                bode_mag.update_layout(
+                    xaxis_title="Frequency / Hz",
+                    yaxis_title=f"|Z| / {z_unit}",
+                    xaxis_type="log",
+                    template="plotly_white",
+                    height=430,
+                )
+                st.plotly_chart(bode_mag, width="stretch")
+            with bode_tabs[1]:
+                bode_phase.update_layout(
+                    xaxis_title="Frequency / Hz",
+                    yaxis_title="Phase / deg",
+                    xaxis_type="log",
+                    template="plotly_white",
+                    height=430,
+                )
+                st.plotly_chart(bode_phase, width="stretch")
+
+    plot_html = fig.to_html(full_html=True, include_plotlyjs="cdn")
+    st.download_button(
+        "Download interactive plot as HTML",
+        data=plot_html,
+        file_name=f"voltscope_{experiment_type}_plot.html",
+        mime="text/html",
+    )
+
+    st.subheader("Analysis results")
+    results_df = build_generic_results(
+        records,
+        experiment_type,
+        lsv_threshold_a=lsv_threshold_a,
+        lsv_threshold_display=lsv_threshold_display,
+        lsv_threshold_unit=lsv_threshold_unit,
+    )
+    st.dataframe(results_df, width="stretch", hide_index=True)
+
+    export_buffer = io.StringIO()
+    export_buffer.write("# Parser summary\n")
+    export_buffer.write(parser_summary.to_csv(index=False))
+    export_buffer.write("\n# Analysis results\n")
+    export_buffer.write(results_df.to_csv(index=False))
+    st.download_button(
+        "Download analysis results as CSV",
+        data=export_buffer.getvalue(),
+        file_name=f"voltscope_{experiment_type}_analysis_results.csv",
+        mime="text/csv",
+    )
+
+    store_generic_experiment_analysis(
+        project_workspace,
+        experiment_id,
+        experiment_type,
+        records,
+        parser_summary,
+        results_df,
+        {
+            "column_mode": column_mode,
+            "selected_units": selected_units,
+            "display_units": display_units,
+            "lsv_threshold": lsv_threshold_display,
+            "lsv_threshold_unit": lsv_threshold_unit,
+        },
+    )
+    render_experiment_notes(project_name, project_workspace, experiment_id)
 
 
 # ---------- Streamlit UI ----------
@@ -919,6 +1998,7 @@ def normalize_project_workspace(project_name: str, workspace: Any) -> dict[str, 
             experiment.setdefault("files", {})
             experiment.setdefault("analysis_outputs", {})
             experiment.setdefault("notes", "")
+            experiment.setdefault("experiment_type", "cv")
         return workspace
 
     timestamp = now_timestamp()
@@ -942,6 +2022,7 @@ def normalize_project_workspace(project_name: str, workspace: Any) -> dict[str, 
             },
             "analysis_outputs": {},
             "notes": "\n\n".join(imported_notes),
+            "experiment_type": "cv",
         }
 
     return project
@@ -994,7 +2075,11 @@ def slugify_name(name: str) -> str:
     return slug or "experiment"
 
 
-def create_experiment(project_workspace: dict[str, Any], experiment_name: str) -> str:
+def create_experiment(
+    project_workspace: dict[str, Any],
+    experiment_name: str,
+    experiment_type: str = "cv",
+) -> str:
     experiments = project_workspace.setdefault("experiments", {})
     base_id = slugify_name(experiment_name)
     experiment_id = base_id
@@ -1011,6 +2096,7 @@ def create_experiment(project_workspace: dict[str, Any], experiment_name: str) -
         "files": {},
         "analysis_outputs": {},
         "notes": "",
+        "experiment_type": experiment_type,
     }
     save_project_workspaces()
     return experiment_id
@@ -1037,6 +2123,20 @@ def delete_experiment(project_name: str, project_workspace: dict[str, Any], expe
     if st.session_state.get(active_key) == experiment_id:
         st.session_state.pop(active_key, None)
     clear_session_keys_containing(f"::{project_name}::{experiment_id}")
+    save_project_workspaces()
+
+
+def rename_experiment(project_workspace: dict[str, Any], experiment_id: str, new_name: str) -> None:
+    experiment = project_workspace.get("experiments", {}).get(experiment_id)
+    if not experiment:
+        return
+
+    cleaned_name = new_name.strip()
+    if not cleaned_name:
+        return
+
+    experiment["name"] = cleaned_name
+    experiment["updated_at"] = now_timestamp()
     save_project_workspaces()
 
 
@@ -1108,7 +2208,9 @@ def store_experiment_analysis(
         files[dataset.filename] = serialize_analyzed_dataset(dataset)
 
     experiment["updated_at"] = now_timestamp()
+    experiment["experiment_type"] = "cv"
     experiment["analysis_outputs"] = {
+        "experiment_type": "cv",
         "parser_summary": dataframe_records(parser_summary_df),
         "esw_summary": dataframe_records(esw_df),
         "peak_metrics": dataframe_records(peak_metric_df),
@@ -1127,6 +2229,7 @@ def experiments_dataframe(project_workspace: dict[str, Any]) -> pd.DataFrame:
                 "experiment": experiment.get("name", experiment_id),
                 "created": format_timestamp(experiment.get("created_at")),
                 "updated": format_timestamp(experiment.get("updated_at")),
+                "type": experiment_short_label(experiment.get("experiment_type", "cv")),
                 "files": len(files),
                 "notes": "yes" if experiment.get("notes") else "",
             }
@@ -1137,7 +2240,6 @@ def experiments_dataframe(project_workspace: dict[str, Any]) -> pd.DataFrame:
 def render_experiment_notes(project_name: str, project_workspace: dict[str, Any], experiment_id: str) -> None:
     experiment = project_workspace["experiments"][experiment_id]
     st.subheader("Experiment notes")
-    st.caption(f"{experiment.get('name', experiment_id)} · {project_name}")
     note_key = f"experiment_notes::{project_name}::{experiment_id}"
     if note_key not in st.session_state:
         st.session_state[note_key] = experiment.get("notes", "")
@@ -1275,6 +2377,9 @@ def apply_app_theme() -> None:
         input:focus {
             box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.08);
         }
+        [data-testid="InputInstructions"] {
+            display: none;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1382,10 +2487,19 @@ def render_project_sidebar(project_name: str, project_workspace: dict[str, Any])
                 value=default_name,
                 key=f"sidebar_new_experiment::{project_name}",
             )
+            experiment_type_label = st.selectbox(
+                "Data type",
+                EXPERIMENT_TYPE_LABELS,
+                key=f"sidebar_new_experiment_type::{project_name}",
+            )
             if st.button("Create", type="primary", key=f"create_experiment::{project_name}"):
                 cleaned_name = experiment_name.strip()
                 if cleaned_name:
-                    experiment_id = create_experiment(project_workspace, cleaned_name)
+                    experiment_id = create_experiment(
+                        project_workspace,
+                        cleaned_name,
+                        EXPERIMENT_TYPE_BY_LABEL[experiment_type_label],
+                    )
                     set_active_experiment(project_name, experiment_id)
                     st.rerun()
                 st.error("Enter an experiment name.")
@@ -1412,6 +2526,28 @@ def render_project_sidebar(project_name: str, project_workspace: dict[str, Any])
             st.caption(format_timestamp(experiment.get("updated_at") or experiment.get("created_at")))
 
         st.divider()
+        if active_experiment_id in experiments:
+            active_experiment = experiments[active_experiment_id]
+            active_experiment_name = active_experiment.get("name", active_experiment_id)
+            with st.expander("Rename selected experiment"):
+                with st.form(key=f"rename_experiment_form::{project_name}::{active_experiment_id}"):
+                    new_experiment_name = st.text_input(
+                        "Experiment name",
+                        value=active_experiment_name,
+                        key=f"rename_experiment_input::{project_name}::{active_experiment_id}",
+                    )
+                    rename_submitted = st.form_submit_button("Rename")
+
+                if rename_submitted:
+                    cleaned_name = new_experiment_name.strip()
+                    if not cleaned_name:
+                        st.error("Enter an experiment name.")
+                    elif cleaned_name != active_experiment_name:
+                        rename_experiment(project_workspace, active_experiment_id, cleaned_name)
+                        st.rerun()
+                    else:
+                        st.info("The experiment already has that name.")
+
         with st.expander("Delete"):
             if active_experiment_id in experiments:
                 active_experiment = experiments[active_experiment_id]
@@ -1462,10 +2598,6 @@ def render_project_home() -> None:
         unsafe_allow_html=True,
     )
 
-    st.markdown(
-        '<div class="home-action-label">Saved projects are listed in the sidebar by most recently opened.</div>',
-        unsafe_allow_html=True,
-    )
 
     st.markdown(
         "<div class='workspace-card'><h3>Create new project</h3><p>Name the workspace that will hold experiments, files, outputs, and notes.</p></div>",
@@ -1491,82 +2623,145 @@ def render_saved_experiment(
     experiment = project_workspace["experiments"][experiment_id]
     files = experiment.get("files", {})
     outputs = experiment.get("analysis_outputs", {})
+    experiment_type = outputs.get("experiment_type") or experiment.get("experiment_type", "cv")
 
     if show_header:
         st.markdown(
             f"""
             <div class="experiment-card">
                 <h3>{escape_html(experiment.get("name", experiment_id))}</h3>
-                <p>Created {format_timestamp(experiment.get("created_at"))} · {len(files)} files</p>
+                <p>{escape_html(experiment_short_label(experiment_type))} · created {format_timestamp(experiment.get("created_at"))} · {len(files)} files</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
     if files:
+        st.subheader("Saved files")
         file_rows = []
         fig = go.Figure()
-        display_unit = st.selectbox(
-            "Saved trace display unit",
-            ["uA", "mA", "A", "nA"],
-            key=f"saved_display_unit::{project_name}::{experiment_id}",
-        )
+
+        if experiment_type in {"cv", "lsv"}:
+            display_unit = st.selectbox(
+                "Saved trace display unit",
+                ["uA", "mA", "A", "nA"],
+                key=f"saved_display_unit::{project_name}::{experiment_id}",
+            )
+        elif experiment_type == "ca":
+            display_unit = st.selectbox(
+                "Saved current display unit",
+                ["uA", "mA", "A", "nA"],
+                key=f"saved_display_unit::{project_name}::{experiment_id}",
+            )
+        elif experiment_type == "cp":
+            display_unit = st.selectbox(
+                "Saved potential display unit",
+                ["V", "mV"],
+                key=f"saved_display_unit::{project_name}::{experiment_id}",
+            )
+        else:
+            display_unit = st.selectbox(
+                "Saved impedance display unit",
+                ["ohm", "kohm", "Mohm"],
+                key=f"saved_display_unit::{project_name}::{experiment_id}",
+            )
+
         for filename, file_record in files.items():
             summary = file_record.get("summary", {})
+            trace = file_record.get("trace", {})
             file_rows.append(
                 {
                     "file": filename,
                     "sample": summary.get("sample_name", ""),
+                    "type": experiment_short_label(summary.get("experiment_type", experiment_type)),
                     "points": summary.get("points", ""),
-                    "potential_range_V": (
-                        f"{summary.get('potential_min_v'):.4g} to {summary.get('potential_max_v'):.4g}"
-                        if summary.get("potential_min_v") is not None and summary.get("potential_max_v") is not None
-                        else ""
-                    ),
-                    "current_range_A": (
-                        f"{summary.get('current_min_a'):.4g} to {summary.get('current_max_a'):.4g}"
-                        if summary.get("current_min_a") is not None and summary.get("current_max_a") is not None
-                        else ""
-                    ),
+                    "warnings": "; ".join(summary.get("warnings", [])),
                 }
             )
-            trace = file_record.get("trace", {})
-            potential_v = trace.get("potential_v") or []
-            raw_current_a = trace.get("raw_current_a") or []
-            if potential_v and raw_current_a:
-                fig.add_trace(
-                    go.Scatter(
-                        x=potential_v,
-                        y=current_from_amps(np.array(raw_current_a, dtype=float), display_unit),
-                        mode="lines",
-                        name=summary.get("sample_name") or filename,
+
+            sample_name = summary.get("sample_name") or filename
+            if experiment_type in {"cv", "lsv"}:
+                potential = trace.get("potential_v") or trace.get("potential") or []
+                current = trace.get("raw_current_a") or trace.get("current") or []
+                if potential and current:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=potential,
+                            y=current_from_amps(np.array(current, dtype=float), display_unit),
+                            mode="lines",
+                            name=sample_name,
+                        )
                     )
-                )
+            elif experiment_type == "ca":
+                time_s = trace.get("time") or []
+                current = trace.get("current") or []
+                if time_s and current:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=time_s,
+                            y=current_from_amps(np.array(current, dtype=float), display_unit),
+                            mode="lines",
+                            name=sample_name,
+                        )
+                    )
+            elif experiment_type == "cp":
+                time_s = trace.get("time") or []
+                potential = trace.get("potential") or []
+                if time_s and potential:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=time_s,
+                            y=convert_role_from_base(np.array(potential, dtype=float), "potential", display_unit),
+                            mode="lines",
+                            name=sample_name,
+                        )
+                    )
+            elif experiment_type == "eis":
+                zreal = trace.get("zreal_ohm") or []
+                zimag = trace.get("zimag_ohm") or []
+                if zreal and zimag:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=convert_role_from_base(np.array(zreal, dtype=float), "zreal", display_unit),
+                            y=convert_role_from_base(-np.array(zimag, dtype=float), "zimag", display_unit),
+                            mode="lines+markers",
+                            name=sample_name,
+                        )
+                    )
 
         st.dataframe(pd.DataFrame(file_rows), width="stretch", hide_index=True)
         if fig.data:
-            fig.update_layout(
-                xaxis_title="Potential / V",
-                yaxis_title=f"Current / {display_unit}",
-                template="plotly_white",
-                height=420,
-                legend_title_text="Saved trace",
-            )
+            if experiment_type in {"cv", "lsv"}:
+                fig.update_layout(xaxis_title="Potential / V", yaxis_title=f"Current / {display_unit}")
+            elif experiment_type == "ca":
+                fig.update_layout(xaxis_title="Time / s", yaxis_title=f"Current / {display_unit}")
+            elif experiment_type == "cp":
+                fig.update_layout(xaxis_title="Time / s", yaxis_title=f"Potential / {display_unit}")
+            else:
+                fig.update_layout(xaxis_title=f"Z real / {display_unit}", yaxis_title=f"-Z imaginary / {display_unit}")
+                fig.update_yaxes(scaleanchor="x", scaleratio=1)
+            fig.update_layout(template="plotly_white", height=420, legend_title_text="Saved trace")
             st.plotly_chart(fig, width="stretch")
 
-    output_tabs = st.tabs(["ESW", "Peak metrics", "Parser summary"])
-    with output_tabs[0]:
-        st.dataframe(pd.DataFrame(outputs.get("esw_summary", [])), width="stretch", hide_index=True)
-    with output_tabs[1]:
-        st.dataframe(pd.DataFrame(outputs.get("peak_metrics", [])), width="stretch", hide_index=True)
-        compact_metrics = outputs.get("compact_metrics", [])
-        if compact_metrics:
-            st.dataframe(pd.DataFrame(compact_metrics), width="stretch", hide_index=True)
-    with output_tabs[2]:
-        st.dataframe(pd.DataFrame(outputs.get("parser_summary", [])), width="stretch", hide_index=True)
+    if outputs.get("results") is not None:
+        output_tabs = st.tabs(["Results", "Parser summary"])
+        with output_tabs[0]:
+            st.dataframe(pd.DataFrame(outputs.get("results", [])), width="stretch", hide_index=True)
+        with output_tabs[1]:
+            st.dataframe(pd.DataFrame(outputs.get("parser_summary", [])), width="stretch", hide_index=True)
+    else:
+        output_tabs = st.tabs(["ESW", "Peak metrics", "Parser summary"])
+        with output_tabs[0]:
+            st.dataframe(pd.DataFrame(outputs.get("esw_summary", [])), width="stretch", hide_index=True)
+        with output_tabs[1]:
+            st.dataframe(pd.DataFrame(outputs.get("peak_metrics", [])), width="stretch", hide_index=True)
+            compact_metrics = outputs.get("compact_metrics", [])
+            if compact_metrics:
+                st.dataframe(pd.DataFrame(compact_metrics), width="stretch", hide_index=True)
+        with output_tabs[2]:
+            st.dataframe(pd.DataFrame(outputs.get("parser_summary", [])), width="stretch", hide_index=True)
 
     render_experiment_notes(project_name, project_workspace, experiment_id)
-
 
 def render_project_header(project_name: str, project_workspace: dict[str, Any]) -> None:
     experiments = project_workspace.get("experiments", {})
@@ -1611,32 +2806,32 @@ def main() -> None:
     project_workspace = get_project_workspace(active_project_name)
     active_experiment_id = render_project_sidebar(active_project_name, project_workspace)
 
-    render_project_header(active_project_name, project_workspace)
-
     if not active_experiment_id:
         render_project_dashboard(active_project_name, project_workspace)
         return
 
     experiment_id = active_experiment_id
     experiment = project_workspace["experiments"][experiment_id]
+    experiment_type = experiment.setdefault("experiment_type", "cv")
+    if experiment_type not in EXPERIMENT_TYPES:
+        experiment_type = "cv"
+        experiment["experiment_type"] = experiment_type
     st.markdown(
         f"""
         <div class="experiment-card">
             <h3>{escape_html(experiment.get("name", experiment_id))}</h3>
-            <p>Created {format_timestamp(experiment.get("created_at"))} · updated {format_timestamp(experiment.get("updated_at"))}</p>
+            <p>{escape_html(experiment_short_label(experiment_type))} · created {format_timestamp(experiment.get("created_at"))} · updated {format_timestamp(experiment.get("updated_at"))}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    st.subheader("Upload files to this experiment")
-    st.caption("CSV, TXT, TSV, and DAT files are supported. Uploaded files are saved into the selected experiment.")
-
     uploaded_files = st.file_uploader(
-        "Upload CV data files",
+        "Data files",
         type=["csv", "txt", "tsv", "dat"],
         accept_multiple_files=True,
-        key=f"upload::{active_project_name}::{experiment_id}",
+        label_visibility="collapsed",
+        key=f"upload::{active_project_name}::{experiment_id}::{experiment_type}",
     )
 
     if not uploaded_files:
@@ -1652,6 +2847,16 @@ def main() -> None:
 
     if not parsed_datasets:
         st.stop()
+        return
+
+    if experiment_type != "cv":
+        render_generic_experiment_analysis(
+            active_project_name,
+            project_workspace,
+            experiment_id,
+            experiment_type,
+            parsed_datasets,
+        )
         return
 
     st.subheader("Parser summary")
@@ -1719,6 +2924,20 @@ def main() -> None:
     with unit_col2:
         selected_current_unit = st.selectbox("Current input unit", ["Auto", "A", "mA", "uA", "nA"])
     with unit_col3:
+        y_axis_quantity = st.selectbox("Y-axis quantity", ["Current", "Current density"])
+
+    electrode_area_cm2 = 1.0
+    if y_axis_quantity == "Current density":
+        current_display_unit = CURRENT_DENSITY_UNIT
+        electrode_area_cm2 = st.number_input(
+            "Electrode surface area (cm^2)",
+            min_value=0.000001,
+            value=1.0,
+            step=0.1,
+            format="%.6f",
+            key=f"cv_electrode_area::{active_project_name}::{experiment_id}",
+        )
+    else:
         current_display_unit = st.selectbox("Current display unit", ["uA", "mA", "A", "nA"])
 
     st.subheader("Processing controls")
@@ -1792,9 +3011,16 @@ def main() -> None:
     )
 
     st.subheader("Peak detection")
-    current_display_values = current_from_amps(analysis_current_a, current_display_unit)
+    current_display_values = current_from_amps(
+        analysis_current_a,
+        current_display_unit,
+        electrode_area_cm2,
+    )
     current_range = float(np.nanmax(current_display_values) - np.nanmin(current_display_values))
-    default_prominence = max(current_range * 0.05, 1e-12 / CURRENT_UNITS_TO_A[current_display_unit])
+    default_prominence = max(
+        current_range * 0.05,
+        current_from_amps(np.array([1e-12]), current_display_unit, electrode_area_cm2)[0],
+    )
 
     peak_col1, peak_col2, peak_col3 = st.columns(3)
     with peak_col1:
@@ -1819,9 +3045,9 @@ def main() -> None:
     peaks = detect_peaks(
         detailed_dataset.potential_v,
         analysis_current_a,
-        current_value_to_amps(min_prominence_display, current_display_unit),
+        current_value_to_amps(min_prominence_display, current_display_unit, electrode_area_cm2),
         int(min_distance),
-        current_value_to_amps(min_abs_current_display, current_display_unit),
+        current_value_to_amps(min_abs_current_display, current_display_unit, electrode_area_cm2),
     )
 
     peak_rows = [
@@ -1831,10 +3057,10 @@ def main() -> None:
             "index": peak.index,
             "potential_V": peak.potential,
             f"current_{current_display_unit}": current_from_amps(
-                np.array([peak.raw_current]), current_display_unit
+                np.array([peak.raw_current]), current_display_unit, electrode_area_cm2
             )[0],
             f"prominence_{current_display_unit}": current_from_amps(
-                np.array([peak.prominence]), current_display_unit
+                np.array([peak.prominence]), current_display_unit, electrode_area_cm2
             )[0],
             "segment": peak.segment_index,
             "confidence": peak.confidence,
@@ -1876,14 +3102,14 @@ def main() -> None:
         select_col1, select_col2 = st.columns(2)
         with select_col1:
             if oxidation_peaks:
-                labels = [peak_label(peak, current_display_unit) for peak in oxidation_peaks]
+                labels = [peak_label(peak, current_display_unit, electrode_area_cm2) for peak in oxidation_peaks]
                 selected_label = st.selectbox("Oxidation peak", labels)
                 selected_oxidation_peak = oxidation_peaks[labels.index(selected_label)]
             else:
                 st.info("No oxidation peaks detected. Lower the prominence threshold or use manual selection.")
         with select_col2:
             if reduction_peaks:
-                labels = [peak_label(peak, current_display_unit) for peak in reduction_peaks]
+                labels = [peak_label(peak, current_display_unit, electrode_area_cm2) for peak in reduction_peaks]
                 selected_label = st.selectbox("Reduction peak", labels)
                 selected_reduction_peak = reduction_peaks[labels.index(selected_label)]
             else:
@@ -1934,7 +3160,7 @@ def main() -> None:
                     "index": anchor_a_idx,
                     "potential_V": detailed_dataset.potential_v[anchor_a_idx],
                     f"current_{current_display_unit}": current_from_amps(
-                        np.array([analysis_current_a[anchor_a_idx]]), current_display_unit
+                        np.array([analysis_current_a[anchor_a_idx]]), current_display_unit, electrode_area_cm2
                     )[0],
                 },
                 {
@@ -1942,7 +3168,7 @@ def main() -> None:
                     "index": anchor_b_idx,
                     "potential_V": detailed_dataset.potential_v[anchor_b_idx],
                     f"current_{current_display_unit}": current_from_amps(
-                        np.array([analysis_current_a[anchor_b_idx]]), current_display_unit
+                        np.array([analysis_current_a[anchor_b_idx]]), current_display_unit, electrode_area_cm2
                     )[0],
                 },
             ]
@@ -1953,7 +3179,7 @@ def main() -> None:
     trace_mode = "lines+markers" if show_markers else "lines"
 
     for dataset in analyzed:
-        raw_display = current_from_amps(dataset.raw_current_a, current_display_unit)
+        raw_display = current_from_amps(dataset.raw_current_a, current_display_unit, electrode_area_cm2)
         if dataset.smoothed_current_a is not None and show_raw_with_smoothed:
             fig.add_trace(
                 go.Scatter(
@@ -1962,9 +3188,11 @@ def main() -> None:
                     mode="lines",
                     name=f"{dataset.sample_name} raw",
                     opacity=0.35,
-                    hovertemplate="Potential: %{x:.4g} V<br>Current: %{y:.4g} "
-                    + current_display_unit
-                    + "<extra></extra>",
+                    hovertemplate=(
+                        f"Potential: %{{x:.4g}} V<br>{current_hover_label(current_display_unit)}: %{{y:.4g}} "
+                        + current_display_unit
+                        + "<extra></extra>"
+                    ),
                 )
             )
         elif dataset.smoothed_current_a is None:
@@ -1974,23 +3202,27 @@ def main() -> None:
                     y=raw_display,
                     mode=trace_mode,
                     name=dataset.sample_name,
-                    hovertemplate="Potential: %{x:.4g} V<br>Current: %{y:.4g} "
-                    + current_display_unit
-                    + "<extra></extra>",
+                    hovertemplate=(
+                        f"Potential: %{{x:.4g}} V<br>{current_hover_label(current_display_unit)}: %{{y:.4g}} "
+                        + current_display_unit
+                        + "<extra></extra>"
+                    ),
                 )
             )
 
         if dataset.smoothed_current_a is not None:
-            smoothed_display = current_from_amps(dataset.smoothed_current_a, current_display_unit)
+            smoothed_display = current_from_amps(dataset.smoothed_current_a, current_display_unit, electrode_area_cm2)
             fig.add_trace(
                 go.Scatter(
                     x=dataset.potential_v,
                     y=smoothed_display,
                     mode=trace_mode,
                     name=f"{dataset.sample_name} smoothed",
-                    hovertemplate="Potential: %{x:.4g} V<br>Current: %{y:.4g} "
-                    + current_display_unit
-                    + "<extra></extra>",
+                    hovertemplate=(
+                        f"Potential: %{{x:.4g}} V<br>{current_hover_label(current_display_unit)}: %{{y:.4g}} "
+                        + current_display_unit
+                        + "<extra></extra>"
+                    ),
                 )
             )
 
@@ -2009,13 +3241,16 @@ def main() -> None:
                     y=current_from_amps(
                         np.array([analysis_current_a[peak.index] for peak in marker_peaks]),
                         current_display_unit,
+                        electrode_area_cm2,
                     ),
                     mode="markers",
                     name=name,
                     marker={"size": 10, "symbol": symbol},
-                    hovertemplate="Potential: %{x:.4g} V<br>Current: %{y:.4g} "
-                    + current_display_unit
-                    + "<extra></extra>",
+                    hovertemplate=(
+                        f"Potential: %{{x:.4g}} V<br>{current_hover_label(current_display_unit)}: %{{y:.4g}} "
+                        + current_display_unit
+                        + "<extra></extra>"
+                    ),
                 )
             )
 
@@ -2027,6 +3262,7 @@ def main() -> None:
                 y=current_from_amps(
                     np.array([analysis_current_a[peak.index] for peak in selected_peaks]),
                     current_display_unit,
+                    electrode_area_cm2,
                 ),
                 mode="markers",
                 name="Selected peaks",
@@ -2038,7 +3274,7 @@ def main() -> None:
         fig.add_trace(
             go.Scatter(
                 x=detailed_dataset.potential_v,
-                y=current_from_amps(baseline_current, current_display_unit),
+                y=current_from_amps(baseline_current, current_display_unit, electrode_area_cm2),
                 mode="lines",
                 name="Linear baseline",
                 line={"dash": "dash"},
@@ -2050,6 +3286,7 @@ def main() -> None:
                 y=current_from_amps(
                     np.array([analysis_current_a[anchor_a_idx], analysis_current_a[anchor_b_idx]]),
                     current_display_unit,
+                    electrode_area_cm2,
                 ),
                 mode="markers",
                 name="Baseline anchors",
@@ -2062,7 +3299,7 @@ def main() -> None:
 
     fig.update_layout(
         xaxis_title="Potential / V",
-        yaxis_title=f"Current / {current_display_unit}",
+        yaxis_title=current_axis_label(current_display_unit),
         template="plotly_white",
         height=620,
         legend_title_text="Trace",
@@ -2081,13 +3318,19 @@ def main() -> None:
 
     st.subheader("Operational ESW summary")
     threshold_display = st.number_input(
-        f"ESW threshold current ({current_display_unit})",
+        f"ESW threshold ({current_display_unit})",
         min_value=0.0,
-        value=float(max(current_range * 0.1, 1e-12 / CURRENT_UNITS_TO_A[current_display_unit])),
-        step=float(max(current_range * 0.05, 1e-12 / CURRENT_UNITS_TO_A[current_display_unit])),
+        value=float(max(
+            current_range * 0.1,
+            current_from_amps(np.array([1e-12]), current_display_unit, electrode_area_cm2)[0],
+        )),
+        step=float(max(
+            current_range * 0.05,
+            current_from_amps(np.array([1e-12]), current_display_unit, electrode_area_cm2)[0],
+        )),
         format="%.6e",
     )
-    threshold_a = current_value_to_amps(threshold_display, current_display_unit)
+    threshold_a = current_value_to_amps(threshold_display, current_display_unit, electrode_area_cm2)
     esw_rows = []
     for dataset in analyzed:
         result = calculate_esw(dataset.potential_v, dataset.raw_current_a, threshold_a)
@@ -2111,10 +3354,11 @@ def main() -> None:
         baseline_current,
         analysis_current_a,
         current_display_unit,
+        electrode_area_cm2,
     )
     if peak_metric_rows:
         peak_metric_df = pd.DataFrame(peak_metric_rows)
-        compact_metrics_df = metrics_table(metrics, current_display_unit)
+        compact_metrics_df = metrics_table(metrics, current_display_unit, electrode_area_cm2)
         st.dataframe(peak_metric_df, width="stretch")
         st.dataframe(compact_metrics_df, width="stretch")
     else:
@@ -2151,6 +3395,8 @@ def main() -> None:
             "potential_unit": selected_potential_unit,
             "current_unit": selected_current_unit,
             "current_display_unit": current_display_unit,
+            "y_axis_quantity": y_axis_quantity,
+            "electrode_area_cm2": electrode_area_cm2,
             "smoothing_method": smoothing_method,
             "smoothing_window": smoothing_window,
             "use_smoothed_for_peaks": use_smoothed_for_peaks,
