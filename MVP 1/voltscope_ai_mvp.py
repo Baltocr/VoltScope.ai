@@ -674,7 +674,57 @@ def convert_current_to_amps(values: np.ndarray, unit: str) -> np.ndarray:
     return values * CURRENT_UNITS_TO_A.get(unit, 1.0)
 
 
+CURRENT_DENSITY_UNITS_TO_A_PER_CM2 = {
+    "A/cm^2": 1.0,
+    "mA/cm^2": 1e-3,
+    "uA/cm^2": 1e-6,
+    "nA/cm^2": 1e-9,
+}
 CURRENT_DENSITY_UNIT = "mA/cm^2"
+REFERENCE_ELECTRODE_OPTIONS = [
+    "Ag/AgCl",
+    "SCE",
+    "SHE/NHE",
+    "RHE",
+    "Hg/HgO",
+    "Hg/Hg2SO4",
+    "Fc/Fc+",
+    "Pt quasi-reference",
+    "Other",
+]
+
+
+def is_current_density_unit(display_unit: str) -> bool:
+    return display_unit in CURRENT_DENSITY_UNITS_TO_A_PER_CM2
+
+
+def current_density_unit_from_current_unit(current_unit: str) -> str:
+    if current_unit in CURRENT_UNITS_TO_A:
+        return f"{current_unit}/cm^2"
+    return CURRENT_DENSITY_UNIT
+
+
+def current_density_from_base(
+    values: np.ndarray,
+    display_unit: str,
+    current_source: str,
+    electrode_area_cm2: float = 1.0,
+) -> np.ndarray:
+    if current_source == "Current density":
+        return values / CURRENT_DENSITY_UNITS_TO_A_PER_CM2.get(display_unit, 1e-3)
+    return values / electrode_area_cm2 / CURRENT_DENSITY_UNITS_TO_A_PER_CM2.get(display_unit, 1e-3)
+
+
+def current_density_value_to_base(
+    value: float,
+    display_unit: str,
+    current_source: str,
+    electrode_area_cm2: float = 1.0,
+) -> float:
+    base_density = value * CURRENT_DENSITY_UNITS_TO_A_PER_CM2.get(display_unit, 1e-3)
+    if current_source == "Current density":
+        return base_density
+    return base_density * electrode_area_cm2
 
 
 def current_from_amps(
@@ -682,8 +732,8 @@ def current_from_amps(
     display_unit: str,
     electrode_area_cm2: float = 1.0,
 ) -> np.ndarray:
-    if display_unit == CURRENT_DENSITY_UNIT:
-        return values * 1000.0 / electrode_area_cm2
+    if is_current_density_unit(display_unit):
+        return current_density_from_base(values, display_unit, "Current", electrode_area_cm2)
     return values / CURRENT_UNITS_TO_A.get(display_unit, 1.0)
 
 
@@ -692,20 +742,37 @@ def current_value_to_amps(
     display_unit: str,
     electrode_area_cm2: float = 1.0,
 ) -> float:
-    if display_unit == CURRENT_DENSITY_UNIT:
-        return value * electrode_area_cm2 / 1000.0
+    if is_current_density_unit(display_unit):
+        return current_density_value_to_base(value, display_unit, "Current", electrode_area_cm2)
     return value * CURRENT_UNITS_TO_A.get(display_unit, 1.0)
 
 
 def current_axis_label(display_unit: str) -> str:
-    if display_unit == CURRENT_DENSITY_UNIT:
-        return f"Current density / {CURRENT_DENSITY_UNIT}"
-    return f"Current / {display_unit}"
+    if is_current_density_unit(display_unit):
+        return f"Current density ({display_unit})"
+    return f"Current ({display_unit})"
 
 
 def current_hover_label(display_unit: str) -> str:
-    return "Current density" if display_unit == CURRENT_DENSITY_UNIT else "Current"
+    return "Current density" if is_current_density_unit(display_unit) else "Current"
 
+
+def lsv_axis_title(axis_quantity: str, display_units: dict[str, Any], reference_electrode: Optional[str]) -> str:
+    if axis_quantity == "Potential":
+        title = f"Potential ({display_units['potential']})"
+        if reference_electrode:
+            title += f" vs {reference_electrode}"
+        return title
+    return current_axis_label(display_units["current"])
+
+
+def dataframe_preview_for_display(dataframe: pd.DataFrame) -> pd.DataFrame:
+    hidden_columns = [
+        column
+        for column in dataframe.columns
+        if re.sub(r"[^a-z0-9]+", "", str(column).lower()) == "cycle"
+    ]
+    return dataframe.drop(columns=hidden_columns, errors="ignore")
 
 
 def unit_options_for_role(role: str) -> list[str]:
@@ -1483,6 +1550,7 @@ def build_generic_results(
     lsv_threshold_a: Optional[float] = None,
     lsv_threshold_display: Optional[float] = None,
     lsv_threshold_unit: Optional[str] = None,
+    lsv_current_source: str = "Current",
 ) -> pd.DataFrame:
     rows = []
     for record in records:
@@ -1521,17 +1589,18 @@ def build_generic_results(
             )
         elif experiment_type == "lsv":
             potential_v = data["potential"]
-            current_a = data["current"]
+            current_values = data["current"]
+            current_summary_key = "current_density_A_cm2" if lsv_current_source == "Current density" else "current_A"
             row.update(
                 {
                     "potential_min_V": float(np.nanmin(potential_v)),
                     "potential_max_V": float(np.nanmax(potential_v)),
-                    "current_min_A": float(np.nanmin(current_a)),
-                    "current_max_A": float(np.nanmax(current_a)),
+                    f"{current_summary_key}_min": float(np.nanmin(current_values)),
+                    f"{current_summary_key}_max": float(np.nanmax(current_values)),
                 }
             )
             if lsv_threshold_a is not None and lsv_threshold_a > 0:
-                result = calculate_esw(potential_v, current_a, lsv_threshold_a)
+                result = calculate_esw(potential_v, current_values, lsv_threshold_a)
                 row.update(
                     {
                         f"threshold_{lsv_threshold_unit or 'display'}": lsv_threshold_display,
@@ -1599,18 +1668,35 @@ def add_generic_trace(
             )
         )
     elif experiment_type == "lsv":
-        x_unit = display_units["potential"]
-        y_unit = display_units["current"]
+        potential_unit = display_units["potential"]
+        current_density_unit = display_units["current"]
         electrode_area_cm2 = float(display_units.get("electrode_area_cm2", 1.0))
+        current_source = display_units.get("current_source", "Current")
+
+        def lsv_axis_values(axis_quantity: str) -> tuple[np.ndarray, str, str]:
+            if axis_quantity == "Current density":
+                return (
+                    current_density_from_base(data["current"], current_density_unit, current_source, electrode_area_cm2),
+                    "Current density",
+                    current_density_unit,
+                )
+            return (
+                convert_role_from_base(data["potential"], "potential", potential_unit),
+                "Potential",
+                potential_unit,
+            )
+
+        x_values, x_label, x_unit = lsv_axis_values(display_units.get("x_axis", "Potential"))
+        y_values, y_label, y_unit = lsv_axis_values(display_units.get("y_axis", "Current density"))
         fig.add_trace(
             go.Scatter(
-                x=convert_role_from_base(data["potential"], "potential", x_unit),
-                y=current_from_amps(data["current"], y_unit, electrode_area_cm2),
+                x=x_values,
+                y=y_values,
                 mode=mode,
                 name=sample_name,
                 hovertemplate=(
-                    f"Potential: %{{x:.4g}} {x_unit}<br>"
-                    f"{current_hover_label(y_unit)}: %{{y:.4g}} {y_unit}<extra></extra>"
+                    f"{x_label}: %{{x:.4g}} {x_unit}<br>"
+                    f"{y_label}: %{{y:.4g}} {y_unit}<extra></extra>"
                 ),
             )
         )
@@ -1647,16 +1733,20 @@ def render_generic_experiment_analysis(
     selected_detected = detect_experiment_columns(selected_dataset, experiment_type)
 
     with st.expander("Raw parsed data preview", expanded=True):
-        st.dataframe(selected_dataset.dataframe.head(30), width="stretch")
+        st.dataframe(dataframe_preview_for_display(selected_dataset.dataframe).head(30), width="stretch")
 
     with st.expander("Detected metadata"):
         if selected_dataset.metadata:
             st.json(selected_dataset.metadata)
         else:
             st.write("No metadata rows detected before the numeric table.")
+            st.text_area(
+                "Manual metadata / notes",
+                placeholder="Type any sample details, instrument settings, electrolyte notes, or context for this file.",
+                key=f"manual_metadata::{project_name}::{experiment_id}::{selected_dataset.filename}",
+            )
 
     st.subheader("Column and unit controls")
-    st.caption(EXPERIMENT_TYPES[experiment_type]["description"])
     column_mode = st.radio(
         "Column selection mode",
         ["Use detected columns per file", "Manually select columns"],
@@ -1721,20 +1811,56 @@ def render_generic_experiment_analysis(
         with col2:
             show_markers = st.checkbox("Show data markers", value=True, key=f"generic_markers::{project_name}::{experiment_id}")
     elif experiment_type == "lsv":
+        potential_col_for_units = selected_detected.get("potential") if column_mode == "Use detected columns per file" else manual_columns.get("potential")
+        current_col_for_units = selected_detected.get("current") if column_mode == "Use detected columns per file" else manual_columns.get("current")
+        potential_display_unit = resolve_role_unit(
+            selected_units.get("potential", "Auto"),
+            selected_dataset,
+            "potential",
+            potential_col_for_units,
+        )
+        if potential_display_unit not in display_unit_options_for_role("potential"):
+            potential_display_unit = "V"
+        current_unit_for_density = resolve_role_unit(
+            selected_units.get("current", "Auto"),
+            selected_dataset,
+            "current",
+            current_col_for_units,
+        )
+
+        axis_options = ["Potential", "Current density"]
+        display_units["current_source"] = st.selectbox(
+            "Uploaded current column contains",
+            ["Current", "Current density"],
+            key=f"lsv_current_source::{project_name}::{experiment_id}",
+        )
         col1, col2, col3 = st.columns(3)
         with col1:
-            display_units["potential"] = st.selectbox("Potential display unit", display_unit_options_for_role("potential"), key=f"disp_potential::{project_name}::{experiment_id}")
+            display_units["x_axis"] = st.selectbox(
+                "X-axis",
+                axis_options,
+                index=0,
+                key=f"lsv_x_axis::{project_name}::{experiment_id}",
+            )
         with col2:
-            y_axis_quantity = st.selectbox(
-                "Y-axis quantity",
-                ["Current", "Current density"],
-                key=f"lsv_y_axis_quantity::{project_name}::{experiment_id}",
+            display_units["y_axis"] = st.selectbox(
+                "Y-axis",
+                axis_options,
+                index=1,
+                key=f"lsv_y_axis::{project_name}::{experiment_id}",
             )
         with col3:
             show_markers = st.checkbox("Show data markers", value=False, key=f"generic_markers::{project_name}::{experiment_id}")
 
-        if y_axis_quantity == "Current density":
-            display_units["current"] = CURRENT_DENSITY_UNIT
+        if display_units["x_axis"] == display_units["y_axis"]:
+            st.warning("Choose different quantities for the X-axis and Y-axis.")
+
+        display_units["potential"] = potential_display_unit
+        display_units["current"] = current_density_unit_from_current_unit(current_unit_for_density)
+        if display_units["current_source"] == "Current density":
+            display_units["electrode_area_cm2"] = 1.0
+            st.info("The uploaded current column is already normalized, so electrode-area normalization is skipped.")
+        else:
             display_units["electrode_area_cm2"] = st.number_input(
                 "Electrode surface area (cm^2)",
                 min_value=0.000001,
@@ -1743,13 +1869,6 @@ def render_generic_experiment_analysis(
                 format="%.6f",
                 key=f"lsv_electrode_area::{project_name}::{experiment_id}",
             )
-        else:
-            display_units["current"] = st.selectbox(
-                "Current display unit",
-                display_unit_options_for_role("current"),
-                key=f"disp_current::{project_name}::{experiment_id}",
-            )
-            display_units["electrode_area_cm2"] = 1.0
     else:
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -1780,12 +1899,14 @@ def render_generic_experiment_analysis(
     lsv_threshold_display = None
     lsv_threshold_a = None
     lsv_threshold_unit = None
+    reference_electrode = None
     if experiment_type == "lsv":
         y_unit = display_units["current"]
         electrode_area_cm2 = float(display_units.get("electrode_area_cm2", 1.0))
+        current_source = display_units.get("current_source", "Current")
         all_lsv_y = np.concatenate(
             [
-                np.abs(current_from_amps(record["data"]["current"], y_unit, electrode_area_cm2))
+                np.abs(current_density_from_base(record["data"]["current"], y_unit, current_source, electrode_area_cm2))
                 for record in records
             ]
         )
@@ -1795,14 +1916,25 @@ def render_generic_experiment_analysis(
             default_threshold = 0.5
         lsv_threshold_unit = y_unit
         lsv_threshold_display = st.number_input(
-            f"Current threshold ({y_unit})",
+            f"Current density threshold ({y_unit})",
             min_value=0.0,
             value=default_threshold,
             step=max(default_threshold * 0.1, 1e-9),
             format="%.6e",
             key=f"lsv_threshold::{project_name}::{experiment_id}",
         )
-        lsv_threshold_a = current_value_to_amps(lsv_threshold_display, y_unit, electrode_area_cm2)
+        lsv_threshold_a = current_density_value_to_base(lsv_threshold_display, y_unit, current_source, electrode_area_cm2)
+        reference_electrode = st.selectbox(
+            "Reference electrode",
+            REFERENCE_ELECTRODE_OPTIONS,
+            key=f"lsv_reference_electrode::{project_name}::{experiment_id}",
+        )
+        if reference_electrode == "Other":
+            custom_reference = st.text_input(
+                "Reference electrode name",
+                key=f"lsv_reference_electrode_custom::{project_name}::{experiment_id}",
+            ).strip()
+            reference_electrode = custom_reference or "Other"
 
     st.subheader(f"Interactive {experiment_short_label(experiment_type)} plot")
     fig = go.Figure()
@@ -1810,16 +1942,28 @@ def render_generic_experiment_analysis(
         add_generic_trace(fig, record, experiment_type, display_units, show_markers)
 
     if experiment_type == "lsv" and lsv_threshold_display is not None and lsv_threshold_display > 0:
-        fig.add_hline(
-            y=lsv_threshold_display,
-            line_dash="dot",
-            annotation_text=f"+{lsv_threshold_display:g} {lsv_threshold_unit}",
-        )
-        fig.add_hline(
-            y=-lsv_threshold_display,
-            line_dash="dot",
-            annotation_text=f"-{lsv_threshold_display:g} {lsv_threshold_unit}",
-        )
+        if display_units.get("y_axis") == "Current density":
+            fig.add_hline(
+                y=lsv_threshold_display,
+                line_dash="dot",
+                annotation_text=f"+{lsv_threshold_display:g} {lsv_threshold_unit}",
+            )
+            fig.add_hline(
+                y=-lsv_threshold_display,
+                line_dash="dot",
+                annotation_text=f"-{lsv_threshold_display:g} {lsv_threshold_unit}",
+            )
+        elif display_units.get("x_axis") == "Current density":
+            fig.add_vline(
+                x=lsv_threshold_display,
+                line_dash="dot",
+                annotation_text=f"+{lsv_threshold_display:g} {lsv_threshold_unit}",
+            )
+            fig.add_vline(
+                x=-lsv_threshold_display,
+                line_dash="dot",
+                annotation_text=f"-{lsv_threshold_display:g} {lsv_threshold_unit}",
+            )
 
     if experiment_type == "ca":
         fig.update_layout(xaxis_title=f"Time / {display_units['time']}", yaxis_title=f"Current / {display_units['current']}")
@@ -1830,13 +1974,27 @@ def render_generic_experiment_analysis(
         fig.update_yaxes(scaleanchor="x", scaleratio=1)
     elif experiment_type == "lsv":
         fig.update_layout(
-            xaxis_title=f"Potential / {display_units['potential']}",
-            yaxis_title=current_axis_label(display_units["current"]),
+            xaxis_title=lsv_axis_title(display_units.get("x_axis", "Potential"), display_units, reference_electrode),
+            yaxis_title=lsv_axis_title(display_units.get("y_axis", "Current density"), display_units, reference_electrode),
         )
     else:
         fig.update_layout(xaxis_title=f"Potential / {display_units['potential']}", yaxis_title=f"Current / {display_units['current']}")
 
-    fig.update_layout(template="plotly_white", height=620, legend_title_text="Sample")
+    fig.update_layout(
+        template="plotly_white",
+        height=620,
+        margin={"l": 78, "r": 24, "t": 36, "b": 88},
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "left",
+            "x": 0,
+            "title_text": "",
+        },
+    )
+    fig.update_xaxes(automargin=True)
+    fig.update_yaxes(automargin=True)
     st.plotly_chart(fig, width="stretch")
 
     if experiment_type == "eis" and any(record["data"].get("frequency_hz") is not None for record in records):
@@ -1903,6 +2061,7 @@ def render_generic_experiment_analysis(
         lsv_threshold_a=lsv_threshold_a,
         lsv_threshold_display=lsv_threshold_display,
         lsv_threshold_unit=lsv_threshold_unit,
+        lsv_current_source=display_units.get("current_source", "Current"),
     )
     st.dataframe(results_df, width="stretch", hide_index=True)
 
@@ -1931,6 +2090,8 @@ def render_generic_experiment_analysis(
             "display_units": display_units,
             "lsv_threshold": lsv_threshold_display,
             "lsv_threshold_unit": lsv_threshold_unit,
+            "lsv_current_source": display_units.get("current_source", "Current"),
+            "reference_electrode": reference_electrode,
         },
     )
     render_experiment_notes(project_name, project_workspace, experiment_id)
@@ -2362,6 +2523,27 @@ def apply_app_theme() -> None:
         .stButton > button[kind="primary"] * {
             color: var(--ink);
         }
+        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] [data-testid="column"]:last-child .stButton > button {
+            width: 2rem;
+            min-width: 2rem;
+            height: 2rem;
+            min-height: 2rem;
+            padding: 0;
+            border-radius: 8px;
+            font-size: 1.1rem;
+            line-height: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 6px 14px rgba(0, 0, 0, 0.08), 0 1px 0 rgba(255,255,255,0.9) inset;
+        }
+        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] [data-testid="column"]:last-child .stButton > button p {
+            margin: 0;
+            line-height: 1;
+        }
+        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] [data-testid="column"]:last-child .stButton > button:hover {
+            transform: translateY(-2px) scale(1.02);
+        }
         [data-testid="stFileUploader"],
         div[data-baseweb="select"] > div,
         textarea,
@@ -2467,44 +2649,66 @@ def get_active_experiment_id(project_name: str, project_workspace: dict[str, Any
     return None
 
 
+def render_create_experiment_form(
+    project_name: str,
+    project_workspace: dict[str, Any],
+    key_prefix: str,
+) -> None:
+    st.markdown(
+        "<div class='workspace-card'><h3>Create experiment</h3><p>Choose a data type first, then upload files into that experiment.</p></div>",
+        unsafe_allow_html=True,
+    )
+    default_name = f"Experiment {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    with st.form(key=f"{key_prefix}_create_experiment_form::{project_name}"):
+        experiment_name = st.text_input(
+            "Experiment name",
+            value=default_name,
+            key=f"{key_prefix}_new_experiment::{project_name}",
+        )
+        experiment_type_label = st.selectbox(
+            "Data type",
+            EXPERIMENT_TYPE_LABELS,
+            key=f"{key_prefix}_new_experiment_type::{project_name}",
+        )
+        submitted = st.form_submit_button("Create experiment")
+
+    if submitted:
+        cleaned_name = experiment_name.strip()
+        if not cleaned_name:
+            st.error("Enter an experiment name.")
+            return
+
+        experiment_id = create_experiment(
+            project_workspace,
+            cleaned_name,
+            EXPERIMENT_TYPE_BY_LABEL[experiment_type_label],
+        )
+        set_active_experiment(project_name, experiment_id)
+        st.rerun()
+
+
 def render_project_sidebar(project_name: str, project_workspace: dict[str, Any]) -> Optional[str]:
     experiments = project_workspace.get("experiments", {})
 
     with st.sidebar:
-        st.header("Project")
-        st.write(project_name)
+        st.header(project_name)
         st.caption(f"{len(experiments)} experiments")
         if st.button("Switch project", key="switch_project"):
             st.session_state.pop("active_project_name", None)
             st.rerun()
 
         st.divider()
+        if experiments:
+            if st.button("New experiment", key=f"sidebar_new_experiment_button::{project_name}"):
+                st.session_state.pop(active_experiment_key(project_name), None)
+                st.session_state.pop(f"experiment_actions_menu::{project_name}", None)
+                st.rerun()
+
         st.subheader("Experiments")
-        with st.expander("New experiment", expanded=not experiments):
-            default_name = f"Experiment {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            experiment_name = st.text_input(
-                "Experiment name",
-                value=default_name,
-                key=f"sidebar_new_experiment::{project_name}",
-            )
-            experiment_type_label = st.selectbox(
-                "Data type",
-                EXPERIMENT_TYPE_LABELS,
-                key=f"sidebar_new_experiment_type::{project_name}",
-            )
-            if st.button("Create", type="primary", key=f"create_experiment::{project_name}"):
-                cleaned_name = experiment_name.strip()
-                if cleaned_name:
-                    experiment_id = create_experiment(
-                        project_workspace,
-                        cleaned_name,
-                        EXPERIMENT_TYPE_BY_LABEL[experiment_type_label],
-                    )
-                    set_active_experiment(project_name, experiment_id)
-                    st.rerun()
-                st.error("Enter an experiment name.")
 
         active_experiment_id = get_active_experiment_id(project_name, project_workspace)
+        menu_key = f"experiment_actions_menu::{project_name}"
+
         if not experiments:
             st.caption("No experiments yet.")
 
@@ -2516,74 +2720,68 @@ def render_project_sidebar(project_name: str, project_workspace: dict[str, Any])
             experiment_name = experiment.get("name", experiment_id)
             is_active = experiment_id == active_experiment_id
             label = f"● {experiment_name}" if is_active else experiment_name
-            if st.button(
-                label,
-                key=f"open_experiment::{project_name}::{experiment_id}",
-                type="primary" if is_active else "secondary",
-            ):
-                set_active_experiment(project_name, experiment_id)
-                st.rerun()
-            st.caption(format_timestamp(experiment.get("updated_at") or experiment.get("created_at")))
+            experiment_col, actions_col = st.columns([0.84, 0.16])
 
-        st.divider()
-        if active_experiment_id in experiments:
-            active_experiment = experiments[active_experiment_id]
-            active_experiment_name = active_experiment.get("name", active_experiment_id)
-            with st.expander("Rename selected experiment"):
-                with st.form(key=f"rename_experiment_form::{project_name}::{active_experiment_id}"):
-                    new_experiment_name = st.text_input(
-                        "Experiment name",
-                        value=active_experiment_name,
-                        key=f"rename_experiment_input::{project_name}::{active_experiment_id}",
-                    )
-                    rename_submitted = st.form_submit_button("Rename")
-
-                if rename_submitted:
-                    cleaned_name = new_experiment_name.strip()
-                    if not cleaned_name:
-                        st.error("Enter an experiment name.")
-                    elif cleaned_name != active_experiment_name:
-                        rename_experiment(project_workspace, active_experiment_id, cleaned_name)
-                        st.rerun()
-                    else:
-                        st.info("The experiment already has that name.")
-
-        with st.expander("Delete"):
-            if active_experiment_id in experiments:
-                active_experiment = experiments[active_experiment_id]
-                active_experiment_name = active_experiment.get("name", active_experiment_id)
-                st.warning(
-                    "Deleting this experiment permanently removes its uploaded files, saved analyses, notes, and comments."
-                )
-                confirm_experiment_name = st.text_input(
-                    f'Type "{active_experiment_name}" to delete the selected experiment',
-                    key=f"delete_experiment_confirm::{project_name}::{active_experiment_id}",
-                )
+            with experiment_col:
                 if st.button(
-                    "Delete selected experiment",
-                    disabled=confirm_experiment_name != active_experiment_name,
-                    key=f"delete_experiment::{project_name}::{active_experiment_id}",
+                    label,
+                    key=f"open_experiment::{project_name}::{experiment_id}",
+                    type="primary" if is_active else "secondary",
                 ):
-                    delete_experiment(project_name, project_workspace, active_experiment_id)
+                    set_active_experiment(project_name, experiment_id)
                     st.rerun()
 
-            st.warning(
-                "Deleting this project permanently removes every experiment, saved analysis, note, and comment in it."
-            )
-            confirm_project_name = st.text_input(
-                f'Type "{project_name}" to delete this project',
-                key=f"delete_active_project_confirm::{project_name}",
-            )
-            if st.button(
-                "Delete project",
-                disabled=confirm_project_name != project_name,
-                key=f"delete_active_project::{project_name}",
-            ):
-                delete_project(project_name)
-                st.rerun()
+            with actions_col:
+                if st.button(
+                    "…",
+                    key=f"experiment_menu_button::{project_name}::{experiment_id}",
+                    help="Experiment actions",
+                ):
+                    current_menu_id = st.session_state.get(menu_key)
+                    st.session_state[menu_key] = None if current_menu_id == experiment_id else experiment_id
+                    st.rerun()
+
+            st.caption(format_timestamp(experiment.get("updated_at") or experiment.get("created_at")))
+
+            if st.session_state.get(menu_key) == experiment_id:
+                with st.container():
+                    st.markdown("**Experiment options**")
+                    with st.form(key=f"rename_experiment_form::{project_name}::{experiment_id}"):
+                        new_experiment_name = st.text_input(
+                            "Experiment name",
+                            value=experiment_name,
+                            key=f"rename_experiment_input::{project_name}::{experiment_id}",
+                        )
+                        rename_submitted = st.form_submit_button("Rename")
+
+                    if rename_submitted:
+                        cleaned_name = new_experiment_name.strip()
+                        if not cleaned_name:
+                            st.error("Enter an experiment name.")
+                        elif cleaned_name != experiment_name:
+                            rename_experiment(project_workspace, experiment_id, cleaned_name)
+                            st.session_state[menu_key] = None
+                            st.rerun()
+                        else:
+                            st.info("The experiment already has that name.")
+
+                    st.warning(
+                        "Deleting this experiment permanently removes its uploaded files, saved analyses, notes, and comments."
+                    )
+                    confirm_experiment_name = st.text_input(
+                        f'Type "{experiment_name}" to delete this experiment',
+                        key=f"delete_experiment_confirm::{project_name}::{experiment_id}",
+                    )
+                    if st.button(
+                        "Delete experiment",
+                        disabled=confirm_experiment_name != experiment_name,
+                        key=f"delete_experiment::{project_name}::{experiment_id}",
+                    ):
+                        delete_experiment(project_name, project_workspace, experiment_id)
+                        st.session_state[menu_key] = None
+                        st.rerun()
 
     return active_experiment_id
-
 
 def render_project_home() -> None:
     render_home_project_sidebar()
@@ -2779,13 +2977,11 @@ def render_project_header(project_name: str, project_workspace: dict[str, Any]) 
 
 def render_project_dashboard(project_name: str, project_workspace: dict[str, Any]) -> None:
     experiments = project_workspace.get("experiments", {})
+    render_create_experiment_form(project_name, project_workspace, key_prefix="dashboard")
+
     if experiments:
         st.subheader("Project experiments")
         st.dataframe(experiments_dataframe(project_workspace), width="stretch", hide_index=True)
-        st.info("Select an experiment from the sidebar to view notes, saved analysis, and upload more files.")
-    else:
-        st.info("Create the first experiment from the sidebar, then upload data files into it.")
-
 
 def main() -> None:
     st.set_page_config(page_title="VoltScope AI MVP", layout="wide")
@@ -2835,7 +3031,8 @@ def main() -> None:
     )
 
     if not uploaded_files:
-        render_saved_experiment(active_project_name, project_workspace, experiment_id, show_header=False)
+        if experiment.get("files"):
+            render_saved_experiment(active_project_name, project_workspace, experiment_id, show_header=False)
         return
 
     parsed_datasets: list[ParsedDataset] = []
@@ -2884,13 +3081,18 @@ def main() -> None:
     selected_dataset = next(dataset for dataset in parsed_datasets if dataset.filename == selected_filename)
 
     with st.expander("Raw parsed data preview", expanded=True):
-        st.dataframe(selected_dataset.dataframe.head(30), width="stretch")
+        st.dataframe(dataframe_preview_for_display(selected_dataset.dataframe).head(30), width="stretch")
 
     with st.expander("Detected metadata"):
         if selected_dataset.metadata:
             st.json(selected_dataset.metadata)
         else:
             st.write("No metadata rows detected before the numeric table.")
+            st.text_area(
+                "Manual metadata / notes",
+                placeholder="Type any sample details, instrument settings, electrolyte notes, or context for this file.",
+                key=f"manual_metadata::{active_project_name}::{experiment_id}::{selected_dataset.filename}",
+            )
 
     st.subheader("Column and unit controls")
     column_mode = st.radio(
