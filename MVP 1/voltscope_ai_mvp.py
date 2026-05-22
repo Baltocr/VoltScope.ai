@@ -2398,6 +2398,66 @@ def experiments_dataframe(project_workspace: dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def render_project_experiment_cards(project_name: str, project_workspace: dict[str, Any]) -> None:
+    experiments = project_workspace.get("experiments", {})
+    sorted_experiments = sorted(
+        experiments.items(),
+        key=lambda item: item[1].get("updated_at", item[1].get("created_at", "")),
+        reverse=True,
+    )
+
+    with st.container(border=True):
+        st.markdown("### Project experiments")
+        for experiment_id, experiment in sorted_experiments:
+            files = experiment.get("files", {})
+            experiment_name = experiment.get("name", experiment_id)
+            experiment_type = experiment_short_label(experiment.get("experiment_type", "cv"))
+            file_label = f"{len(files)} file" if len(files) == 1 else f"{len(files)} files"
+            created_label = format_timestamp(experiment.get("created_at"))
+            updated_label = format_timestamp(experiment.get("updated_at"))
+            notes = str(experiment.get("notes") or "").strip()
+            notes_key = f"dashboard_notes_expanded::{project_name}::{experiment_id}"
+            notes_expanded = bool(st.session_state.get(notes_key))
+            notes_is_long = len(notes) > 180
+            visible_notes = notes
+            if notes_is_long and not notes_expanded:
+                visible_notes = notes[:180].rstrip() + "..."
+            if not visible_notes:
+                visible_notes = "No notes yet."
+
+            with st.container(border=True):
+                st.markdown(
+                    f"""
+                    <div class="project-experiment-tile">
+                        <h4>{escape_html(experiment_name)}</h4>
+                        <p>{escape_html(experiment_type)} · {escape_html(file_label)}</p>
+                        <p>Created {escape_html(created_label)} · Updated {escape_html(updated_label)}</p>
+                        <p class="experiment-notes-preview"><strong>Notes:</strong> {escape_html(visible_notes)}</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                action_cols = st.columns([0.68, 0.32])
+                with action_cols[0]:
+                    if notes_is_long:
+                        if st.button(
+                            "Show less" if notes_expanded else "Show more",
+                            key=f"dashboard_toggle_notes::{project_name}::{experiment_id}",
+                        ):
+                            st.session_state[notes_key] = not notes_expanded
+                            st.rerun()
+
+                with action_cols[1]:
+                    if st.button(
+                        "Open experiment",
+                        key=f"dashboard_open_experiment::{project_name}::{experiment_id}",
+                        type="primary",
+                    ):
+                        set_active_experiment(project_name, experiment_id)
+                        st.rerun()
+
+
 def render_experiment_notes(project_name: str, project_workspace: dict[str, Any], experiment_id: str) -> None:
     experiment = project_workspace["experiments"][experiment_id]
     st.subheader("Experiment notes")
@@ -2488,6 +2548,68 @@ def apply_app_theme() -> None:
         .experiment-card p {
             color: var(--muted);
             margin: 0;
+        }
+        .analysis-card {
+            border: 1px solid #dddddd;
+            border-radius: 10px;
+            padding: 1rem 1.1rem;
+            margin: 0.75rem 0 1rem;
+            background: #ffffff;
+            box-shadow: 0 12px 28px rgba(0, 0, 0, 0.07);
+        }
+        .analysis-card h4 {
+            margin: 0 0 0.2rem;
+            font-size: 1.05rem;
+        }
+        .analysis-card .analysis-file {
+            color: var(--muted);
+            font-size: 0.86rem;
+            margin-bottom: 0.8rem;
+            overflow-wrap: anywhere;
+        }
+        .analysis-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+            gap: 0.55rem;
+        }
+        .analysis-metric {
+            border: 1px solid #eeeeee;
+            border-radius: 8px;
+            padding: 0.65rem 0.7rem;
+            background: #fafafa;
+        }
+        .analysis-metric span {
+            color: var(--muted);
+            display: block;
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        .analysis-metric strong {
+            display: block;
+            font-size: 1rem;
+            margin-top: 0.15rem;
+            overflow-wrap: anywhere;
+        }
+        .project-experiment-tile {
+            padding: 0.25rem 0 0.35rem;
+        }
+        .project-experiment-tile h4 {
+            font-size: 1.2rem;
+            line-height: 1.2;
+            margin: 0 0 0.35rem;
+        }
+        .project-experiment-tile p {
+            color: var(--muted);
+            font-size: 0.9rem;
+            line-height: 1.45;
+            margin: 0.15rem 0;
+        }
+        .project-experiment-tile .experiment-notes-preview {
+            color: var(--ink);
+            margin-top: 0.55rem;
+            overflow-wrap: anywhere;
         }
         .home-action-label {
             color: var(--muted);
@@ -2812,6 +2934,145 @@ def render_project_home() -> None:
             st.rerun()
 
 
+def format_result_value(value: Any, unit: str = "") -> str:
+    if value is None:
+        return "Not found"
+    if isinstance(value, float) and not np.isfinite(value):
+        return "Not found"
+    if isinstance(value, (int, np.integer)):
+        return f"{int(value):,}{unit}"
+    if isinstance(value, (float, np.floating)):
+        magnitude = abs(float(value))
+        if magnitude != 0 and (magnitude < 0.001 or magnitude >= 10000):
+            return f"{float(value):.3e}{unit}"
+        return f"{float(value):.3f}{unit}"
+    return f"{value}{unit}"
+
+
+def prettify_result_label(key: str) -> str:
+    known_labels = {
+        "points": "Points",
+        "potential_min_V": "Potential min",
+        "potential_max_V": "Potential max",
+        "current_min_A": "Current min",
+        "current_max_A": "Current max",
+        "current_density_A_cm2_min": "Current density min",
+        "current_density_A_cm2_max": "Current density max",
+        "cathodic_limit_V": "Cathodic limit",
+        "anodic_limit_V": "Anodic limit",
+        "operational_ESW_V": "Operational ESW",
+        "duration_s": "Duration",
+        "initial_current_A": "Initial current",
+        "final_current_A": "Final current",
+        "steady_state_current_A": "Steady-state current",
+        "charge_C": "Charge",
+        "initial_potential_V": "Initial potential",
+        "final_potential_V": "Final potential",
+        "delta_potential_V": "Potential change",
+        "average_slope_V_s": "Average slope",
+        "zreal_min_ohm": "Z real min",
+        "zreal_max_ohm": "Z real max",
+        "max_minus_zimag_ohm": "Max -Z imaginary",
+        "estimated_rs_ohm": "Estimated Rs",
+        "estimated_diameter_ohm": "Estimated diameter",
+        "frequency_min_Hz": "Frequency min",
+        "frequency_max_Hz": "Frequency max",
+    }
+    if key.startswith("threshold_"):
+        return "Threshold"
+    return known_labels.get(key, key.replace("_", " ").title())
+
+
+def result_value_unit(key: str) -> str:
+    if key.endswith("_V"):
+        return " V"
+    if key.endswith("_A"):
+        return " A"
+    if key.endswith("_A_cm2_min") or key.endswith("_A_cm2_max"):
+        return " A/cm^2"
+    if key.endswith("_s"):
+        return " s"
+    if key.endswith("_C"):
+        return " C"
+    if key.endswith("_V_s"):
+        return " V/s"
+    if key.endswith("_ohm"):
+        return " ohm"
+    if key.endswith("_Hz"):
+        return " Hz"
+    if key.startswith("threshold_"):
+        return f" {key.replace('threshold_', '')}"
+    return ""
+
+
+def result_metric_items(row: dict[str, Any]) -> list[tuple[str, str]]:
+    preferred_keys = [
+        "points",
+        "potential_min_V",
+        "potential_max_V",
+        "current_min_A",
+        "current_max_A",
+        "current_density_A_cm2_min",
+        "current_density_A_cm2_max",
+        "cathodic_limit_V",
+        "anodic_limit_V",
+        "operational_ESW_V",
+        "duration_s",
+        "initial_current_A",
+        "final_current_A",
+        "steady_state_current_A",
+        "charge_C",
+        "initial_potential_V",
+        "final_potential_V",
+        "delta_potential_V",
+        "average_slope_V_s",
+        "zreal_min_ohm",
+        "zreal_max_ohm",
+        "max_minus_zimag_ohm",
+        "estimated_rs_ohm",
+        "estimated_diameter_ohm",
+        "frequency_min_Hz",
+        "frequency_max_Hz",
+    ]
+    threshold_keys = [key for key in row if key.startswith("threshold_")]
+    ordered_keys = preferred_keys + threshold_keys
+    items = []
+    for key in ordered_keys:
+        if key not in row:
+            continue
+        items.append((prettify_result_label(key), format_result_value(row.get(key), result_value_unit(key))))
+    return items
+
+
+def render_analysis_result_cards(results: list[dict[str, Any]]) -> None:
+    if not results:
+        st.info("No saved analysis results yet.")
+        return
+
+    for row in results:
+        sample_name = row.get("sample_name") or "Unnamed sample"
+        file_name = row.get("file_name") or row.get("filename") or ""
+        metric_html = "\n".join(
+            f"""
+            <div class="analysis-metric">
+                <span>{escape_html(label)}</span>
+                <strong>{escape_html(value)}</strong>
+            </div>
+            """
+            for label, value in result_metric_items(row)
+        )
+        st.markdown(
+            f"""
+            <div class="analysis-card">
+                <h4>{escape_html(str(sample_name))}</h4>
+                <div class="analysis-file">{escape_html(str(file_name))}</div>
+                <div class="analysis-grid">{metric_html}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
 def render_saved_experiment(
     project_name: str,
     project_workspace: dict[str, Any],
@@ -2944,7 +3205,7 @@ def render_saved_experiment(
     if outputs.get("results") is not None:
         output_tabs = st.tabs(["Results", "Parser summary"])
         with output_tabs[0]:
-            st.dataframe(pd.DataFrame(outputs.get("results", [])), width="stretch", hide_index=True)
+            render_analysis_result_cards(outputs.get("results", []))
         with output_tabs[1]:
             st.dataframe(pd.DataFrame(outputs.get("parser_summary", [])), width="stretch", hide_index=True)
     else:
@@ -2980,8 +3241,7 @@ def render_project_dashboard(project_name: str, project_workspace: dict[str, Any
     render_create_experiment_form(project_name, project_workspace, key_prefix="dashboard")
 
     if experiments:
-        st.subheader("Project experiments")
-        st.dataframe(experiments_dataframe(project_workspace), width="stretch", hide_index=True)
+        render_project_experiment_cards(project_name, project_workspace)
 
 def main() -> None:
     st.set_page_config(page_title="VoltScope AI MVP", layout="wide")
