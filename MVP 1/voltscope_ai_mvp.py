@@ -22,6 +22,7 @@ import io
 import html
 import json
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,11 +35,13 @@ import streamlit as st
 
 
 POTENTIAL_UNITS_TO_V = {"V": 1.0, "mV": 1e-3}
-CURRENT_UNITS_TO_A = {"A": 1.0, "mA": 1e-3, "uA": 1e-6, "nA": 1e-9}
+CURRENT_UNITS_TO_A = {"A": 1.0, "mA": 1e-3, "uA": 1e-6, "nA": 1e-9, "pA": 1e-12}
 TIME_UNITS_TO_S = {"s": 1.0, "ms": 1e-3, "min": 60.0, "h": 3600.0}
 FREQUENCY_UNITS_TO_HZ = {"Hz": 1.0, "kHz": 1e3, "MHz": 1e6}
 IMPEDANCE_UNITS_TO_OHM = {"ohm": 1.0, "kohm": 1e3, "Mohm": 1e6}
 PHASE_UNITS_TO_DEG = {"deg": 1.0, "rad": 180.0 / np.pi}
+CURRENT_MAGNITUDE_WARNING_A = 0.1
+CURRENT_MAGNITUDE_WARNING_UA = 1_000_000.0
 WORKSPACE_STORE_PATH = Path(__file__).with_name("voltscope_project_workspaces.json")
 
 
@@ -126,6 +129,8 @@ class AnalyzedDataset:
     potential_v: np.ndarray
     raw_current_a: np.ndarray
     smoothed_current_a: Optional[np.ndarray]
+    cycle_values: Optional[np.ndarray]
+    cycle_source: str
     metadata: dict[str, str]
     warnings: list[str]
 
@@ -185,7 +190,20 @@ def is_numeric_row(tokens: list[str]) -> bool:
     return count >= 2 and count >= max(2, len(tokens) // 2)
 
 
+def has_tabular_numeric_rows(lines: list[str]) -> bool:
+    for line in lines[:120]:
+        if "\t" not in line:
+            continue
+        tokens = split_line(line, "\t")
+        if len(tokens) >= 2 and numeric_count(tokens) >= 2:
+            return True
+    return False
+
+
 def detect_delimiter(lines: list[str]) -> str:
+    if has_tabular_numeric_rows(lines):
+        return "\t"
+
     candidates = [",", "\t", ";", "whitespace"]
     best_delimiter = ","
     best_score = -1
@@ -249,6 +267,92 @@ def parse_metadata(lines: list[str]) -> dict[str, str]:
     return metadata
 
 
+def metadata_rows_for_display(metadata: dict[str, str]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    parsed_rows: list[dict[str, str]] = []
+    unparsed_rows: list[dict[str, str]] = []
+    for key, value in metadata.items():
+        if key.startswith("metadata_line_"):
+            line_number = key.rsplit("_", 1)[-1]
+            unparsed_rows.append({"Line": line_number, "Text": value})
+        else:
+            parsed_rows.append({"Field": key, "Value": value})
+    return parsed_rows, unparsed_rows
+
+
+def normalize_electrode_area_text(value: Any) -> Optional[str]:
+    text = str(value).strip()
+    match = _NUMBER_RE.search(text)
+    if not match:
+        return text or None
+    area = float(match.group(0))
+    unit = "cm^2" if "cm" in normalize_label(text) else "cm^2"
+    return f"{format_summary_number(area)} {display_unit_label(unit)}"
+
+
+def electrode_area_metadata_summary(metadata: dict[str, str]) -> Optional[str]:
+    for key, value in metadata.items():
+        compact_key = re.sub(r"[^a-z0-9]+", "", normalize_label(key))
+        if compact_key in {"electrodearea", "surfacearea", "geometricarea"} or (
+            "area" in compact_key and "electrode" in compact_key
+        ):
+            return normalize_electrode_area_text(value)
+    return None
+
+
+def normalize_reference_electrode(value: Any) -> Optional[str]:
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = normalize_label(text)
+    compact = re.sub(r"[^a-z0-9]+", "", normalized)
+    reference_aliases = {
+        "agagcl": "Ag/AgCl",
+        "agcl": "Ag/AgCl",
+        "sce": "SCE",
+        "saturatedcalomelelectrode": "SCE",
+        "shennhe": "SHE/NHE",
+        "she": "SHE/NHE",
+        "nhe": "SHE/NHE",
+        "rhe": "RHE",
+        "hghgo": "Hg/HgO",
+        "hghg2so4": "Hg/Hg2SO4",
+        "fcfc": "Fc/Fc+",
+        "ptquasireference": "Pt quasi-reference",
+    }
+    for alias, reference in reference_aliases.items():
+        if alias in compact:
+            return reference
+    return text
+
+
+def reference_electrode_from_metadata(metadata: dict[str, str]) -> Optional[str]:
+    for key, value in metadata.items():
+        compact_key = re.sub(r"[^a-z0-9]+", "", normalize_label(key))
+        if compact_key in {"reference", "ref", "referenceelectrode", "refelectrode"} or (
+            "reference" in compact_key and "electrode" in compact_key
+        ):
+            return normalize_reference_electrode(value)
+    return None
+
+
+def reference_electrode_source_label(reference_electrode: Optional[str], source: str) -> str:
+    if not reference_electrode:
+        return "Not selected"
+    source_labels = {
+        "metadata": "from metadata",
+        "default": "default",
+        "user": "user-selected",
+    }
+    source_text = source_labels.get(source, source)
+    return f"{reference_electrode} ({source_text})"
+
+
+def reference_electrode_default_note(reference_electrode: Optional[str], source: str) -> str:
+    if reference_electrode and source == "default":
+        return f"Reference electrode was not found in the file; using default {reference_electrode}."
+    return ""
+
+
 def find_table_bounds(lines: list[str], delimiter: str) -> tuple[int, int, list[str], bool]:
     for idx, line in enumerate(lines):
         tokens = split_line(line, delimiter)
@@ -275,6 +379,62 @@ def find_table_bounds(lines: list[str], delimiter: str) -> tuple[int, int, list[
     raise ValueError("Could not find a numeric data table in the uploaded file.")
 
 
+def current_unit_from_header_token(header: Optional[str]) -> Optional[str]:
+    if not header:
+        return None
+    label = normalize_label(header)
+    compact = re.sub(r"[^a-z0-9]+", "", label)
+    tokens = [token for token in re.split(r"[^a-z0-9]+", label) if token]
+
+    unit_tokens = [
+        ("pA", {"pa", "picoamp", "picoamps", "picoampere", "picoamperes"}),
+        ("nA", {"na", "nanoamp", "nanoamps", "nanoampere", "nanoamperes"}),
+        ("uA", {"ua", "microamp", "microamps", "microampere", "microamperes"}),
+        ("mA", {"ma", "milliamp", "milliamps", "milliampere", "milliamperes"}),
+        ("A", {"a", "amp", "amps", "ampere", "amperes"}),
+    ]
+    for unit, aliases in unit_tokens:
+        if any(token in aliases for token in tokens):
+            return unit
+
+    compact_patterns = [
+        ("pA", ("pa", "picoamp", "picoamps", "picoampere", "picoamperes")),
+        ("nA", ("na", "nanoamp", "nanoamps", "nanoampere", "nanoamperes")),
+        ("uA", ("ua", "microamp", "microamps", "microampere", "microamperes")),
+        ("mA", ("ma", "milliamp", "milliamps", "milliampere", "milliamperes")),
+        ("A", ("a", "amp", "amps", "ampere", "amperes")),
+    ]
+    for unit, suffixes in compact_patterns:
+        if any(
+            compact in {suffix, f"current{suffix}", f"i{suffix}", f"j{suffix}", f"currentdensity{suffix}"}
+            or compact.endswith(f"per{suffix}")
+            for suffix in suffixes
+        ):
+            return unit
+    return None
+
+
+def potential_header_has_explicit_unit(header: Optional[str]) -> bool:
+    if not header:
+        return False
+    label = normalize_label(header)
+    compact = re.sub(r"[^a-z0-9]+", "", label)
+    tokens = [token for token in re.split(r"[^a-z0-9]+", label) if token]
+    if any(token in {"v", "volt", "volts", "mv", "millivolt", "millivolts"} for token in tokens):
+        return True
+    return compact in {
+        "v",
+        "ev",
+        "emv",
+        "ewev",
+        "ewemv",
+        "potentialv",
+        "potentialmv",
+        "voltagev",
+        "voltagemv",
+    }
+
+
 def detect_unit_from_header(header: str, role: str) -> Optional[str]:
     label = normalize_label(header)
     compact = re.sub(r"[^a-z0-9]+", "", label)
@@ -293,22 +453,7 @@ def detect_unit_from_header(header: str, role: str) -> Optional[str]:
         return None
 
     if role == "current":
-        if "na" in label or "nanoamp" in label:
-            return "nA"
-        if "ua" in label or "microamp" in label:
-            return "uA"
-        if "ma" in label or "milliamp" in label:
-            return "mA"
-        if (
-            "/a" in label
-            or "(a)" in label
-            or label in {"a", "i", "j", "current"}
-            or compact in {"a", "i", "j", "currenta", "ia", "ja", "currentdensitya"}
-            or compact.endswith("amps")
-            or compact.endswith("ampere")
-        ):
-            return "A"
-        return None
+        return current_unit_from_header_token(header)
 
     if role == "time":
         if "ms" in label or compact.endswith("ms") or "millisecond" in label:
@@ -365,21 +510,24 @@ def header_indicates_current_density(header: str) -> bool:
         "ma/cm2",
         "ua/cm2",
         "na/cm2",
+        "pa/cm2",
         "a/cm2",
         "macm2",
         "uacm2",
         "nacm2",
+        "pacm2",
         "acm2",
         "macm-2",
         "uacm-2",
         "nacm-2",
+        "pacm-2",
         "acm-2",
     ]
     if any(token in label for token in density_tokens):
         return True
-    if any(token in compact for token in ["currentdensity", "currentdens", "macm2", "uacm2", "nacm2", "acm2"]):
+    if any(token in compact for token in ["currentdensity", "currentdens", "macm2", "uacm2", "nacm2", "pacm2", "acm2"]):
         return True
-    return compact in {"j", "ja", "jma", "jua", "jna"}
+    return compact in {"j", "ja", "jma", "jua", "jna", "jpa"}
 
 
 def score_potential_column(header: str, values: np.ndarray) -> float:
@@ -772,10 +920,12 @@ CURRENT_DENSITY_UNITS_TO_A_PER_CM2 = {
     "mA/cm^2": 1e-3,
     "uA/cm^2": 1e-6,
     "nA/cm^2": 1e-9,
+    "pA/cm^2": 1e-12,
 }
 CURRENT_DENSITY_UNIT = "mA/cm^2"
+DEFAULT_REFERENCE_ELECTRODE = "Ag/AgCl"
 REFERENCE_ELECTRODE_OPTIONS = [
-    "Ag/AgCl",
+    DEFAULT_REFERENCE_ELECTRODE,
     "SCE",
     "SHE/NHE",
     "RHE",
@@ -868,9 +1018,10 @@ def current_value_to_amps(
 
 
 def current_axis_label(display_unit: str) -> str:
+    unit_label = display_unit_label(display_unit)
     if is_current_density_unit(display_unit):
-        return f"Current density ({display_unit})"
-    return f"Current ({display_unit})"
+        return f"Current density ({unit_label})"
+    return f"Current ({unit_label})"
 
 
 def current_hover_label(display_unit: str) -> str:
@@ -899,7 +1050,7 @@ def unit_options_for_role(role: str) -> list[str]:
     if role == "potential":
         return ["Auto", "V", "mV"]
     if role == "current":
-        return ["Auto", "A", "mA", "uA", "nA"]
+        return ["Auto", "A", "mA", "uA", "nA", "pA"]
     if role == "time":
         return ["Auto", "s", "ms", "min", "h"]
     if role == "frequency":
@@ -930,7 +1081,7 @@ def display_unit_options_for_role(role: str) -> list[str]:
     if role == "potential":
         return ["V", "mV"]
     if role == "current":
-        return ["uA", "mA", "A", "nA"]
+        return ["uA", "mA", "A", "nA", "pA"]
     if role == "time":
         return ["s", "ms", "min", "h"]
     if role == "frequency":
@@ -991,6 +1142,176 @@ def resolve_role_unit_from_values(
     return unit
 
 
+def current_header_has_explicit_unit(header: Optional[str]) -> bool:
+    return current_unit_from_header_token(header) is not None
+
+
+def current_unit_confidence_detail(
+    dataset: ParsedDataset,
+    current_col: Optional[str],
+    selected_current_unit: str = "Auto",
+) -> str:
+    if selected_current_unit != "Auto":
+        return "Confirmed by user"
+    if current_col and dataset.detected_units.get(f"current:{current_col}") and current_header_has_explicit_unit(current_col):
+        return "Detected from column header"
+    return "Column label is ambiguous"
+
+
+def current_unit_confidence(
+    dataset: ParsedDataset,
+    current_col: Optional[str],
+    selected_current_unit: str = "Auto",
+) -> str:
+    if selected_current_unit != "Auto":
+        return "Confirmed by user"
+    if current_col and dataset.detected_units.get(f"current:{current_col}") and current_header_has_explicit_unit(current_col):
+        return "High"
+    return "Low"
+
+
+def current_unit_is_ambiguous(
+    dataset: ParsedDataset,
+    current_col: Optional[str],
+    selected_current_unit: str = "Auto",
+) -> bool:
+    return current_unit_confidence(dataset, current_col, selected_current_unit) == "Low"
+
+
+def suggested_current_unit_for_values(values: np.ndarray) -> str:
+    finite_abs = np.abs(np.asarray(values, dtype=float))
+    finite_abs = finite_abs[np.isfinite(finite_abs)]
+    finite_abs = finite_abs[finite_abs > 0]
+    if not finite_abs.size:
+        return "uA"
+    p95 = float(np.nanpercentile(finite_abs, 95))
+    if p95 < 1e-3:
+        return "A"
+    if p95 < 1:
+        return "mA"
+    if p95 < 1e3:
+        return "uA"
+    if p95 < 1e6:
+        return "nA"
+    return "pA"
+
+
+def current_unit_magnitude_warning(
+    dataset: ParsedDataset,
+    current_col: Optional[str],
+    selected_current_unit: str = "Auto",
+    interpreted_current_unit: str = "A",
+    current_source: str = "Current",
+    electrode_area_cm2: float = 1.0,
+) -> str:
+    if not current_col or current_col not in dataset.dataframe.columns:
+        return ""
+    if not current_unit_is_ambiguous(dataset, current_col, selected_current_unit):
+        return ""
+
+    current_values = dataset.dataframe[current_col].to_numpy(dtype=float)
+    finite_abs_raw = np.abs(current_values[np.isfinite(current_values)])
+    finite_abs_raw = finite_abs_raw[finite_abs_raw > 0]
+    if not finite_abs_raw.size:
+        return ""
+
+    suggested_unit = suggested_current_unit_for_values(current_values)
+    interpreted_current_a = convert_current_to_amps(current_values, interpreted_current_unit)
+    interpreted_display = current_to_display(
+        interpreted_current_a,
+        "uA/cm^2" if current_source == "Current density" else "uA",
+        current_source,
+        electrode_area_cm2,
+    )
+    finite_interpreted = np.abs(interpreted_display[np.isfinite(interpreted_display)])
+    p95_interpreted = float(np.nanpercentile(finite_interpreted, 95)) if finite_interpreted.size else 0.0
+
+    raw_p95 = float(np.nanpercentile(finite_abs_raw, 95))
+    raw_values_look_scaled = 1 <= raw_p95 <= 1000 and suggested_unit != interpreted_current_unit
+    interpreted_is_large = p95_interpreted >= 1e4
+    if raw_values_look_scaled or interpreted_is_large:
+        return (
+            "Current unit may be wrong. The current column has no unit label and values are "
+            f"unusually large if interpreted as {display_unit_label(interpreted_current_unit)}."
+        )
+    return ""
+
+
+def current_unit_review_explanation(current_col_label: str, suggested_unit: str, current_unit_warning: str) -> str:
+    if current_unit_warning:
+        return (
+            "The current column has no unit in the header. If interpreted as A, "
+            "the current values are unusually large for a typical CV/LSV."
+        )
+    if suggested_unit == "A":
+        return (
+            "The current column has no unit in the header. Based on value magnitude, "
+            "A is the most likely input unit. Please confirm before using current-dependent metrics."
+        )
+    return (
+        f"The current column '{current_col_label}' has no unit in the header. Based on value magnitude, "
+        f"{display_unit_label(suggested_unit)} is the most likely input unit. "
+        "Please confirm before using current-dependent metrics."
+    )
+
+
+def current_unit_review_reason(suggested_unit: str, current_unit_warning: str) -> str:
+    if current_unit_warning:
+        return "Suggested based on value magnitude; interpreting as A gives unusually large currents."
+    if suggested_unit == "A":
+        return "Suggested based on value magnitude; A gives microamp-scale currents."
+    return f"Suggested based on value magnitude; {display_unit_label(suggested_unit)} gives a plausible current scale."
+
+
+def current_magnitude_sanity_warning(
+    current_base_values: np.ndarray,
+    current_source: str = "Current",
+    max_abs_current_a_threshold: float = CURRENT_MAGNITUDE_WARNING_A,
+    max_abs_current_uA_threshold: float = CURRENT_MAGNITUDE_WARNING_UA,
+) -> str:
+    if current_source != "Current":
+        return ""
+    finite_abs_a = np.abs(np.asarray(current_base_values, dtype=float))
+    finite_abs_a = finite_abs_a[np.isfinite(finite_abs_a)]
+    if not finite_abs_a.size:
+        return ""
+    max_abs_current_a = float(np.nanmax(finite_abs_a))
+    max_abs_current_uA = max_abs_current_a * 1e6
+    if max_abs_current_a > max_abs_current_a_threshold or max_abs_current_uA > max_abs_current_uA_threshold:
+        return "Current magnitude is unusually large. Check whether the current unit was inferred correctly."
+    return ""
+
+
+def current_magnitude_ack_key(key_prefix: str, filename: str) -> str:
+    return f"{key_prefix}::ack_current_magnitude::{filename}"
+
+
+def missing_unit_header_warning(
+    dataset: ParsedDataset,
+    potential_col: Optional[str],
+    current_col: Optional[str],
+    selected_current_unit: str = "Auto",
+) -> str:
+    missing_current_unit = current_unit_is_ambiguous(dataset, current_col, selected_current_unit)
+    if missing_current_unit:
+        return "Column units missing from header. Please confirm potential/current units."
+    return ""
+
+
+def unit_header_audit_note(
+    current_col: Optional[str],
+    selected_current_unit: str,
+) -> str:
+    if selected_current_unit == "Auto":
+        return ""
+    if current_header_has_explicit_unit(current_col):
+        return ""
+    return (
+        "Column units were missing from header. Current unit was confirmed by user as "
+        f"{display_unit_label(selected_current_unit)}."
+    )
+
+
 def finite_pair_mask(*arrays: np.ndarray) -> np.ndarray:
     if not arrays:
         return np.array([], dtype=bool)
@@ -1018,12 +1339,6 @@ def validate_cv_data(filename: str, potential_v: np.ndarray, current_a: np.ndarr
     if current_range == 0:
         warnings.append(f"{filename}: current values are constant.")
 
-    turning_points = detect_potential_turning_points(potential_v[finite_mask])
-    if len(turning_points) > 1:
-        warnings.append(
-            f"{filename}: multiple potential turning points detected; cycle splitting is approximate."
-        )
-
     return warnings
 
 
@@ -1037,9 +1352,15 @@ def normalize_dataset(
     smoothing_method: str,
     smoothing_window: int,
 ) -> AnalyzedDataset:
-    working = dataset.dataframe[[potential_col, current_col]].dropna().copy()
+    cycle_col = find_cycle_column(dataset)
+    working_cols = [potential_col, current_col]
+    if cycle_col and cycle_col not in working_cols:
+        working_cols.append(cycle_col)
+    working = dataset.dataframe[working_cols].dropna(subset=[potential_col, current_col]).copy()
     potential_values = working[potential_col].to_numpy(dtype=float)
     current_values = working[current_col].to_numpy(dtype=float)
+    cycle_values = working[cycle_col].to_numpy(dtype=float) if cycle_col and cycle_col in working else None
+    cycle_source = "column" if cycle_values is not None else "none"
 
     potential_unit = resolve_unit(selected_potential_unit, dataset, "potential", potential_col, "V")
     if selected_potential_unit == "Auto" and not dataset.detected_units.get(f"potential:{potential_col}"):
@@ -1052,12 +1373,24 @@ def normalize_dataset(
     finite_mask = np.isfinite(potential_v) & np.isfinite(raw_current_a)
     potential_v = potential_v[finite_mask]
     raw_current_a = raw_current_a[finite_mask]
+    if cycle_values is not None:
+        cycle_values = cycle_values[finite_mask]
+    else:
+        inferred_cycle_values = infer_cycle_values_from_potential(potential_v)
+        if inferred_cycle_values is not None:
+            cycle_values = inferred_cycle_values
+            cycle_source = "inferred"
 
     smoothed_current_a = None
     if smoothing_method != "None" and len(raw_current_a) >= 5:
         smoothed_current_a = smooth_current(raw_current_a, smoothing_method, smoothing_window)
 
     warnings = validate_cv_data(dataset.filename, potential_v, raw_current_a)
+    source_warnings = [
+        warning
+        for warning in dataset.warnings
+        if LEGACY_APPROXIMATE_CYCLE_WARNING not in warning
+    ]
 
     return AnalyzedDataset(
         filename=dataset.filename,
@@ -1070,8 +1403,10 @@ def normalize_dataset(
         potential_v=potential_v,
         raw_current_a=raw_current_a,
         smoothed_current_a=smoothed_current_a,
+        cycle_values=cycle_values,
+        cycle_source=cycle_source,
         metadata=dataset.metadata,
-        warnings=dataset.warnings + warnings,
+        warnings=source_warnings + warnings,
     )
 
 
@@ -1173,6 +1508,9 @@ def calculate_esw(potential: np.ndarray, current: np.ndarray, threshold: float) 
 # ---------- Peak and baseline analysis ----------
 
 
+LEGACY_APPROXIMATE_CYCLE_WARNING = "multiple potential turning points detected; cycle splitting is approximate"
+
+
 def detect_potential_turning_points(potential: np.ndarray) -> list[int]:
     if len(potential) < 3:
         return []
@@ -1206,6 +1544,25 @@ def split_scan_segments(potential: np.ndarray) -> list[tuple[int, int, str]]:
         segments.append((start, end, direction))
 
     return segments
+
+
+def infer_cycle_values_from_potential(potential: np.ndarray) -> Optional[np.ndarray]:
+    segments = split_scan_segments(potential)
+    if len(segments) < 3:
+        return None
+
+    cycle_values = np.full(len(potential), np.nan, dtype=float)
+    for segment_index, (start, end, _direction) in enumerate(segments):
+        cycle_values[start:end] = float(segment_index // 2 + 1)
+
+    if np.any(~np.isfinite(cycle_values)):
+        finite_cycles = cycle_values[np.isfinite(cycle_values)]
+        fill_value = float(finite_cycles[0]) if finite_cycles.size else 1.0
+        cycle_values[~np.isfinite(cycle_values)] = fill_value
+
+    if len(np.unique(cycle_values[np.isfinite(cycle_values)])) < 2:
+        return None
+    return cycle_values
 
 
 def estimate_peak_prominence(current: np.ndarray, idx: int, peak_type: str, window_size: int) -> float:
@@ -1279,8 +1636,12 @@ CANDIDATE_PEAK_FILTER_OPTIONS = [
 ]
 
 
-def candidate_peak_rank_key(peak: Peak) -> tuple[float, float, int]:
-    return (float(peak.prominence), abs(float(peak.raw_current)), confidence_rank(peak.confidence))
+def candidate_peak_rank_key(peak: Peak, potential: Optional[np.ndarray] = None) -> tuple[float, float, float, int]:
+    not_near_edge_bonus = 0.0
+    if potential is not None and not peak_is_near_segment_endpoint(potential, peak):
+        not_near_edge_bonus = max(abs(float(peak.raw_current)), float(peak.prominence), 1e-30)
+    combined_score = float(peak.prominence) + abs(float(peak.raw_current)) + not_near_edge_bonus
+    return (combined_score, abs(float(peak.raw_current)), float(peak.prominence), confidence_rank(peak.confidence))
 
 
 def unique_peaks_by_id(peaks: list[Peak]) -> list[Peak]:
@@ -1299,7 +1660,8 @@ def filter_candidate_peaks_for_display(
     selected_oxidation_peak: Optional[Peak],
     selected_reduction_peak: Optional[Peak],
     display_filter: str,
-    top_n: int = 10,
+    top_n: int = 5,
+    potential: Optional[np.ndarray] = None,
 ) -> list[Peak]:
     selected = [peak for peak in [selected_oxidation_peak, selected_reduction_peak] if peak is not None]
     selected_ids = {peak.id for peak in selected}
@@ -1315,7 +1677,7 @@ def filter_candidate_peaks_for_display(
 
     ranked_non_selected = sorted(
         [peak for peak in peaks if peak.id not in selected_ids],
-        key=candidate_peak_rank_key,
+        key=lambda peak: candidate_peak_rank_key(peak, potential),
         reverse=True,
     )
     return unique_peaks_by_id(selected + ranked_non_selected[:top_n])
@@ -1728,6 +2090,18 @@ def local_extremum_label(peak: Peak) -> str:
     return "local extremum"
 
 
+def select_default_primary_peaks(peaks: list[Peak]) -> tuple[Optional[Peak], Optional[Peak]]:
+    oxidation_peaks = [peak for peak in peaks if peak.peak_type == "oxidation"]
+    reduction_peaks = [peak for peak in peaks if peak.peak_type == "reduction"]
+    oxidation_peak = None
+    reduction_peak = None
+    if oxidation_peaks:
+        oxidation_peak = oxidation_peaks[default_primary_peak_index(oxidation_peaks, "oxidation")]
+    if reduction_peaks:
+        reduction_peak = reduction_peaks[default_primary_peak_index(reduction_peaks, "reduction")]
+    return oxidation_peak, reduction_peak
+
+
 def build_peak_metrics_rows(
     oxidation_peak: Optional[Peak],
     reduction_peak: Optional[Peak],
@@ -1866,11 +2240,19 @@ def format_current_metric(
     display_unit: str,
     current_source: str,
     electrode_area_cm2: float,
+    needs_unit_review: bool = False,
 ) -> str:
     if value is None or not np.isfinite(value):
         return "Not detected"
     display_value = current_to_display(np.array([value]), display_unit, current_source, electrode_area_cm2)[0]
-    return f"{display_value:.4g} {display_unit_label(display_unit)}"
+    value_text = f"{display_value:.4g} {display_unit_label(display_unit)}"
+    if needs_unit_review:
+        value_text += " (unit review)"
+    return value_text
+
+
+def pending_current_metric(unit_confidence: str) -> bool:
+    return unit_confidence == "Low"
 
 
 def format_potential_metric(value: Optional[float]) -> str:
@@ -1942,14 +2324,208 @@ def cv_analysis_status(
     reduction_peak: Optional[Peak],
     metrics: dict[str, Optional[float]],
     potential: np.ndarray,
+    cycle_assignment_uncertain: bool = False,
 ) -> str:
     if oxidation_peak is None and reduction_peak is None:
         return "Failed"
     if oxidation_peak is None or reduction_peak is None:
         return "Incomplete"
+    if cycle_assignment_uncertain:
+        return "Review recommended"
     if cv_analysis_quality_messages(oxidation_peak, reduction_peak, metrics, potential):
         return "Review recommended"
     return "Passed"
+
+
+def parser_confidence_from_details(details: dict[str, Any]) -> str:
+    if details.get("potential_column") in {None, "Not detected"}:
+        return "Low"
+    if details.get("current_column") in {None, "Not detected"}:
+        return "Low"
+    warnings = str(details.get("warnings", "None")).strip()
+    if warnings and warnings != "None":
+        return "Medium"
+    return "High"
+
+
+def overall_analysis_status(
+    analysis_status: str,
+    unit_confidence: str = "High",
+    parser_confidence: str = "High",
+    current_unit_warning: str = "",
+) -> str:
+    if analysis_status in {"Failed", "Incomplete"}:
+        return analysis_status
+    if unit_confidence == "Low" or parser_confidence == "Low" or current_unit_warning:
+        return "Review needed"
+    if analysis_status == "Review recommended" or parser_confidence == "Medium":
+        return "Review needed"
+    return "Passed"
+
+
+def cv_analysis_quality_label(
+    oxidation_peak: Optional[Peak],
+    reduction_peak: Optional[Peak],
+    metrics: dict[str, Optional[float]],
+    potential: np.ndarray,
+    cycle_assignment_uncertain: bool = False,
+) -> str:
+    status = cv_analysis_status(oxidation_peak, reduction_peak, metrics, potential, cycle_assignment_uncertain)
+    if status != "Passed":
+        return status
+
+    confidence_values = [
+        peak.confidence for peak in [oxidation_peak, reduction_peak] if peak is not None
+    ]
+    if len(confidence_values) == 2 and all(value == "high" for value in confidence_values):
+        return "High"
+    if len(confidence_values) == 2 and all(value in {"high", "medium-high"} for value in confidence_values):
+        return "Medium-high"
+    if confidence_values:
+        return ", ".join(confidence_values).title()
+    return "Incomplete"
+
+
+def metric_trend_summary(label: str, values: list[Optional[float]], unit: str) -> str:
+    finite_values = [float(value) for value in values if value is not None and np.isfinite(value)]
+    if len(finite_values) < 2:
+        return f"{label}: not enough detected values."
+
+    start_value = finite_values[0]
+    end_value = finite_values[-1]
+    delta = end_value - start_value
+    scale = max(abs(start_value), abs(end_value), 1e-12)
+    if abs(delta) / scale < 0.05:
+        trend = "roughly stable"
+    elif label == "Ipc":
+        trend = "became more cathodic" if end_value < start_value else "became less cathodic"
+    else:
+        trend = "increased" if delta > 0 else "decreased"
+
+    return f"{label}: {trend} ({start_value:.4g} to {end_value:.4g} {unit})."
+
+
+def build_per_cycle_cv_metrics(
+    potential_v: np.ndarray,
+    analysis_current_a: np.ndarray,
+    cycle_values: Optional[np.ndarray],
+    cycles: list[float],
+    selected_cycle_value: Optional[float],
+    min_prominence_a: float,
+    min_distance: int,
+    min_abs_current_a: float,
+    display_unit: str,
+    electrode_area_cm2: float,
+    current_source: str,
+    selected_cycle_metrics: Optional[dict[str, Optional[float]]] = None,
+    selected_oxidation_peak: Optional[Peak] = None,
+    selected_reduction_peak: Optional[Peak] = None,
+    auto_tune_each_cycle: bool = True,
+) -> tuple[pd.DataFrame, list[str]]:
+    rows: list[dict[str, Any]] = []
+    trend_values: dict[str, list[Optional[float]]] = {
+        "ipa": [],
+        "ipc": [],
+        "delta_ep": [],
+    }
+    display_label = display_unit_label(display_unit)
+
+    for cycle_value in cycles:
+        cycle_mask = cycle_selection_mask(cycle_values, cycle_value, len(potential_v))
+        if not np.any(cycle_mask):
+            continue
+
+        cycle_potential = potential_v[cycle_mask]
+        cycle_current = analysis_current_a[cycle_mask]
+        is_selected_cycle = selected_cycle_value is not None and np.isclose(
+            cycle_value,
+            selected_cycle_value,
+            rtol=0.0,
+            atol=1e-9,
+        )
+
+        if is_selected_cycle and selected_cycle_metrics is not None:
+            metrics = selected_cycle_metrics
+            oxidation_peak = selected_oxidation_peak
+            reduction_peak = selected_reduction_peak
+        else:
+            cycle_min_prominence = min_prominence_a
+            cycle_min_distance = int(min_distance)
+            cycle_min_abs_current = min_abs_current_a
+            if auto_tune_each_cycle:
+                cycle_params = auto_tune_cv_peak_parameters(cycle_potential, cycle_current)
+                cycle_min_prominence = float(cycle_params["min_prominence"])
+                cycle_min_distance = int(cycle_params["min_distance"])
+                cycle_min_abs_current = float(cycle_params["min_abs_current"])
+
+            peaks = detect_peaks(
+                cycle_potential,
+                cycle_current,
+                cycle_min_prominence,
+                cycle_min_distance,
+                cycle_min_abs_current,
+            )
+            oxidation_peak, reduction_peak = select_default_primary_peaks(peaks)
+            _peak_rows, metrics = build_peak_metrics_rows(
+                oxidation_peak,
+                reduction_peak,
+                None,
+                cycle_current,
+                display_unit,
+                electrode_area_cm2,
+                current_source,
+            )
+
+        epa = metrics.get("epa_V")
+        epc = metrics.get("epc_V")
+        ipa = metrics.get("ipa_A")
+        ipc = metrics.get("ipc_A")
+        delta_ep = metrics.get("delta_ep_V")
+        formal_potential = (epa + epc) / 2 if epa is not None and epc is not None else None
+        ipa_display = (
+            current_to_display(np.array([ipa]), display_unit, current_source, electrode_area_cm2)[0]
+            if ipa is not None
+            else None
+        )
+        ipc_display = (
+            current_to_display(np.array([ipc]), display_unit, current_source, electrode_area_cm2)[0]
+            if ipc is not None
+            else None
+        )
+        trend_values["ipa"].append(ipa_display)
+        trend_values["ipc"].append(ipc_display)
+        trend_values["delta_ep"].append(delta_ep * 1000 if delta_ep is not None else None)
+
+        rows.append(
+            {
+                "cycle": cycle_display_label(cycle_value),
+                "analyzed": "Yes" if is_selected_cycle else "",
+                "Epa (V)": "Not detected" if epa is None else f"{epa:.4g}",
+                f"Ipa ({display_label})": "Not detected" if ipa_display is None else f"{ipa_display:.4g}",
+                "Epc (V)": "Not detected" if epc is None else f"{epc:.4g}",
+                f"Ipc ({display_label})": "Not detected" if ipc_display is None else f"{ipc_display:.4g}",
+                "\u0394Ep (mV)": "Not detected" if delta_ep is None else f"{delta_ep * 1000:.4g}",
+                "E\u00b0\u2032 (V)": "Not detected" if formal_potential is None else f"{formal_potential:.4g}",
+                "|Ipa/Ipc|": (
+                    "Not detected"
+                    if metrics.get("ipa_ipc_ratio") is None
+                    else f"{metrics['ipa_ipc_ratio']:.4g}"
+                ),
+                "analysis quality": cv_analysis_quality_label(
+                    oxidation_peak,
+                    reduction_peak,
+                    metrics,
+                    cycle_potential,
+                ),
+            }
+        )
+
+    trend_messages = [
+        metric_trend_summary("Ipa", trend_values["ipa"], display_label),
+        metric_trend_summary("Ipc", trend_values["ipc"], display_label),
+        metric_trend_summary("\u0394Ep", trend_values["delta_ep"], "mV"),
+    ]
+    return pd.DataFrame(rows), trend_messages
 
 
 def status_badge_class(status: str) -> str:
@@ -1977,6 +2553,14 @@ def render_cv_analysis_summary(
     potential: np.ndarray,
     scan_rate_estimate: str = "Not available",
     cycle_count: str = "Not detected",
+    title_suffix: str = "",
+    cycle_assignment_uncertain: bool = False,
+    analyzed_cycle_label: Optional[str] = None,
+    analysis_status_override: Optional[str] = None,
+    analysis_quality_override: Optional[str] = None,
+    unit_confidence: str = "High",
+    parser_confidence: str = "High",
+    current_unit_warning: str = "",
 ) -> None:
     epa = metrics.get("epa_V")
     epc = metrics.get("epc_V")
@@ -2007,26 +2591,77 @@ def render_cv_analysis_summary(
     else:
         confidence_label = "Incomplete"
 
-    status = cv_analysis_status(oxidation_peak, reduction_peak, metrics, potential)
+    peak_status = cv_analysis_status(
+        oxidation_peak,
+        reduction_peak,
+        metrics,
+        potential,
+        cycle_assignment_uncertain,
+    )
+    status = analysis_status_override or overall_analysis_status(
+        peak_status,
+        unit_confidence,
+        parser_confidence,
+        current_unit_warning,
+    )
     status_class = status_badge_class(status)
+    current_metrics_pending = pending_current_metric(unit_confidence)
+    current_metrics_need_review = current_metrics_pending or bool(current_unit_warning)
+    ipa_value = (
+        "Pending unit confirmation"
+        if current_metrics_pending
+        else format_current_metric(
+            metrics.get("ipa_A"),
+            display_unit,
+            current_source,
+            electrode_area_cm2,
+            current_metrics_need_review,
+        )
+    )
+    ipc_value = (
+        "Pending unit confirmation"
+        if current_metrics_pending
+        else format_current_metric(
+            metrics.get("ipc_A"),
+            display_unit,
+            current_source,
+            electrode_area_cm2,
+            current_metrics_need_review,
+        )
+    )
+    ratio_value = (
+        "Pending unit confirmation"
+        if current_metrics_pending
+        else (
+            "Not detected"
+            if metrics.get("ipa_ipc_ratio") is None
+            else f"{metrics['ipa_ipc_ratio']:.4g}{' (unit review)' if current_metrics_need_review else ''}"
+        )
+    )
 
+    title = f"CV Analysis Summary{title_suffix}"
     summary_items = [
         ("Analysis status", status),
+        ("Peak detection confidence", confidence_label),
+        ("Unit confidence", unit_confidence),
+        ("Parser confidence", parser_confidence),
         ("Epa", format_potential_metric(epa)),
-        ("Ipa", format_current_metric(metrics.get("ipa_A"), display_unit, current_source, electrode_area_cm2)),
+        ("Ipa", ipa_value),
         ("Epc", format_potential_metric(epc)),
-        ("Ipc", format_current_metric(metrics.get("ipc_A"), display_unit, current_source, electrode_area_cm2)),
+        ("Ipc", ipc_value),
         ("\u0394Ep", "Not detected" if delta_ep_mv is None else f"{delta_ep_mv:.4g} mV"),
         ("E\u00b0\u2032", format_potential_metric(formal_potential)),
-        ("|Ipa/Ipc|", "Not detected" if metrics.get("ipa_ipc_ratio") is None else f"{metrics['ipa_ipc_ratio']:.4g}"),
-        ("Analysis quality", confidence_label),
+        ("|Ipa/Ipc|", ratio_value),
+        ("Overall quality", analysis_quality_override or status),
         ("Scan mode", scan_mode),
     ]
     if switching_potential:
         summary_items.append(("Switching potential", switching_potential))
     if scan_rate_label:
         summary_items.append(("Scan rate", scan_rate_label))
-    if cycle_count_label:
+    if analyzed_cycle_label:
+        summary_items.append(("Analyzed cycle", analyzed_cycle_label))
+    elif cycle_count_label:
         summary_items.append(("Cycle count", cycle_count_label))
 
     metric_html = "\n".join(
@@ -2042,13 +2677,691 @@ def render_cv_analysis_summary(
         f"""
         <div class="analysis-card">
             <div class="analysis-card-header">
-                <h4>CV Analysis Summary</h4>
+                <h4>{escape_html(title)}</h4>
                 <span class="status-badge status-{escape_html(status_class)}">{escape_html(status)}</span>
             </div>
             <div class="analysis-grid">{metric_html}</div>
         </div>
         """,
         unsafe_allow_html=True,
+    )
+    if current_metrics_pending:
+        st.caption("Current-dependent metrics will be calculated after unit confirmation.")
+
+
+def lsv_scan_direction(potential_v: np.ndarray) -> str:
+    finite = potential_v[np.isfinite(potential_v)]
+    if finite.size < 2:
+        return "anodic"
+    return "anodic" if float(finite[-1]) >= float(finite[0]) else "cathodic"
+
+
+def select_lsv_onset(result: ESWResult, direction: str) -> tuple[Optional[float], Optional[str]]:
+    if direction == "cathodic" and result.cathodic_limit is not None:
+        return result.cathodic_limit, "cathodic"
+    if direction == "anodic" and result.anodic_limit is not None:
+        return result.anodic_limit, "anodic"
+    if result.anodic_limit is not None:
+        return result.anodic_limit, "anodic"
+    if result.cathodic_limit is not None:
+        return result.cathodic_limit, "cathodic"
+    return None, None
+
+
+def readable_lsv_current_unit(
+    current_values: np.ndarray,
+    current_source: str,
+    electrode_area_cm2: float,
+    prefer_density: bool = True,
+) -> str:
+    density_units = ["nA/cm^2", "uA/cm^2", "mA/cm^2", "A/cm^2"]
+    current_units = ["nA", "uA", "mA", "A"]
+    candidate_units = density_units if prefer_density else current_units
+
+    for unit in candidate_units:
+        display_values = current_to_display(current_values, unit, current_source, electrode_area_cm2)
+        finite_abs = np.abs(display_values[np.isfinite(display_values)])
+        if not finite_abs.size:
+            continue
+        p95 = float(np.nanpercentile(finite_abs, 95))
+        if 0.1 <= p95 < 1000:
+            return unit
+
+    return "uA/cm^2" if prefer_density else "uA"
+
+
+def lsv_display_unit_for_records(
+    records: list[dict[str, Any]],
+    current_source: str,
+    electrode_area_cm2: float,
+    prefer_density: bool = True,
+) -> str:
+    current_arrays = [
+        np.asarray(record.get("data", {}).get("current", np.array([])), dtype=float)
+        for record in records
+        if record.get("data", {}).get("current") is not None
+    ]
+    if not current_arrays:
+        return "uA/cm^2" if prefer_density else "uA"
+    return readable_lsv_current_unit(
+        np.concatenate(current_arrays),
+        current_source,
+        electrode_area_cm2,
+        prefer_density=prefer_density,
+    )
+
+
+def format_lsv_current_value(
+    current_value: Optional[float],
+    display_unit: str,
+    current_source: str,
+    electrode_area_cm2: float,
+) -> str:
+    if current_value is None:
+        return "Not available"
+    display_value = current_to_display(
+        np.array([current_value], dtype=float),
+        display_unit,
+        current_source,
+        electrode_area_cm2,
+    )[0]
+    if not np.isfinite(display_value):
+        return "Not available"
+    return f"{display_value:.4g} {display_unit_label(display_unit)}"
+
+
+def format_lsv_threshold(
+    threshold_base: Optional[float],
+    display_unit: str,
+    current_source: str,
+    electrode_area_cm2: float,
+) -> str:
+    if threshold_base is None:
+        return "Not available"
+    return format_lsv_current_value(threshold_base, display_unit, current_source, electrode_area_cm2)
+
+
+def lsv_threshold_quantity_label(display_unit: str) -> str:
+    return "current density" if is_current_density_unit(display_unit) else "current"
+
+
+def lsv_axis_options_for_current_source(current_source: str) -> tuple[list[str], str]:
+    if current_source == "Current density":
+        return ["Potential", "Current density"], "Current density"
+    return ["Potential", "Current", "Current density"], "Current"
+
+
+def lsv_dominant_response_direction(current_values: np.ndarray) -> Optional[str]:
+    finite = np.asarray(current_values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return None
+    max_current = float(np.nanmax(finite))
+    min_current = float(np.nanmin(finite))
+    if abs(min_current) > abs(max_current):
+        return "cathodic"
+    if abs(max_current) > 0:
+        return "anodic"
+    return None
+
+
+def lsv_auto_threshold_preset_label(display_unit: str) -> str:
+    return f"Auto (10% of max {lsv_threshold_quantity_label(display_unit)})"
+
+
+def lsv_threshold_preset_options(display_unit: str) -> list[str]:
+    if is_current_density_unit(display_unit):
+        return [
+            lsv_auto_threshold_preset_label(display_unit),
+            "1 mA/cm\u00b2",
+            "5 mA/cm\u00b2",
+            "10 mA/cm\u00b2",
+            "20 mA/cm\u00b2",
+            "50 mA/cm\u00b2",
+            "Custom",
+        ]
+    return [
+        lsv_auto_threshold_preset_label(display_unit),
+        "1 \u00b5A",
+        "5 \u00b5A",
+        "10 \u00b5A",
+        "50 \u00b5A",
+        "100 \u00b5A",
+        "Custom",
+    ]
+
+
+def lsv_threshold_preset_base_value(
+    preset: str,
+    current_source: str,
+    electrode_area_cm2: float,
+) -> Optional[float]:
+    density_presets = {
+        "1 mA/cm\u00b2": 1e-3,
+        "5 mA/cm\u00b2": 5e-3,
+        "10 mA/cm\u00b2": 10e-3,
+        "20 mA/cm\u00b2": 20e-3,
+        "50 mA/cm\u00b2": 50e-3,
+    }
+    current_presets = {
+        "1 \u00b5A": 1e-6,
+        "5 \u00b5A": 5e-6,
+        "10 \u00b5A": 10e-6,
+        "50 \u00b5A": 50e-6,
+        "100 \u00b5A": 100e-6,
+    }
+    if preset in density_presets:
+        density_base = density_presets[preset]
+        return density_base if current_source == "Current density" else density_base * electrode_area_cm2
+    return current_presets.get(preset)
+
+
+def lsv_threshold_source_details(
+    source: str,
+    quantity_label: str,
+    direction: Optional[str] = None,
+) -> tuple[str, str]:
+    if source == "Auto-selected":
+        if direction == "anodic":
+            return source, f"Auto-selected as 10% of maximum anodic {quantity_label}."
+        if direction == "cathodic":
+            return source, f"Auto-selected as 10% of maximum cathodic {quantity_label} magnitude."
+        return source, f"Auto-selected as 10% of maximum absolute {quantity_label} magnitude."
+    if source == "Default":
+        return source, "Default threshold."
+    return "User-defined", "User-defined threshold."
+
+
+def threshold_values_match(value: Optional[float], expected: Optional[float]) -> bool:
+    if value is None or expected is None:
+        return False
+    tolerance = max(abs(float(expected)) * 1e-9, 1e-12)
+    return abs(float(value) - float(expected)) <= tolerance
+
+
+def lsv_threshold_recommendation(
+    preset: str,
+    display_unit: str,
+    current_source: str,
+    electrode_area_cm2: float,
+    auto_threshold_display: float,
+    auto_source: str,
+    direction: Optional[str] = None,
+) -> tuple[float, str, str]:
+    quantity_label = lsv_threshold_quantity_label(display_unit)
+    auto_label = lsv_auto_threshold_preset_label(display_unit)
+    if preset == auto_label:
+        source, rule = lsv_threshold_source_details(auto_source, quantity_label, direction)
+        return auto_threshold_display, source, rule
+
+    preset_base = lsv_threshold_preset_base_value(preset, current_source, electrode_area_cm2)
+    if preset_base is not None:
+        preset_display = current_to_display(
+            np.array([preset_base], dtype=float),
+            display_unit,
+            current_source,
+            electrode_area_cm2,
+        )[0]
+        source, rule = lsv_threshold_source_details("User-defined", quantity_label, direction)
+        return float(preset_display), source, rule
+
+    source, rule = lsv_threshold_source_details("User-defined", quantity_label, direction)
+    return auto_threshold_display, source, rule
+
+
+def format_lsv_potential(
+    potential_v: Optional[float],
+    reference_electrode: Optional[str] = None,
+    decimals: int = 3,
+) -> str:
+    if potential_v is None or not np.isfinite(potential_v):
+        return "Not detected"
+    reference = f" vs {reference_electrode}" if reference_electrode else ""
+    return f"{potential_v:.{decimals}f} V{reference}"
+
+
+def build_lsv_analysis_summary(
+    record: dict[str, Any],
+    parsed_dataset: Optional[ParsedDataset],
+    threshold_a: Optional[float],
+    display_units: dict[str, Any],
+    reference_electrode: Optional[str] = None,
+    threshold_source: str = "User-defined",
+    threshold_rule: str = "User-defined threshold.",
+    reference_electrode_source: str = "user",
+    unit_review_needed: bool = False,
+) -> dict[str, str]:
+    potential_v = np.asarray(record["data"].get("potential", np.array([])), dtype=float)
+    current_values = np.asarray(record["data"].get("current", np.array([])), dtype=float)
+    current_source = display_units.get("current_source", "Current")
+    electrode_area_cm2 = float(display_units.get("electrode_area_cm2", 1.0))
+    display_axes = {
+        display_units.get("x_axis", "Potential"),
+        display_units.get("y_axis", "Current density"),
+    }
+    prefer_density = "Current density" in display_axes
+    current_unit = readable_lsv_current_unit(
+        current_values,
+        current_source,
+        electrode_area_cm2,
+        prefer_density=prefer_density,
+    )
+    current_label = "current density" if is_current_density_unit(current_unit) else "current"
+
+    direction = lsv_scan_direction(potential_v)
+    onset_potential = None
+    onset_direction = direction
+    if threshold_a is not None and threshold_a > 0:
+        result = calculate_esw(potential_v, current_values, threshold_a)
+        onset_potential, onset_direction = select_lsv_onset(result, direction)
+
+    status = "Passed" if onset_potential is not None else "Review needed"
+    review_note = ""
+    if onset_potential is None:
+        review_note = "No threshold crossing was detected in the uploaded potential range. Review the threshold or uploaded data."
+        method_note = review_note
+    else:
+        signed_threshold = -threshold_a if onset_direction == "cathodic" else threshold_a
+        threshold_note = format_lsv_threshold(signed_threshold, current_unit, current_source, electrode_area_cm2)
+        reference_note = f" Reported vs {reference_electrode}." if reference_electrode else ""
+        method_note = (
+            f"Onset = linearly interpolated potential where {onset_direction} "
+            f"{current_label} first crosses {threshold_note}.{reference_note}"
+        )
+    if unit_review_needed:
+        status = "Review needed"
+        review_note = "Current-dependent metrics may be incorrectly scaled until current unit is confirmed."
+
+    finite_current = current_values[np.isfinite(current_values)]
+    finite_potential = potential_v[np.isfinite(potential_v)]
+    max_current = None
+    max_potential = None
+    min_current = None
+    min_potential = None
+    if finite_current.size and potential_v.size == current_values.size:
+        max_idx = int(np.nanargmax(current_values))
+        min_idx = int(np.nanargmin(current_values))
+        max_current = float(current_values[max_idx])
+        max_potential = float(potential_v[max_idx]) if np.isfinite(potential_v[max_idx]) else None
+        min_current = float(current_values[min_idx])
+        min_potential = float(potential_v[min_idx]) if np.isfinite(potential_v[min_idx]) else None
+
+    scan_rate = "Not available"
+    scan_rate_note = ""
+    if parsed_dataset is not None:
+        potential_col = record.get("columns", {}).get("potential")
+        scan_rate_estimate = scan_rate_estimate_summary(parsed_dataset, potential_col)
+        scan_rate = summarize_scan_rate_for_card(scan_rate_estimate) or "Not available"
+        if scan_rate == "Not available":
+            scan_rate_note = scan_rate_unavailable_reason(parsed_dataset, potential_col)
+
+    method_quantity = "Current-density" if is_current_density_unit(current_unit) else "Current"
+    summary_direction = onset_direction or direction
+    if summary_direction == "cathodic":
+        onset_label = "Cathodic onset potential"
+        primary_current_label = f"Max cathodic {current_label}"
+        primary_current = min_current
+        primary_potential_label = f"Potential at max cathodic {current_label}"
+        primary_potential = min_potential
+    elif summary_direction == "anodic":
+        onset_label = "Anodic onset potential"
+        primary_current_label = f"Max anodic {current_label}"
+        primary_current = max_current
+        primary_potential_label = f"Potential at max anodic {current_label}"
+        primary_potential = max_potential
+    else:
+        onset_label = "Onset potential"
+        primary_current_label = f"Max {current_label}"
+        primary_current = max_current
+        primary_potential_label = f"Potential at max {current_label}"
+        primary_potential = max_potential
+
+    return {
+        "status": status,
+        "review_note": review_note,
+        "onset_label": onset_label,
+        "onset_potential": format_lsv_potential(onset_potential, reference_electrode),
+        "onset_method": f"{method_quantity} threshold crossing",
+        "threshold": format_lsv_threshold(threshold_a, current_unit, current_source, electrode_area_cm2),
+        "threshold_source": threshold_source,
+        "threshold_rule": threshold_rule,
+        "method_note": method_note,
+        "direction": summary_direction.title(),
+        "primary_current_label": primary_current_label,
+        "primary_current_value": format_lsv_current_value(primary_current, current_unit, current_source, electrode_area_cm2),
+        "primary_potential_label": primary_potential_label,
+        "primary_potential": format_lsv_potential(primary_potential, reference_electrode),
+        "max_label": f"Max {current_label}",
+        "max_value": format_lsv_current_value(max_current, current_unit, current_source, electrode_area_cm2),
+        "max_potential": format_lsv_potential(max_potential, reference_electrode),
+        "min_label": f"Min {current_label}",
+        "min_value": format_lsv_current_value(min_current, current_unit, current_source, electrode_area_cm2),
+        "min_potential": format_lsv_potential(min_potential, reference_electrode),
+        "potential_range": format_fixed_range(finite_potential, "V", 3),
+        "scan_rate": scan_rate,
+        "scan_rate_note": scan_rate_note,
+        "reference_electrode": reference_electrode_source_label(reference_electrode, reference_electrode_source),
+        "reference_note": reference_electrode_default_note(reference_electrode, reference_electrode_source),
+    }
+
+
+def render_lsv_analysis_summary(summary: dict[str, str]) -> None:
+    status = summary.get("status", "Review needed")
+    status_class = status_badge_class(status)
+    summary_items = [
+        ("Analysis status", status),
+        (summary.get("onset_label", "Onset potential"), summary.get("onset_potential", "Not detected")),
+        ("Onset method", summary.get("onset_method", "Threshold crossing")),
+        ("Threshold", summary.get("threshold", "Not available")),
+        ("Threshold source", summary.get("threshold_source", "User-defined")),
+        ("Threshold rule", summary.get("threshold_rule", "User-defined threshold.")),
+        ("Direction", summary.get("direction", "Not available")),
+        (summary.get("primary_current_label", "Max current"), summary.get("primary_current_value", "Not available")),
+        (summary.get("primary_potential_label", "Potential at max current"), summary.get("primary_potential", "Not available")),
+        ("Potential range", summary.get("potential_range", "Not available")),
+        ("Scan rate", summary.get("scan_rate", "Not available")),
+        ("Reference electrode", summary.get("reference_electrode", "Not selected")),
+    ]
+    metric_html = "\n".join(
+        f"""
+        <div class="analysis-metric">
+            <span>{escape_html(label)}</span>
+            <strong>{escape_html(value)}</strong>
+        </div>
+        """
+        for label, value in summary_items
+    )
+    st.markdown(
+        f"""
+        <div class="analysis-card">
+            <div class="analysis-card-header">
+                <h4>LSV Analysis Summary</h4>
+                <span class="status-badge status-{escape_html(status_class)}">{escape_html(status)}</span>
+            </div>
+            <div class="analysis-grid">{metric_html}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if summary.get("method_note"):
+        st.caption(summary["method_note"])
+    if summary.get("reference_note"):
+        st.caption(summary["reference_note"])
+    if summary.get("scan_rate_note"):
+        st.info(summary["scan_rate_note"])
+    if summary.get("review_note"):
+        st.warning(summary["review_note"])
+
+
+def format_lsv_display_state(
+    display_units: dict[str, Any],
+    threshold_a: Optional[float],
+    reference_electrode: Optional[str],
+    electrode_area_metadata: Optional[str] = None,
+) -> str:
+    current_source = display_units.get("current_source", "Current")
+    electrode_area_cm2 = float(display_units.get("electrode_area_cm2", 1.0))
+    y_axis = display_units.get("y_axis", "Current density")
+    x_axis = display_units.get("x_axis", "Potential")
+    if y_axis in {"Current", "Current density"}:
+        display_quantity = y_axis
+    elif x_axis in {"Current", "Current density"}:
+        display_quantity = x_axis
+    else:
+        display_quantity = "Current density"
+    if threshold_a is None:
+        threshold_text = "not set"
+    else:
+        threshold_text = format_lsv_threshold(
+            threshold_a,
+            display_units.get("current", "mA/cm^2"),
+            current_source,
+            electrode_area_cm2,
+        )
+    reference_text = reference_electrode or "Not selected"
+
+    if current_source == "Current density":
+        summary = (
+            "Display: Current density from uploaded column, "
+            f"threshold = {threshold_text}, reference = {reference_text}."
+        )
+        if electrode_area_metadata:
+            summary += (
+                f" Electrode area metadata: {electrode_area_metadata}. "
+                "No additional normalization applied."
+            )
+        return summary
+
+    if display_quantity == "Current":
+        return (
+            f"Display: Current, threshold = {threshold_text}, "
+            f"reference = {reference_text}."
+        )
+
+    area_text = f"{electrode_area_cm2:.1f}" if electrode_area_cm2 == round(electrode_area_cm2) else f"{electrode_area_cm2:g}"
+    return (
+        f"Display: {display_quantity}, area = {area_text} cm\u00b2, "
+        f"threshold = {threshold_text}, reference = {reference_text}."
+    )
+
+
+def build_lsv_detailed_metrics(
+    record: dict[str, Any],
+    parsed_dataset: Optional[ParsedDataset],
+    threshold_a: Optional[float],
+    display_units: dict[str, Any],
+    reference_electrode: Optional[str] = None,
+    threshold_source: str = "User-defined",
+    threshold_rule: str = "User-defined threshold.",
+) -> pd.DataFrame:
+    potential_v = np.asarray(record["data"].get("potential", np.array([])), dtype=float)
+    current_values = np.asarray(record["data"].get("current", np.array([])), dtype=float)
+    current_source = display_units.get("current_source", "Current")
+    electrode_area_cm2 = float(display_units.get("electrode_area_cm2", 1.0))
+    current_unit = display_units.get("current")
+    if not current_unit:
+        current_unit = readable_lsv_current_unit(
+            current_values,
+            current_source,
+            electrode_area_cm2,
+            prefer_density=display_units.get("y_axis", "Current density") == "Current density",
+        )
+    is_density = is_current_density_unit(current_unit)
+    current_label = "current density" if is_density else "current"
+    current_label_title = "current density" if is_density else "current"
+
+    direction = lsv_scan_direction(potential_v)
+    result = calculate_esw(potential_v, current_values, threshold_a) if threshold_a and threshold_a > 0 else ESWResult(None, None, None)
+    onset_potential, onset_direction = select_lsv_onset(result, direction)
+    onset_direction = onset_direction or direction
+    if onset_direction == "cathodic":
+        onset_label = "Cathodic onset potential"
+    elif onset_direction == "anodic":
+        onset_label = "Anodic onset potential"
+    else:
+        onset_label = "Onset potential"
+
+    max_current = None
+    max_potential = None
+    min_current = None
+    min_potential = None
+    if current_values.size and current_values.size == potential_v.size:
+        finite_pair = np.isfinite(current_values) & np.isfinite(potential_v)
+        if np.any(finite_pair):
+            finite_indices = np.flatnonzero(finite_pair)
+            max_idx = int(finite_indices[np.nanargmax(current_values[finite_pair])])
+            min_idx = int(finite_indices[np.nanargmin(current_values[finite_pair])])
+            max_current = float(current_values[max_idx])
+            max_potential = float(potential_v[max_idx])
+            min_current = float(current_values[min_idx])
+            min_potential = float(potential_v[min_idx])
+
+    scan_rate = "Not available"
+    scan_rate_note = ""
+    if parsed_dataset is not None:
+        potential_col = record.get("columns", {}).get("potential")
+        scan_rate_estimate = scan_rate_estimate_summary(parsed_dataset, potential_col)
+        scan_rate = summarize_scan_rate_for_card(scan_rate_estimate) or "Not available"
+        if scan_rate == "Not available":
+            scan_rate_note = scan_rate_unavailable_reason(parsed_dataset, potential_col)
+
+    direction_method = "Potential increases from start to end." if direction == "anodic" else "Potential decreases from start to end."
+    threshold_method = threshold_rule
+    crossing_method = f"Linear interpolation where {current_label} crosses the selected threshold."
+    rows = [
+        {
+            "Metric": onset_label,
+            "Value": format_lsv_potential(onset_potential, reference_electrode),
+            "Method": crossing_method,
+        },
+        {
+            "Metric": "Threshold",
+            "Value": format_lsv_threshold(threshold_a, current_unit, current_source, electrode_area_cm2),
+            "Method": threshold_method,
+        },
+        {
+            "Metric": "Threshold source",
+            "Value": threshold_source,
+            "Method": threshold_rule,
+        },
+        {
+            "Metric": "Onset method",
+            "Value": "Current-density threshold crossing" if is_density else "Current threshold crossing",
+            "Method": "Uses the selected threshold and scan direction to select the relevant crossing.",
+        },
+        {
+            "Metric": "Direction",
+            "Value": onset_direction.title(),
+            "Method": direction_method,
+        },
+        {
+            "Metric": f"Max {current_label_title}",
+            "Value": format_lsv_current_value(max_current, current_unit, current_source, electrode_area_cm2),
+            "Method": f"Maximum {current_label} in the normalized LSV trace.",
+        },
+        {
+            "Metric": f"Potential at max {current_label_title}",
+            "Value": format_lsv_potential(max_potential, reference_electrode),
+            "Method": f"Potential value at the maximum {current_label}.",
+        },
+        {
+            "Metric": f"Min {current_label_title}",
+            "Value": format_lsv_current_value(min_current, current_unit, current_source, electrode_area_cm2),
+            "Method": f"Minimum {current_label} in the normalized LSV trace.",
+        },
+        {
+            "Metric": f"Potential at min {current_label_title}",
+            "Value": format_lsv_potential(min_potential, reference_electrode),
+            "Method": f"Potential value at the minimum {current_label}.",
+        },
+        {
+            "Metric": "Potential range",
+            "Value": format_fixed_range(potential_v[np.isfinite(potential_v)], "V", 3),
+            "Method": "Minimum to maximum potential after unit normalization.",
+        },
+        {
+            "Metric": "Scan rate",
+            "Value": scan_rate,
+            "Method": scan_rate_note or "Estimated from dE/dt when time and potential columns are available.",
+        },
+        {
+            "Metric": "Number of points",
+            "Value": str(int(len(potential_v))),
+            "Method": "Numeric rows used after parser cleanup and column normalization.",
+        },
+    ]
+    return pd.DataFrame(rows, columns=["Metric", "Value", "Method"])
+
+
+def build_lsv_onset_annotation(
+    record: dict[str, Any],
+    threshold_a: Optional[float],
+    display_units: dict[str, Any],
+    reference_electrode: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    if threshold_a is None or threshold_a <= 0:
+        return None
+
+    potential_v = np.asarray(record["data"].get("potential", np.array([])), dtype=float)
+    current_values = np.asarray(record["data"].get("current", np.array([])), dtype=float)
+    if potential_v.size < 2 or current_values.size != potential_v.size:
+        return None
+
+    direction = lsv_scan_direction(potential_v)
+    result = calculate_esw(potential_v, current_values, threshold_a)
+    onset_potential, onset_direction = select_lsv_onset(result, direction)
+    if onset_potential is None or onset_direction is None:
+        return None
+
+    potential_unit = display_units.get("potential", "V")
+    current_unit = display_units.get("current", "uA/cm^2")
+    current_source = display_units.get("current_source", "Current")
+    electrode_area_cm2 = float(display_units.get("electrode_area_cm2", 1.0))
+    threshold_base = threshold_a if onset_direction == "anodic" else -threshold_a
+    potential_display = convert_role_from_base(np.array([onset_potential]), "potential", potential_unit)[0]
+    current_display = current_to_display(
+        np.array([threshold_base]),
+        current_unit,
+        current_source,
+        electrode_area_cm2,
+    )[0]
+    reference = f" vs {reference_electrode}" if reference_electrode else ""
+    onset_label = f"Onset = {onset_potential:.3f} V{reference}"
+    return {
+        "onset_potential_v": float(onset_potential),
+        "onset_potential_display": float(potential_display),
+        "threshold_display": float(current_display),
+        "direction": onset_direction,
+        "label": onset_label,
+        "hover": (
+            f"{onset_label}<br>"
+            f"Threshold: {current_display:.4g} {display_unit_label(current_unit)}"
+        ),
+    }
+
+
+def add_lsv_onset_annotation_to_plot(
+    fig: go.Figure,
+    record: dict[str, Any],
+    threshold_a: Optional[float],
+    display_units: dict[str, Any],
+    reference_electrode: Optional[str],
+) -> None:
+    annotation = build_lsv_onset_annotation(record, threshold_a, display_units, reference_electrode)
+    if annotation is None:
+        return
+
+    x_axis = display_units.get("x_axis", "Potential")
+    y_axis = display_units.get("y_axis", "Current density")
+    marker_x = annotation["onset_potential_display"] if x_axis == "Potential" else annotation["threshold_display"]
+    marker_y = annotation["threshold_display"] if y_axis != "Potential" else annotation["onset_potential_display"]
+
+    if x_axis == "Potential":
+        fig.add_vline(
+            x=annotation["onset_potential_display"],
+            line_dash="dash",
+            line_color="#dc2626",
+            annotation_text=annotation["label"],
+            annotation_position="top",
+        )
+    elif y_axis == "Potential":
+        fig.add_hline(
+            y=annotation["onset_potential_display"],
+            line_dash="dash",
+            line_color="#dc2626",
+            annotation_text=annotation["label"],
+            annotation_position="right",
+        )
+
+    fig.add_trace(
+        go.Scatter(
+            x=[marker_x],
+            y=[marker_y],
+            mode="markers",
+            name="Onset",
+            marker={"color": "#dc2626", "size": 11, "symbol": "circle"},
+            hovertemplate=f"{annotation['hover']}<extra></extra>",
+        )
     )
 
 
@@ -2062,6 +3375,34 @@ def experiment_label(experiment_type: str) -> str:
 
 def experiment_short_label(experiment_type: str) -> str:
     return EXPERIMENT_TYPES.get(experiment_type, EXPERIMENT_TYPES["cv"])["short_label"]
+
+
+def effective_experiment_type(experiment: dict[str, Any]) -> str:
+    outputs = experiment.get("analysis_outputs", {})
+    output_type = outputs.get("experiment_type") if isinstance(outputs, dict) else None
+    if output_type in EXPERIMENT_TYPES and output_type != "auto":
+        return str(output_type)
+
+    stored_type = experiment.get("experiment_type", "auto")
+    if stored_type in EXPERIMENT_TYPES and stored_type != "auto":
+        return str(stored_type)
+
+    file_types = {
+        file_record.get("summary", {}).get("experiment_type")
+        for file_record in experiment.get("files", {}).values()
+        if isinstance(file_record, dict) and isinstance(file_record.get("summary"), dict)
+    }
+    file_types = {str(file_type) for file_type in file_types if file_type in EXPERIMENT_TYPES and file_type != "auto"}
+    if len(file_types) == 1:
+        return next(iter(file_types))
+
+    return "auto"
+
+
+def experiment_header_type_label(experiment_type: str, detection_warnings: Optional[list[str]] = None) -> str:
+    if detection_warnings:
+        return "Auto / needs review"
+    return experiment_short_label(experiment_type)
 
 
 def role_label(role: str) -> str:
@@ -2192,7 +3533,7 @@ def format_summary_number(value: Any) -> str:
 
 
 def display_unit_label(unit: str) -> str:
-    return str(unit).replace("uA", "\u00b5A")
+    return str(unit).replace("uA", "\u00b5A").replace("cm^2", "cm\u00b2")
 
 
 def format_fixed_range(values: np.ndarray, unit: str, decimals: int) -> str:
@@ -2220,6 +3561,17 @@ def display_delimiter(delimiter: str) -> str:
     return labels.get(delimiter, delimiter)
 
 
+def filename_suggests_tabular_text(filename: str) -> bool:
+    name = Path(filename).name.lower()
+    return bool(re.search(r"(^|[_\-.])tab([_\-.]|$)", name))
+
+
+def display_delimiter_for_dataset(dataset: ParsedDataset) -> str:
+    if dataset.delimiter == "whitespace" and filename_suggests_tabular_text(dataset.filename):
+        return "tab / whitespace"
+    return display_delimiter(dataset.delimiter)
+
+
 def delimiter_fallback_from_filename(filename: str) -> str:
     suffix = Path(filename).suffix.lower()
     if suffix == ".tsv":
@@ -2231,6 +3583,46 @@ def current_source_guess_for_column(column: Optional[str]) -> str:
     if column and header_indicates_current_density(column):
         return "Current density"
     return "Current"
+
+
+def readable_parser_current_unit_for_lsv(
+    parsed_datasets: list[ParsedDataset],
+    current_source_override: Optional[str] = None,
+    electrode_area_cm2: float = 1.0,
+) -> tuple[Optional[str], Optional[str]]:
+    current_arrays: list[np.ndarray] = []
+    detected_sources: list[str] = []
+    for dataset in parsed_datasets:
+        detected = detect_experiment_columns(dataset, "lsv")
+        current_col = detected.get("current")
+        if not current_col or current_col not in dataset.dataframe:
+            continue
+        current_values = dataset.dataframe[current_col].to_numpy(dtype=float)
+        current_unit = resolve_role_unit_from_values("Auto", dataset, "current", current_col, current_values)
+        current_arrays.append(convert_current_to_amps(current_values, current_unit))
+        detected_source = current_source_guess_for_column(current_col)
+        detected_sources.append(
+            "Current density"
+            if detected_source == "Current density"
+            else current_source_override or detected_source
+        )
+
+    if not current_arrays:
+        return None, current_source_override
+
+    current_source = current_source_override
+    if current_source is None and detected_sources:
+        unique_sources = set(detected_sources)
+        current_source = detected_sources[0] if len(unique_sources) == 1 else "Current"
+
+    current_source = current_source or "Current"
+    display_unit = readable_lsv_current_unit(
+        np.concatenate(current_arrays),
+        current_source,
+        electrode_area_cm2,
+        prefer_density=current_source == "Current density",
+    )
+    return display_unit, current_source
 
 
 def current_unit_label_for_summary(current_unit: str, current_source: str) -> str:
@@ -2273,6 +3665,73 @@ def cycle_count_summary(dataset: ParsedDataset, potential_col: Optional[str] = N
         return f"Not detected ({cycle_col})"
     count = len(np.unique(finite))
     return str(count)
+
+
+def available_cycle_values(cycle_values: Optional[np.ndarray]) -> list[float]:
+    if cycle_values is None:
+        return []
+    finite = cycle_values[np.isfinite(cycle_values)]
+    if finite.size == 0:
+        return []
+    return sorted(float(value) for value in np.unique(finite))
+
+
+def cycle_display_label(cycle_value: float) -> str:
+    if float(cycle_value).is_integer():
+        return f"Cycle {int(cycle_value)}"
+    return f"Cycle {cycle_value:g}"
+
+
+def cycle_selection_mask(cycle_values: Optional[np.ndarray], selected_cycle: Optional[float], length: int) -> np.ndarray:
+    if cycle_values is None or selected_cycle is None or len(cycle_values) != length:
+        return np.ones(length, dtype=bool)
+    return np.isclose(cycle_values, selected_cycle, rtol=0.0, atol=1e-9)
+
+
+def analyzed_cycle_label(selected_cycle_value: Optional[float], cycle_count: int) -> Optional[str]:
+    if selected_cycle_value is None or cycle_count <= 1:
+        return None
+    return f"{cycle_display_label(selected_cycle_value)} of {cycle_count}"
+
+
+def cycle_assignment_messages(
+    dataset: AnalyzedDataset,
+    cycle_count: int,
+    current_cycle_label: Optional[str] = None,
+) -> list[tuple[str, str]]:
+    if cycle_count <= 1:
+        return []
+
+    source_phrase = "detected"
+    level = "info"
+    if dataset.cycle_source == "column":
+        source_phrase = "from cycle column"
+    elif dataset.cycle_source == "inferred":
+        source_phrase = "inferred from potential turning points"
+        level = "warning"
+
+    cycle_context = current_cycle_label or "the selected cycle"
+    message = (
+        f"Multi-cycle CV detected: {cycle_count} cycles {source_phrase}. "
+        f"Currently analyzing: {cycle_context}. "
+        "Metrics and peak markers use the selected cycle; plot may show all cycles."
+    )
+    if dataset.cycle_source == "inferred":
+        message += " Cycle splitting may be approximate."
+    return [(level, message)]
+
+
+def selected_cycle_trace_name(cycle_value: float, is_selected_cycle: bool) -> str:
+    cycle_name = cycle_display_label(cycle_value)
+    if is_selected_cycle:
+        return f"{cycle_name} \u2014 selected"
+    return cycle_name
+
+
+def selected_cycle_trace_style(is_selected_cycle: bool) -> tuple[float, float]:
+    if is_selected_cycle:
+        return 1.0, 4.0
+    return 0.28, 1.4
 
 
 def representative_scan_rate_v_s(time_s: np.ndarray, potential_v: np.ndarray) -> Optional[float]:
@@ -2328,6 +3787,26 @@ def scan_rate_estimate_summary(dataset: ParsedDataset, potential_col: Optional[s
     return f"{format_summary_number(scan_rate)} V/s ({format_summary_number(scan_rate * 1000)} mV/s)"
 
 
+def scan_rate_unavailable_reason(dataset: ParsedDataset, potential_col: Optional[str]) -> str:
+    time_col = dataset.detected_time_col
+    if not time_col:
+        excluded = {potential_col} if potential_col else set()
+        time_col = detect_column_by_role(dataset.dataframe, "time", excluded=excluded)
+    if not time_col:
+        return "Scan rate could not be estimated because no time column was found."
+    if not potential_col or time_col not in dataset.dataframe or potential_col not in dataset.dataframe:
+        return "Scan rate could not be estimated because the required time or potential column was unavailable."
+    return "Scan rate could not be estimated from the available time and potential values."
+
+
+def scan_rate_note_for_dataset(dataset: Optional[ParsedDataset], potential_col: Optional[str]) -> str:
+    if dataset is None:
+        return ""
+    if scan_rate_estimate_summary(dataset, potential_col) != "Not available":
+        return ""
+    return scan_rate_unavailable_reason(dataset, potential_col)
+
+
 def parser_unit_conversion_summary(
     potential_unit: str,
     current_unit: str,
@@ -2336,10 +3815,38 @@ def parser_unit_conversion_summary(
 ) -> str:
     current_display_unit = current_unit_label_for_summary(current_unit, current_source)
     current_base_unit = "A/cm^2" if current_source == "Current density" else "A"
-    summary = f"Potential: {potential_unit} -> V; {current_source}: {current_display_unit} -> {current_base_unit}"
+    summary = (
+        f"Potential: {display_unit_label(potential_unit)} -> V; "
+        f"{current_source}: {display_unit_label(current_display_unit)} -> {display_unit_label(current_base_unit)}"
+    )
     if display_current_unit:
         summary += f"; Display unit: {display_unit_label(display_current_unit)}"
     return summary
+
+
+def column_label_looks_inferred(column: Optional[str]) -> bool:
+    if column is None:
+        return False
+    text = str(column).strip()
+    if not text:
+        return True
+    if re.fullmatch(r"column\s+\d+", text, flags=re.IGNORECASE):
+        return True
+    return bool(_NUMBER_RE.fullmatch(text.replace(",", "")))
+
+
+def user_facing_column_label(dataset: ParsedDataset, column: Optional[str]) -> str:
+    if not column:
+        return "Not detected"
+    if column_label_looks_inferred(column):
+        try:
+            column_number = dataset.headers.index(column) + 1
+        except ValueError:
+            column_number = 0
+        if column_number:
+            return f"Inferred column {column_number}"
+        return "Inferred column"
+    return str(column)
 
 
 def parser_summary_details(
@@ -2348,6 +3855,7 @@ def parser_summary_details(
     display_current_unit: Optional[str] = None,
     current_source_override: Optional[str] = None,
     electrode_area_cm2: float = 1.0,
+    current_input_unit_override: Optional[str] = None,
 ) -> dict[str, Any]:
     detected = detect_experiment_columns(dataset, experiment_type)
     potential_col = detected.get("potential")
@@ -2366,16 +3874,46 @@ def parser_summary_details(
     current_range = "Not available"
     raw_current_range = "Not available"
     analysis_current_range = "Not available"
-    current_source = current_source_override or current_source_guess_for_column(current_col)
+    original_current_range = "Not available"
+    suggested_current_unit = "Not needed"
+    current_unit_warning = ""
+    current_magnitude_warning = ""
+    unit_header_warning = ""
+    unit_header_audit = ""
+    detected_current_source = current_source_guess_for_column(current_col)
+    current_source = (
+        "Current density"
+        if detected_current_source == "Current density"
+        else current_source_override or detected_current_source
+    )
     if current_col:
         current_values = dataset.dataframe[current_col].to_numpy(dtype=float)
-        current_unit = resolve_role_unit_from_values("Auto", dataset, "current", current_col, current_values)
+        current_unit = (
+            current_input_unit_override
+            or resolve_role_unit_from_values("Auto", dataset, "current", current_col, current_values)
+        )
+        current_label = current_unit_label_for_summary(current_unit, current_source)
+        original_current_range = format_numeric_range(current_values, "raw values")
+        if current_unit_is_ambiguous(dataset, current_col, current_input_unit_override or "Auto"):
+            suggested_current_unit = (
+                f"{display_unit_label(suggested_current_unit_for_values(current_values))} "
+                "based on value magnitude"
+            )
+            current_unit_warning = current_unit_magnitude_warning(
+                dataset,
+                current_col,
+                current_input_unit_override or "Auto",
+                current_unit,
+                current_source,
+                electrode_area_cm2,
+            )
         raw_current_range = format_numeric_range(
-            current_values, current_unit_label_for_summary(current_unit, current_source)
+            current_values, display_unit_label(current_label)
         )
         current_base_values = convert_current_to_amps(current_values, current_unit)
         analysis_unit = "A/cm^2" if current_source == "Current density" else "A"
-        analysis_current_range = format_numeric_range(current_base_values, analysis_unit)
+        analysis_current_range = format_numeric_range(current_base_values, display_unit_label(analysis_unit))
+        current_magnitude_warning = current_magnitude_sanity_warning(current_base_values, current_source)
         if display_current_unit:
             current_range = format_fixed_range(
                 current_to_display(current_base_values, display_current_unit, current_source, electrode_area_cm2),
@@ -2385,38 +3923,83 @@ def parser_summary_details(
         else:
             current_range = raw_current_range
 
+    unit_header_warning = missing_unit_header_warning(
+        dataset,
+        potential_col,
+        current_col,
+        current_input_unit_override or "Auto",
+    )
+    unit_header_audit = unit_header_audit_note(
+        current_col,
+        current_input_unit_override or "Auto",
+    )
     warnings = "; ".join(dataset.warnings) if dataset.warnings else "None"
     current_label = current_unit_label_for_summary(current_unit, current_source)
+    current_label_display = display_unit_label(current_label)
+    analysis_current_unit = "A/cm^2" if current_source == "Current density" else "A"
+    analysis_current_unit_display = display_unit_label(analysis_current_unit)
+    display_current_unit_display = display_unit_label(display_current_unit) if display_current_unit else current_label_display
     if display_current_unit:
-        units = f"Potential {potential_unit}; Current {current_label} \u2192 displayed as {display_unit_label(display_current_unit)}"
+        units = (
+            f"Potential {display_unit_label(potential_unit)}; "
+            f"{current_source} {current_label_display} \u2192 analysis {analysis_current_unit_display} "
+            f"\u2192 displayed as {display_current_unit_display}"
+        )
     else:
-        units = f"Potential: {potential_unit}; {current_source}: {current_label}"
+        units = f"Potential: {display_unit_label(potential_unit)}; {current_source}: {current_label_display}"
+
+    metadata_rows_before_header = max((dataset.header_row or dataset.data_start_row) - 1, 0)
+    scan_rate_estimate = scan_rate_estimate_summary(dataset, potential_col)
+    scan_rate_note = ""
+    if scan_rate_estimate == "Not available":
+        scan_rate_note = scan_rate_unavailable_reason(dataset, potential_col)
 
     return {
         "file_name": dataset.filename,
         "experiment_type": experiment_short_label(experiment_type),
         "rows_imported": len(dataset.dataframe),
-        "potential_column": potential_col or "Not detected",
-        "current_column": current_col or "Not detected",
+        "y_quantity": current_source,
+        "potential_column": user_facing_column_label(dataset, potential_col),
+        "current_column": user_facing_column_label(dataset, current_col),
+        "raw_potential_column": potential_col or "Not detected",
+        "raw_current_column": current_col or "Not detected",
         "units": units,
         "potential_range": potential_range,
         "current_range": current_range,
         "raw_potential_range": raw_potential_range,
         "raw_current_range": raw_current_range,
+        "original_current_values": original_current_range,
         "analysis_current_range": analysis_current_range,
-        "raw_current_unit": current_label,
-        "analysis_current_unit": "A/cm^2" if current_source == "Current density" else "A",
-        "display_current_unit": display_unit_label(display_current_unit) if display_current_unit else current_label,
+        "raw_current_unit": current_label_display,
+        "analysis_current_unit": analysis_current_unit_display,
+        "display_current_unit": display_current_unit_display,
         "warnings": warnings,
-        "delimiter": display_delimiter(dataset.delimiter),
+        "current_unit_confidence": current_unit_confidence(
+            dataset,
+            current_col,
+            current_input_unit_override or "Auto",
+        ),
+        "current_unit_confidence_detail": current_unit_confidence_detail(
+            dataset,
+            current_col,
+            current_input_unit_override or "Auto",
+        ),
+        "suggested_current_unit": suggested_current_unit,
+        "unit_header_warning": unit_header_warning,
+        "unit_header_audit": unit_header_audit,
+        "current_unit_warning": current_unit_warning,
+        "current_magnitude_warning": current_magnitude_warning,
+        "delimiter": display_delimiter_for_dataset(dataset),
         "header_row": f"Line {dataset.header_row}" if dataset.header_row else "Generated headers",
+        "metadata_rows_before_header": metadata_rows_before_header,
         "rows_skipped": dataset.rows_skipped,
         "missing_values": dataset.missing_values,
         "rows_dropped": dataset.rows_dropped,
         "unit_conversion": parser_unit_conversion_summary(potential_unit, current_unit, current_source, display_current_unit)
         if potential_col and current_col
         else "Not available",
-        "scan_rate_estimate": scan_rate_estimate_summary(dataset, potential_col),
+        "scan_rate_estimate": scan_rate_estimate,
+        "scan_rate_note": scan_rate_note,
         "cycle_count": cycle_count_summary(dataset, potential_col),
     }
 
@@ -2427,6 +4010,7 @@ def make_parser_summary(
     display_current_unit: Optional[str] = None,
     current_source_override: Optional[str] = None,
     electrode_area_cm2: float = 1.0,
+    current_input_unit_override: Optional[str] = None,
 ) -> pd.DataFrame:
     rows = []
     roles = required_roles_for_experiment(experiment_type) + optional_roles_for_experiment(experiment_type)
@@ -2438,6 +4022,7 @@ def make_parser_summary(
             display_current_unit,
             current_source_override,
             electrode_area_cm2,
+            current_input_unit_override,
         )
         row = {
             "file": details["file_name"],
@@ -2445,14 +4030,21 @@ def make_parser_summary(
             "rows_imported": details["rows_imported"],
             "columns": len(dataset.headers),
             "delimiter": dataset.delimiter,
+            "metadata_rows_before_header": details["metadata_rows_before_header"],
             "header_row": details["header_row"],
-            "rows_skipped": details["rows_skipped"],
+            "rows_skipped_before_numeric_data": details["rows_skipped"],
             "missing_values": details["missing_values"],
             "rows_dropped": details["rows_dropped"],
             "metadata_fields": len(dataset.metadata),
             "potential_range": details["potential_range"],
             "current_range": details["current_range"],
             "unit_conversion": details["unit_conversion"],
+            "current_unit_confidence": details["current_unit_confidence"],
+            "current_unit_confidence_detail": details["current_unit_confidence_detail"],
+            "suggested_current_unit": details["suggested_current_unit"],
+            "unit_header_warning": details["unit_header_warning"],
+            "unit_header_audit": details["unit_header_audit"],
+            "current_magnitude_warning": details["current_magnitude_warning"],
             "scan_rate_estimate": details["scan_rate_estimate"],
             "cycle_count": details["cycle_count"],
             "warnings": "; ".join(dataset.warnings),
@@ -2793,11 +4385,13 @@ def build_generic_results(
             )
             if lsv_threshold_a is not None and lsv_threshold_a > 0:
                 result = calculate_esw(potential_v, current_values, lsv_threshold_a)
+                direction = lsv_scan_direction(potential_v)
+                onset_potential, onset_direction = select_lsv_onset(result, direction)
                 row.update(
                     {
                         f"threshold_{lsv_threshold_unit or 'display'}": lsv_threshold_display,
-                        "cathodic_limit_V": result.cathodic_limit,
-                        "anodic_limit_V": result.anodic_limit,
+                        "onset_direction": onset_direction or direction,
+                        "onset_potential_V": onset_potential,
                         "operational_ESW_V": result.esw,
                     }
                 )
@@ -2872,6 +4466,12 @@ def add_generic_trace(
                     "Current density",
                     current_density_unit,
                 )
+            if axis_quantity == "Current":
+                return (
+                    current_to_display(data["current"], current_density_unit, current_source, electrode_area_cm2),
+                    "Current",
+                    current_density_unit,
+                )
             return (
                 convert_role_from_base(data["potential"], "potential", potential_unit),
                 "Potential",
@@ -2905,6 +4505,35 @@ def add_generic_trace(
         )
 
 
+def render_detected_metadata(metadata: dict[str, str], manual_metadata_key: str) -> None:
+    st.markdown("**Detected metadata**")
+    parsed_rows, unparsed_rows = metadata_rows_for_display(metadata)
+
+    if parsed_rows:
+        st.table(pd.DataFrame(parsed_rows))
+    elif unparsed_rows:
+        st.info("No structured metadata fields were detected.")
+    else:
+        st.write("No metadata rows detected before the numeric table.")
+
+    if unparsed_rows:
+        with st.expander("Unparsed metadata lines", expanded=False):
+            st.table(pd.DataFrame(unparsed_rows))
+
+    if metadata:
+        with st.expander("Advanced/debug raw metadata", expanded=False):
+            st.json(metadata)
+
+    st.text_area(
+        "Manual file metadata",
+        placeholder=(
+            "Add sample name, electrode, electrolyte, concentration, scan rate, instrument, "
+            "reference electrode, or other file-specific metadata."
+        ),
+        key=manual_metadata_key,
+    )
+
+
 def render_generic_experiment_analysis(
     project_name: str,
     project_workspace: dict[str, Any],
@@ -2912,173 +4541,267 @@ def render_generic_experiment_analysis(
     experiment_type: str,
     parsed_datasets: list[ParsedDataset],
 ) -> None:
+    experiment = project_workspace.get("experiments", {}).get(experiment_id, {})
+    saved_analysis_outputs = experiment.get("analysis_outputs", {}) if isinstance(experiment, dict) else {}
+    saved_analysis_settings = (
+        saved_analysis_outputs.get("settings", {})
+        if isinstance(saved_analysis_outputs, dict)
+        else {}
+    )
+    is_lsv = experiment_type == "lsv"
+    saved_display_units = saved_analysis_settings.get("display_units", {}) if isinstance(saved_analysis_settings, dict) else {}
+    parser_display_current_unit = None
+    parser_current_source = None
+    parser_electrode_area = 1.0
+    if is_lsv:
+        saved_current_source = (
+            saved_analysis_settings.get("lsv_current_source")
+            or saved_display_units.get("current_source")
+        )
+        parser_electrode_area = float(saved_display_units.get("electrode_area_cm2") or 1.0)
+        parser_display_current_unit, parser_current_source = readable_parser_current_unit_for_lsv(
+            parsed_datasets,
+            str(saved_current_source) if saved_current_source else None,
+            parser_electrode_area,
+        )
+
     parser_summary = render_parser_summary(
         parsed_datasets,
         experiment_type,
         key_prefix=f"generic_parser::{project_name}::{experiment_id}",
+        display_current_unit=parser_display_current_unit,
+        current_source_override=parser_current_source,
+        electrode_area_cm2=parser_electrode_area,
+    )
+    lsv_summary_container = st.container() if is_lsv else None
+    lsv_plot_container = st.container() if is_lsv else None
+    lsv_metrics_container = st.container() if is_lsv else None
+    lsv_controls_container = st.container() if is_lsv else None
+    lsv_mapping_container = st.container() if is_lsv else None
+    lsv_details_container = st.container() if is_lsv else None
+    lsv_controls_expander = (
+        lsv_controls_container.expander("LSV Analysis & Display Controls", expanded=False)
+        if lsv_controls_container is not None
+        else nullcontext()
+    )
+    mapping_context = (
+        lsv_mapping_container.expander("Data Mapping & Units", expanded=False)
+        if lsv_mapping_container is not None
+        else nullcontext()
     )
 
-    selected_filename = st.selectbox(
-        "Preview / detailed analysis file",
-        [dataset.filename for dataset in parsed_datasets],
-        key=f"generic_preview::{project_name}::{experiment_id}",
-    )
-    selected_dataset = next(dataset for dataset in parsed_datasets if dataset.filename == selected_filename)
-    selected_detected = detect_experiment_columns(selected_dataset, experiment_type)
+    with mapping_context:
+        selected_filename = st.selectbox(
+            "Preview / detailed analysis file",
+            [dataset.filename for dataset in parsed_datasets],
+            key=f"generic_preview::{project_name}::{experiment_id}",
+        )
+        selected_dataset = next(dataset for dataset in parsed_datasets if dataset.filename == selected_filename)
+        selected_detected = detect_experiment_columns(selected_dataset, experiment_type)
 
-    with st.expander("Detected metadata"):
-        if selected_dataset.metadata:
-            st.json(selected_dataset.metadata)
+        if not is_lsv:
+            with st.expander("Detected metadata"):
+                render_detected_metadata(
+                    selected_dataset.metadata,
+                    f"manual_metadata::{project_name}::{experiment_id}::{selected_dataset.filename}",
+                )
+
+        if is_lsv:
+            st.markdown("**Column and unit controls**")
         else:
-            st.write("No metadata rows detected before the numeric table.")
-            st.text_area(
-                "Manual file metadata",
-                placeholder=(
-                    "Add sample name, electrode, electrolyte, concentration, scan rate, instrument, "
-                    "reference electrode, or other file-specific metadata."
-                ),
-                key=f"manual_metadata::{project_name}::{experiment_id}::{selected_dataset.filename}",
+            st.subheader("Column and unit controls")
+        column_mode = st.radio(
+            "Column selection mode",
+            ["Use detected columns per file", "Manually select columns"],
+            horizontal=True,
+            key=f"generic_column_mode::{project_name}::{experiment_id}",
+        )
+
+        manual_columns: dict[str, Optional[str]] = {}
+        roles = required_roles_for_experiment(experiment_type) + optional_roles_for_experiment(experiment_type)
+        column_count = 3 if experiment_type == "eis" else 2
+        for idx, role in enumerate(roles):
+            if idx % column_count == 0:
+                cols = st.columns(column_count)
+            options = selected_dataset.headers if role in required_roles_for_experiment(experiment_type) else ["None"] + selected_dataset.headers
+            detected_column = selected_detected.get(role)
+            if detected_column in options:
+                default_index = options.index(detected_column)
+            else:
+                default_index = 0
+            with cols[idx % column_count]:
+                selected_column = st.selectbox(
+                    f"{role_label(role)} column",
+                    options,
+                    index=default_index,
+                    disabled=column_mode == "Use detected columns per file",
+                    key=f"generic_col::{project_name}::{experiment_id}::{role}",
+                )
+            manual_columns[role] = None if selected_column == "None" else selected_column
+
+        selected_units: dict[str, str] = {}
+        unit_cols = st.columns(min(3, len(roles)))
+        for idx, role in enumerate(roles):
+            with unit_cols[idx % len(unit_cols)]:
+                selected_units[role] = st.selectbox(
+                    f"{role_label(role)} input unit",
+                    unit_options_for_role(role),
+                    key=f"generic_unit::{project_name}::{experiment_id}::{role}",
+                )
+
+    if is_lsv and lsv_details_container is not None:
+        with lsv_details_container.expander("Detected Metadata / Data & Processing Details", expanded=False):
+            render_detected_metadata(
+                selected_dataset.metadata,
+                f"manual_metadata::{project_name}::{experiment_id}::{selected_dataset.filename}",
             )
 
-    st.subheader("Column and unit controls")
-    column_mode = st.radio(
-        "Column selection mode",
-        ["Use detected columns per file", "Manually select columns"],
-        horizontal=True,
-        key=f"generic_column_mode::{project_name}::{experiment_id}",
-    )
-
-    manual_columns: dict[str, Optional[str]] = {}
-    roles = required_roles_for_experiment(experiment_type) + optional_roles_for_experiment(experiment_type)
-    column_count = 3 if experiment_type == "eis" else 2
-    for idx, role in enumerate(roles):
-        if idx % column_count == 0:
-            cols = st.columns(column_count)
-        options = selected_dataset.headers if role in required_roles_for_experiment(experiment_type) else ["None"] + selected_dataset.headers
-        detected_column = selected_detected.get(role)
-        if detected_column in options:
-            default_index = options.index(detected_column)
-        else:
-            default_index = 0
-        with cols[idx % column_count]:
-            selected_column = st.selectbox(
-                f"{role_label(role)} column",
-                options,
-                index=default_index,
-                disabled=column_mode == "Use detected columns per file",
-                key=f"generic_col::{project_name}::{experiment_id}::{role}",
-            )
-        manual_columns[role] = None if selected_column == "None" else selected_column
-
-    selected_units: dict[str, str] = {}
-    unit_cols = st.columns(min(3, len(roles)))
-    for idx, role in enumerate(roles):
-        with unit_cols[idx % len(unit_cols)]:
-            selected_units[role] = st.selectbox(
-                f"{role_label(role)} input unit",
-                unit_options_for_role(role),
-                key=f"generic_unit::{project_name}::{experiment_id}::{role}",
-            )
-
-    st.subheader("Display controls")
     display_units: dict[str, str] = {}
-    if experiment_type == "ca":
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            display_units["time"] = st.selectbox("Time display unit", display_unit_options_for_role("time"), key=f"disp_time::{project_name}::{experiment_id}")
-        with col2:
-            display_units["current"] = st.selectbox("Current display unit", display_unit_options_for_role("current"), key=f"disp_current::{project_name}::{experiment_id}")
-        with col3:
-            show_markers = st.checkbox("Show data markers", value=False, key=f"generic_markers::{project_name}::{experiment_id}")
-    elif experiment_type == "cp":
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            display_units["time"] = st.selectbox("Time display unit", display_unit_options_for_role("time"), key=f"disp_time::{project_name}::{experiment_id}")
-        with col2:
-            display_units["potential"] = st.selectbox("Potential display unit", display_unit_options_for_role("potential"), key=f"disp_potential::{project_name}::{experiment_id}")
-        with col3:
-            show_markers = st.checkbox("Show data markers", value=False, key=f"generic_markers::{project_name}::{experiment_id}")
-    elif experiment_type == "eis":
-        col1, col2 = st.columns(2)
-        with col1:
-            display_units["impedance"] = st.selectbox("Impedance display unit", display_unit_options_for_role("impedance"), key=f"disp_impedance::{project_name}::{experiment_id}")
-        with col2:
-            show_markers = st.checkbox("Show data markers", value=True, key=f"generic_markers::{project_name}::{experiment_id}")
-    elif experiment_type == "lsv":
-        potential_col_for_units = selected_detected.get("potential") if column_mode == "Use detected columns per file" else manual_columns.get("potential")
-        current_col_for_units = selected_detected.get("current") if column_mode == "Use detected columns per file" else manual_columns.get("current")
-        potential_values_for_units = (
-            selected_dataset.dataframe[potential_col_for_units].to_numpy(dtype=float)
-            if potential_col_for_units in selected_dataset.dataframe.columns
-            else np.array([])
-        )
-        potential_display_unit = resolve_role_unit_from_values(
-            selected_units.get("potential", "Auto"),
-            selected_dataset,
-            "potential",
-            potential_col_for_units,
-            potential_values_for_units,
-        )
-        if potential_display_unit not in display_unit_options_for_role("potential"):
-            potential_display_unit = "V"
-        current_unit_for_density = resolve_role_unit(
-            selected_units.get("current", "Auto"),
-            selected_dataset,
-            "current",
-            current_col_for_units,
-        )
-
-        axis_options = ["Potential", "Current density"]
-        current_source_default = 1 if current_col_for_units and header_indicates_current_density(current_col_for_units) else 0
-        display_units["current_source"] = st.selectbox(
-            "Uploaded current column contains",
-            ["Current", "Current density"],
-            index=current_source_default,
-            key=f"lsv_current_source::{project_name}::{experiment_id}",
-        )
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            display_units["x_axis"] = st.selectbox(
-                "X-axis",
-                axis_options,
-                index=0,
-                key=f"lsv_x_axis::{project_name}::{experiment_id}",
-            )
-        with col2:
-            display_units["y_axis"] = st.selectbox(
-                "Y-axis",
-                axis_options,
-                index=1,
-                key=f"lsv_y_axis::{project_name}::{experiment_id}",
-            )
-        with col3:
-            show_markers = st.checkbox("Show data markers", value=False, key=f"generic_markers::{project_name}::{experiment_id}")
-
-        if display_units["x_axis"] == display_units["y_axis"]:
-            st.warning("Choose different quantities for the X-axis and Y-axis.")
-
-        display_units["potential"] = potential_display_unit
-        display_units["current"] = current_density_unit_from_current_unit(current_unit_for_density)
-        if display_units["current_source"] == "Current density":
-            display_units["electrode_area_cm2"] = 1.0
-            st.info("The uploaded current column is already normalized, so electrode-area normalization is skipped.")
+    with lsv_controls_expander:
+        if is_lsv:
+            st.markdown("**Display controls**")
         else:
-            display_units["electrode_area_cm2"] = st.number_input(
-                "Electrode surface area (cm^2)",
-                min_value=0.000001,
-                value=1.0,
-                step=0.1,
-                format="%.6f",
-                key=f"lsv_electrode_area::{project_name}::{experiment_id}",
+            st.subheader("Display controls")
+        if experiment_type == "ca":
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                display_units["time"] = st.selectbox("Time display unit", display_unit_options_for_role("time"), key=f"disp_time::{project_name}::{experiment_id}")
+            with col2:
+                display_units["current"] = st.selectbox("Current display unit", display_unit_options_for_role("current"), key=f"disp_current::{project_name}::{experiment_id}")
+            with col3:
+                show_markers = st.checkbox("Show data markers", value=False, key=f"generic_markers::{project_name}::{experiment_id}")
+        elif experiment_type == "cp":
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                display_units["time"] = st.selectbox("Time display unit", display_unit_options_for_role("time"), key=f"disp_time::{project_name}::{experiment_id}")
+            with col2:
+                display_units["potential"] = st.selectbox("Potential display unit", display_unit_options_for_role("potential"), key=f"disp_potential::{project_name}::{experiment_id}")
+            with col3:
+                show_markers = st.checkbox("Show data markers", value=False, key=f"generic_markers::{project_name}::{experiment_id}")
+        elif experiment_type == "eis":
+            col1, col2 = st.columns(2)
+            with col1:
+                display_units["impedance"] = st.selectbox("Impedance display unit", display_unit_options_for_role("impedance"), key=f"disp_impedance::{project_name}::{experiment_id}")
+            with col2:
+                show_markers = st.checkbox("Show data markers", value=True, key=f"generic_markers::{project_name}::{experiment_id}")
+        elif experiment_type == "lsv":
+            potential_col_for_units = selected_detected.get("potential") if column_mode == "Use detected columns per file" else manual_columns.get("potential")
+            current_col_for_units = selected_detected.get("current") if column_mode == "Use detected columns per file" else manual_columns.get("current")
+            potential_values_for_units = (
+                selected_dataset.dataframe[potential_col_for_units].to_numpy(dtype=float)
+                if potential_col_for_units in selected_dataset.dataframe.columns
+                else np.array([])
             )
-    else:
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            display_units["potential"] = st.selectbox("Potential display unit", display_unit_options_for_role("potential"), key=f"disp_potential::{project_name}::{experiment_id}")
-        with col2:
-            display_units["current"] = st.selectbox("Current display unit", display_unit_options_for_role("current"), key=f"disp_current::{project_name}::{experiment_id}")
-        with col3:
-            show_markers = st.checkbox("Show data markers", value=False, key=f"generic_markers::{project_name}::{experiment_id}")
+            potential_display_unit = resolve_role_unit_from_values(
+                selected_units.get("potential", "Auto"),
+                selected_dataset,
+                "potential",
+                potential_col_for_units,
+                potential_values_for_units,
+            )
+            if potential_display_unit not in display_unit_options_for_role("potential"):
+                potential_display_unit = "V"
+            current_unit_for_density = resolve_role_unit(
+                selected_units.get("current", "Auto"),
+                selected_dataset,
+                "current",
+                current_col_for_units,
+            )
+
+            current_source_default = 1 if current_col_for_units and header_indicates_current_density(current_col_for_units) else 0
+            current_source_key = (
+                f"lsv_current_source::{project_name}::{experiment_id}::"
+                f"{selected_filename}::{current_col_for_units or 'current'}"
+            )
+            if current_source_default == 1 and st.session_state.get(current_source_key) != "Current density":
+                st.session_state[current_source_key] = "Current density"
+            display_units["current_source"] = st.selectbox(
+                "Uploaded current column contains",
+                ["Current", "Current density"],
+                index=current_source_default,
+                key=current_source_key,
+            )
+            axis_options, default_y_axis = lsv_axis_options_for_current_source(display_units["current_source"])
+            y_axis_default_index = axis_options.index(default_y_axis)
+            axis_key_scope = (
+                f"{project_name}::{experiment_id}::{selected_filename}::"
+                f"{display_units['current_source']}"
+            )
+            x_axis_key = f"lsv_x_axis::{axis_key_scope}"
+            y_axis_key = f"lsv_y_axis::{axis_key_scope}"
+            if st.session_state.get(x_axis_key) not in {None, *axis_options}:
+                st.session_state[x_axis_key] = "Potential"
+            if st.session_state.get(y_axis_key) not in {None, *axis_options}:
+                st.session_state[y_axis_key] = default_y_axis
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                display_units["x_axis"] = st.selectbox(
+                    "X-axis",
+                    axis_options,
+                    index=0,
+                    key=x_axis_key,
+                )
+            with col2:
+                display_units["y_axis"] = st.selectbox(
+                    "Y-axis",
+                    axis_options,
+                    index=y_axis_default_index,
+                    key=y_axis_key,
+                )
+            with col3:
+                show_markers = st.checkbox("Show data markers", value=False, key=f"generic_markers::{project_name}::{experiment_id}")
+
+            if display_units["x_axis"] == display_units["y_axis"]:
+                st.warning("Choose different quantities for the X-axis and Y-axis.")
+
+            display_units["potential"] = potential_display_unit
+            uses_current_density_axis = "Current density" in {
+                display_units.get("x_axis", "Potential"),
+                display_units.get("y_axis", default_y_axis),
+            }
+            display_units["current"] = (
+                current_density_unit_from_current_unit(current_unit_for_density)
+                if uses_current_density_axis
+                else current_unit_for_density
+            )
+            if display_units["current_source"] == "Current density":
+                display_units["electrode_area_cm2"] = 1.0
+                st.info("The uploaded current column is already normalized, so electrode-area normalization is skipped.")
+                detected_area_metadata = electrode_area_metadata_summary(selected_dataset.metadata)
+                if detected_area_metadata:
+                    st.info(
+                        f"Electrode area metadata: {detected_area_metadata}. "
+                        "No additional normalization applied."
+                    )
+            elif uses_current_density_axis:
+                display_units["electrode_area_cm2"] = st.number_input(
+                    "Electrode surface area (cm^2)",
+                    min_value=0.000001,
+                    value=1.0,
+                    step=0.1,
+                    format="%.6f",
+                    key=f"lsv_electrode_area::{project_name}::{experiment_id}",
+                )
+                area_text = (
+                    f"{float(display_units['electrode_area_cm2']):.1f}"
+                    if float(display_units["electrode_area_cm2"]) == round(float(display_units["electrode_area_cm2"]))
+                    else f"{float(display_units['electrode_area_cm2']):g}"
+                )
+                st.info(
+                    "Current density calculated from raw current using electrode area = "
+                    f"{area_text} cm\u00b2. Enter the actual electrode area for meaningful "
+                    "current-density values."
+                )
+            else:
+                display_units["electrode_area_cm2"] = 1.0
+        else:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                display_units["potential"] = st.selectbox("Potential display unit", display_unit_options_for_role("potential"), key=f"disp_potential::{project_name}::{experiment_id}")
+            with col2:
+                display_units["current"] = st.selectbox("Current display unit", display_unit_options_for_role("current"), key=f"disp_current::{project_name}::{experiment_id}")
+            with col3:
+                show_markers = st.checkbox("Show data markers", value=False, key=f"generic_markers::{project_name}::{experiment_id}")
 
     records: list[dict[str, Any]] = []
     for dataset in parsed_datasets:
@@ -3099,165 +4822,318 @@ def render_generic_experiment_analysis(
         for warning in record.get("warnings", []):
             st.warning(f"{record['filename']}: {warning}")
 
+    if experiment_type == "lsv":
+        electrode_area_cm2 = float(display_units.get("electrode_area_cm2", 1.0))
+        current_source = display_units.get("current_source", "Current")
+        display_units["current"] = lsv_display_unit_for_records(
+            records,
+            current_source,
+            electrode_area_cm2,
+            prefer_density="Current density" in {
+                display_units.get("x_axis", "Potential"),
+                display_units.get("y_axis", "Current density"),
+            },
+        )
+
     lsv_threshold_display = None
     lsv_threshold_a = None
     lsv_threshold_unit = None
+    lsv_threshold_source = "Default"
+    lsv_threshold_rule = "Default threshold."
     reference_electrode = None
+    reference_electrode_source = "default"
     if experiment_type == "lsv":
         y_unit = display_units["current"]
         electrode_area_cm2 = float(display_units.get("electrode_area_cm2", 1.0))
         current_source = display_units.get("current_source", "Current")
+        selected_record_for_threshold = next(
+            (record for record in records if record["filename"] == selected_filename),
+            records[0],
+        )
+        selected_threshold_direction = lsv_dominant_response_direction(
+            np.asarray(
+                selected_record_for_threshold["data"].get("current", np.array([])),
+                dtype=float,
+            )
+        ) or lsv_scan_direction(
+            np.asarray(
+                selected_record_for_threshold["data"].get("potential", np.array([])),
+                dtype=float,
+            )
+        )
         all_lsv_y = np.concatenate(
             [
-                np.abs(current_density_from_base(record["data"]["current"], y_unit, current_source, electrode_area_cm2))
+                np.abs(current_to_display(record["data"]["current"], y_unit, current_source, electrode_area_cm2))
                 for record in records
             ]
         )
         finite_lsv_y = all_lsv_y[np.isfinite(all_lsv_y)]
-        default_threshold = float(np.nanmax(finite_lsv_y) * 0.1) if finite_lsv_y.size else 0.5
-        if default_threshold <= 0:
+        if finite_lsv_y.size and float(np.nanmax(finite_lsv_y)) > 0:
+            default_threshold = float(np.nanmax(finite_lsv_y) * 0.1)
+            default_threshold_source = "Auto-selected"
+        else:
             default_threshold = 0.5
+            default_threshold_source = "Default"
         lsv_threshold_unit = y_unit
-        lsv_threshold_display = st.number_input(
-            f"Current density threshold ({y_unit})",
-            min_value=0.0,
-            value=default_threshold,
-            step=max(default_threshold * 0.1, 1e-9),
-            format="%.6e",
-            key=f"lsv_threshold::{project_name}::{experiment_id}",
-        )
-        lsv_threshold_a = current_density_value_to_base(lsv_threshold_display, y_unit, current_source, electrode_area_cm2)
-        reference_electrode = st.selectbox(
-            "Reference electrode",
-            REFERENCE_ELECTRODE_OPTIONS,
-            key=f"lsv_reference_electrode::{project_name}::{experiment_id}",
-        )
-        if reference_electrode == "Other":
-            custom_reference = st.text_input(
-                "Reference electrode name",
-                key=f"lsv_reference_electrode_custom::{project_name}::{experiment_id}",
-            ).strip()
-            reference_electrode = custom_reference or "Other"
-
-    st.subheader(f"Interactive {experiment_short_label(experiment_type)} plot")
-    fig = go.Figure()
-    for record in records:
-        add_generic_trace(fig, record, experiment_type, display_units, show_markers)
-
-    if experiment_type == "lsv" and lsv_threshold_display is not None and lsv_threshold_display > 0:
-        if display_units.get("y_axis") == "Current density":
-            fig.add_hline(
-                y=lsv_threshold_display,
-                line_dash="dot",
-                annotation_text=f"+{lsv_threshold_display:g} {lsv_threshold_unit}",
+        with lsv_controls_expander:
+            st.markdown("**Threshold and reference**")
+            threshold_preset_options = lsv_threshold_preset_options(y_unit)
+            threshold_preset = st.selectbox(
+                "Threshold preset",
+                threshold_preset_options,
+                index=0,
+                key=f"lsv_threshold_preset::{project_name}::{experiment_id}::{y_unit}",
             )
-            fig.add_hline(
-                y=-lsv_threshold_display,
-                line_dash="dot",
-                annotation_text=f"-{lsv_threshold_display:g} {lsv_threshold_unit}",
+            recommended_threshold, lsv_threshold_source, lsv_threshold_rule = lsv_threshold_recommendation(
+                threshold_preset,
+                y_unit,
+                current_source,
+                electrode_area_cm2,
+                default_threshold,
+                default_threshold_source,
+                selected_threshold_direction,
             )
-        elif display_units.get("x_axis") == "Current density":
-            fig.add_vline(
-                x=lsv_threshold_display,
-                line_dash="dot",
-                annotation_text=f"+{lsv_threshold_display:g} {lsv_threshold_unit}",
+            lsv_threshold_display = st.number_input(
+                f"{lsv_threshold_quantity_label(y_unit).title()} threshold ({display_unit_label(y_unit)})",
+                min_value=0.0,
+                value=recommended_threshold,
+                step=max(recommended_threshold * 0.1, 1e-9),
+                format="%.6e",
+                key=f"lsv_threshold::{project_name}::{experiment_id}::{y_unit}::{threshold_preset}",
             )
-            fig.add_vline(
-                x=-lsv_threshold_display,
-                line_dash="dot",
-                annotation_text=f"-{lsv_threshold_display:g} {lsv_threshold_unit}",
+            if not threshold_values_match(lsv_threshold_display, recommended_threshold):
+                lsv_threshold_source, lsv_threshold_rule = lsv_threshold_source_details(
+                    "User-defined",
+                    lsv_threshold_quantity_label(y_unit),
+                    selected_threshold_direction,
+                )
+            st.caption(lsv_threshold_rule)
+        lsv_threshold_a = current_display_value_to_base(lsv_threshold_display, y_unit, current_source, electrode_area_cm2)
+        selected_reference_from_metadata = reference_electrode_from_metadata(selected_dataset.metadata)
+        reference_options = list(REFERENCE_ELECTRODE_OPTIONS)
+        if selected_reference_from_metadata and selected_reference_from_metadata not in reference_options:
+            reference_options.insert(-1, selected_reference_from_metadata)
+        saved_reference_electrode = str(saved_analysis_settings.get("reference_electrode") or "").strip()
+        if saved_reference_electrode and saved_reference_electrode not in reference_options:
+            reference_options.append(saved_reference_electrode)
+        if saved_reference_electrode and (
+            saved_reference_electrode != DEFAULT_REFERENCE_ELECTRODE or not selected_reference_from_metadata
+        ):
+            default_reference_value = saved_reference_electrode
+        elif selected_reference_from_metadata:
+            default_reference_value = selected_reference_from_metadata
+        else:
+            default_reference_value = DEFAULT_REFERENCE_ELECTRODE
+        reference_index = reference_options.index(default_reference_value) if default_reference_value in reference_options else 0
+        with lsv_controls_expander:
+            reference_electrode = st.selectbox(
+                "Reference electrode",
+                reference_options,
+                index=reference_index,
+                key=f"lsv_reference_electrode::{project_name}::{experiment_id}::{selected_filename}",
             )
+            if reference_electrode == "Other":
+                custom_reference = st.text_input(
+                    "Reference electrode name",
+                    key=f"lsv_reference_electrode_custom::{project_name}::{experiment_id}::{selected_filename}",
+                ).strip()
+                reference_electrode = custom_reference or "Other"
+            if selected_reference_from_metadata and reference_electrode == selected_reference_from_metadata:
+                reference_electrode_source = "metadata"
+            elif reference_electrode == DEFAULT_REFERENCE_ELECTRODE and not selected_reference_from_metadata:
+                reference_electrode_source = "default"
+            else:
+                reference_electrode_source = "user"
 
-    if experiment_type == "ca":
-        fig.update_layout(xaxis_title=f"Time / {display_units['time']}", yaxis_title=f"Current / {display_units['current']}")
-    elif experiment_type == "cp":
-        fig.update_layout(xaxis_title=f"Time / {display_units['time']}", yaxis_title=f"Potential / {display_units['potential']}")
-    elif experiment_type == "eis":
-        fig.update_layout(xaxis_title=f"Z real / {display_units['impedance']}", yaxis_title=f"-Z imaginary / {display_units['impedance']}")
-        fig.update_yaxes(scaleanchor="x", scaleratio=1)
-    elif experiment_type == "lsv":
-        fig.update_layout(
-            xaxis_title=lsv_axis_title(display_units.get("x_axis", "Potential"), display_units, reference_electrode),
-            yaxis_title=lsv_axis_title(display_units.get("y_axis", "Current density"), display_units, reference_electrode),
-        )
-    else:
-        fig.update_layout(xaxis_title=f"Potential / {display_units['potential']}", yaxis_title=f"Current / {display_units['current']}")
+        if lsv_summary_container is not None:
+            selected_record = next(
+                (record for record in records if record["filename"] == selected_filename),
+                records[0],
+            )
+            selected_parsed_dataset = selected_record.get("parsed_dataset")
+            with lsv_summary_container:
+                selected_metadata_area = None
+                if isinstance(selected_parsed_dataset, ParsedDataset):
+                    selected_metadata_area = electrode_area_metadata_summary(selected_parsed_dataset.metadata)
+                selected_current_col = selected_record.get("columns", {}).get("current")
+                selected_current_unit_review_needed = (
+                    isinstance(selected_parsed_dataset, ParsedDataset)
+                    and current_unit_is_ambiguous(
+                        selected_parsed_dataset,
+                        selected_current_col,
+                        selected_units.get("current", "Auto"),
+                    )
+                )
+                selected_current_magnitude_review_needed = False
+                if isinstance(selected_parsed_dataset, ParsedDataset):
+                    selected_details = parser_summary_details(
+                        selected_parsed_dataset,
+                        "lsv",
+                        display_units.get("current"),
+                        display_units.get("current_source"),
+                        float(display_units.get("electrode_area_cm2", 1.0)),
+                        selected_units.get("current") if selected_units.get("current") != "Auto" else None,
+                    )
+                    selected_current_magnitude_review_needed = bool(
+                        selected_details.get("current_magnitude_warning")
+                    ) and not bool(
+                        st.session_state.get(
+                            current_magnitude_ack_key(
+                                f"generic_parser::{project_name}::{experiment_id}",
+                                selected_parsed_dataset.filename,
+                            )
+                        )
+                    )
+                st.markdown(
+                    f"<div class=\"analysis-file\">{escape_html(format_lsv_display_state(display_units, lsv_threshold_a, reference_electrode, selected_metadata_area))}</div>",
+                    unsafe_allow_html=True,
+                )
+                render_lsv_analysis_summary(
+                    build_lsv_analysis_summary(
+                        selected_record,
+                        selected_parsed_dataset if isinstance(selected_parsed_dataset, ParsedDataset) else selected_dataset,
+                        lsv_threshold_a,
+                        display_units,
+                        reference_electrode,
+                        lsv_threshold_source,
+                        lsv_threshold_rule,
+                        reference_electrode_source,
+                        selected_current_unit_review_needed or selected_current_magnitude_review_needed,
+                    )
+                )
 
-    fig.update_layout(
-        template="plotly_white",
-        height=620,
-        margin={"l": 78, "r": 24, "t": 36, "b": 88},
-        legend={
-            "orientation": "h",
-            "yanchor": "bottom",
-            "y": 1.02,
-            "xanchor": "left",
-            "x": 0,
-            "title_text": "",
-        },
-    )
-    fig.update_xaxes(automargin=True)
-    fig.update_yaxes(automargin=True)
-    st.plotly_chart(fig, width="stretch")
-
-    if experiment_type == "eis" and any(record["data"].get("frequency_hz") is not None for record in records):
-        bode_mag = go.Figure()
-        bode_phase = go.Figure()
-        z_unit = display_units["impedance"]
+    plot_context = lsv_plot_container if lsv_plot_container is not None else nullcontext()
+    with plot_context:
+        st.subheader(f"Interactive {experiment_short_label(experiment_type)} plot")
+        fig = go.Figure()
         for record in records:
-            frequency = record["data"].get("frequency_hz")
-            if frequency is None or not len(frequency):
-                continue
-            zreal = record["data"]["zreal_ohm"]
-            zimag = record["data"]["zimag_ohm"]
-            zmod = np.sqrt(zreal**2 + zimag**2)
-            phase = np.rad2deg(np.arctan2(zimag, zreal))
-            bode_mag.add_trace(
-                go.Scatter(
-                    x=frequency,
-                    y=convert_role_from_base(zmod, "zmod", z_unit),
-                    mode="lines+markers" if show_markers else "lines",
-                    name=record["sample_name"],
-                )
-            )
-            bode_phase.add_trace(
-                go.Scatter(
-                    x=frequency,
-                    y=phase,
-                    mode="lines+markers" if show_markers else "lines",
-                    name=record["sample_name"],
-                )
-            )
-        if bode_mag.data:
-            bode_tabs = st.tabs(["Bode magnitude", "Bode phase"])
-            with bode_tabs[0]:
-                bode_mag.update_layout(
-                    xaxis_title="Frequency / Hz",
-                    yaxis_title=f"|Z| / {z_unit}",
-                    xaxis_type="log",
-                    template="plotly_white",
-                    height=430,
-                )
-                st.plotly_chart(bode_mag, width="stretch")
-            with bode_tabs[1]:
-                bode_phase.update_layout(
-                    xaxis_title="Frequency / Hz",
-                    yaxis_title="Phase / deg",
-                    xaxis_type="log",
-                    template="plotly_white",
-                    height=430,
-                )
-                st.plotly_chart(bode_phase, width="stretch")
+            add_generic_trace(fig, record, experiment_type, display_units, show_markers)
 
-    plot_html = fig.to_html(full_html=True, include_plotlyjs="cdn")
-    st.download_button(
-        "Download interactive plot as HTML",
-        data=plot_html,
-        file_name=f"voltscope_{experiment_type}_plot.html",
-        mime="text/html",
-    )
+        if experiment_type == "lsv" and lsv_threshold_display is not None and lsv_threshold_display > 0:
+            if display_units.get("y_axis") in {"Current", "Current density"}:
+                fig.add_hline(
+                    y=lsv_threshold_display,
+                    line_dash="dot",
+                    annotation_text=f"+{lsv_threshold_display:g} {display_unit_label(lsv_threshold_unit)}",
+                )
+                fig.add_hline(
+                    y=-lsv_threshold_display,
+                    line_dash="dot",
+                    annotation_text=f"-{lsv_threshold_display:g} {display_unit_label(lsv_threshold_unit)}",
+                )
+            elif display_units.get("x_axis") in {"Current", "Current density"}:
+                fig.add_vline(
+                    x=lsv_threshold_display,
+                    line_dash="dot",
+                    annotation_text=f"+{lsv_threshold_display:g} {display_unit_label(lsv_threshold_unit)}",
+                )
+                fig.add_vline(
+                    x=-lsv_threshold_display,
+                    line_dash="dot",
+                    annotation_text=f"-{lsv_threshold_display:g} {display_unit_label(lsv_threshold_unit)}",
+                )
 
-    st.subheader("Analysis results")
+            selected_lsv_record = next(
+                (record for record in records if record["filename"] == selected_filename),
+                records[0],
+            )
+            add_lsv_onset_annotation_to_plot(
+                fig,
+                selected_lsv_record,
+                lsv_threshold_a,
+                display_units,
+                reference_electrode,
+            )
+
+        if experiment_type == "ca":
+            fig.update_layout(xaxis_title=f"Time / {display_units['time']}", yaxis_title=f"Current / {display_units['current']}")
+        elif experiment_type == "cp":
+            fig.update_layout(xaxis_title=f"Time / {display_units['time']}", yaxis_title=f"Potential / {display_units['potential']}")
+        elif experiment_type == "eis":
+            fig.update_layout(xaxis_title=f"Z real / {display_units['impedance']}", yaxis_title=f"-Z imaginary / {display_units['impedance']}")
+            fig.update_yaxes(scaleanchor="x", scaleratio=1)
+        elif experiment_type == "lsv":
+            fig.update_layout(
+                xaxis_title=lsv_axis_title(display_units.get("x_axis", "Potential"), display_units, reference_electrode),
+                yaxis_title=lsv_axis_title(display_units.get("y_axis", "Current density"), display_units, reference_electrode),
+            )
+        else:
+            fig.update_layout(xaxis_title=f"Potential / {display_units['potential']}", yaxis_title=f"Current / {display_units['current']}")
+
+        fig.update_layout(
+            template="plotly_white",
+            height=620,
+            margin={"l": 78, "r": 24, "t": 36, "b": 88},
+            legend={
+                "orientation": "h",
+                "yanchor": "bottom",
+                "y": 1.02,
+                "xanchor": "left",
+                "x": 0,
+                "title_text": "",
+            },
+        )
+        fig.update_xaxes(automargin=True)
+        fig.update_yaxes(automargin=True)
+        st.plotly_chart(fig, width="stretch")
+
+        if experiment_type == "eis" and any(record["data"].get("frequency_hz") is not None for record in records):
+            bode_mag = go.Figure()
+            bode_phase = go.Figure()
+            z_unit = display_units["impedance"]
+            for record in records:
+                frequency = record["data"].get("frequency_hz")
+                if frequency is None or not len(frequency):
+                    continue
+                zreal = record["data"]["zreal_ohm"]
+                zimag = record["data"]["zimag_ohm"]
+                zmod = np.sqrt(zreal**2 + zimag**2)
+                phase = np.rad2deg(np.arctan2(zimag, zreal))
+                bode_mag.add_trace(
+                    go.Scatter(
+                        x=frequency,
+                        y=convert_role_from_base(zmod, "zmod", z_unit),
+                        mode="lines+markers" if show_markers else "lines",
+                        name=record["sample_name"],
+                    )
+                )
+                bode_phase.add_trace(
+                    go.Scatter(
+                        x=frequency,
+                        y=phase,
+                        mode="lines+markers" if show_markers else "lines",
+                        name=record["sample_name"],
+                    )
+                )
+            if bode_mag.data:
+                bode_tabs = st.tabs(["Bode magnitude", "Bode phase"])
+                with bode_tabs[0]:
+                    bode_mag.update_layout(
+                        xaxis_title="Frequency / Hz",
+                        yaxis_title=f"|Z| / {z_unit}",
+                        xaxis_type="log",
+                        template="plotly_white",
+                        height=430,
+                    )
+                    st.plotly_chart(bode_mag, width="stretch")
+                with bode_tabs[1]:
+                    bode_phase.update_layout(
+                        xaxis_title="Frequency / Hz",
+                        yaxis_title="Phase / deg",
+                        xaxis_type="log",
+                        template="plotly_white",
+                        height=430,
+                    )
+                    st.plotly_chart(bode_phase, width="stretch")
+
+        plot_html = fig.to_html(full_html=True, include_plotlyjs="cdn")
+        st.download_button(
+            "Download interactive plot as HTML",
+            data=plot_html,
+            file_name=f"voltscope_{experiment_type}_plot.html",
+            mime="text/html",
+        )
+
     results_df = build_generic_results(
         records,
         experiment_type,
@@ -3266,19 +5142,45 @@ def render_generic_experiment_analysis(
         lsv_threshold_unit=lsv_threshold_unit,
         lsv_current_source=display_units.get("current_source", "Current"),
     )
-    st.dataframe(results_df, width="stretch", hide_index=True)
+    metrics_context = lsv_metrics_container if lsv_metrics_container is not None else nullcontext()
+    with metrics_context:
+        st.subheader("Detailed LSV Metrics" if is_lsv else "Analysis results")
+        selected_metrics_df = None
+        if is_lsv:
+            selected_lsv_record = next(
+                (record for record in records if record["filename"] == selected_filename),
+                records[0],
+            )
+            selected_parsed_dataset = selected_lsv_record.get("parsed_dataset")
+            selected_metrics_df = build_lsv_detailed_metrics(
+                selected_lsv_record,
+                selected_parsed_dataset if isinstance(selected_parsed_dataset, ParsedDataset) else selected_dataset,
+                lsv_threshold_a,
+                display_units,
+                reference_electrode,
+                lsv_threshold_source,
+                lsv_threshold_rule,
+            )
+            st.table(selected_metrics_df)
+            with st.expander("Raw/internal results", expanded=False):
+                st.dataframe(results_df, width="stretch", hide_index=True)
+        else:
+            st.dataframe(results_df, width="stretch", hide_index=True)
 
-    export_buffer = io.StringIO()
-    export_buffer.write("# Parser summary\n")
-    export_buffer.write(parser_summary.to_csv(index=False))
-    export_buffer.write("\n# Analysis results\n")
-    export_buffer.write(results_df.to_csv(index=False))
-    st.download_button(
-        "Download analysis results as CSV",
-        data=export_buffer.getvalue(),
-        file_name=f"voltscope_{experiment_type}_analysis_results.csv",
-        mime="text/csv",
-    )
+        export_buffer = io.StringIO()
+        export_buffer.write("# Parser summary\n")
+        export_buffer.write(parser_summary.to_csv(index=False))
+        if selected_metrics_df is not None:
+            export_buffer.write("\n# Detailed LSV metrics\n")
+            export_buffer.write(selected_metrics_df.to_csv(index=False))
+        export_buffer.write("\n# Raw analysis results\n")
+        export_buffer.write(results_df.to_csv(index=False))
+        st.download_button(
+            "Download analysis results as CSV",
+            data=export_buffer.getvalue(),
+            file_name=f"voltscope_{experiment_type}_analysis_results.csv",
+            mime="text/csv",
+        )
 
     store_generic_experiment_analysis(
         project_workspace,
@@ -3293,8 +5195,11 @@ def render_generic_experiment_analysis(
             "display_units": display_units,
             "lsv_threshold": lsv_threshold_display,
             "lsv_threshold_unit": lsv_threshold_unit,
+            "lsv_threshold_source": lsv_threshold_source,
+            "lsv_threshold_rule": lsv_threshold_rule,
             "lsv_current_source": display_units.get("current_source", "Current"),
             "reference_electrode": reference_electrode,
+            "reference_electrode_source": reference_electrode_source,
         },
     )
     render_experiment_notes(project_name, project_workspace, experiment_id)
@@ -3435,6 +5340,9 @@ def parsed_dataset_from_saved_file(
             return None
         current_col = "CurrentDensity_A_cm2" if current_source == "Current density" else "Current_A"
         dataframe = pd.DataFrame({"Potential_V": potential, current_col: current})
+        cycle_values = trace.get("cycle_values")
+        if isinstance(cycle_values, list) and len(cycle_values) == len(dataframe):
+            dataframe["Cycle"] = pd.to_numeric(pd.Series(cycle_values), errors="coerce")
         headers = list(dataframe.columns)
         detected_units = {"potential:Potential_V": "V", f"current:{current_col}": "A"}
         return ParsedDataset(
@@ -3658,6 +5566,7 @@ def summarize_analysis(dataset: AnalyzedDataset) -> dict[str, Any]:
         "potential_unit": dataset.potential_unit,
         "current_unit": dataset.current_unit,
         "current_source": dataset.current_source,
+        "cycle_source": dataset.cycle_source,
         "points": int(len(dataset.potential_v)),
         "potential_min_v": float(np.min(potential)) if potential.size else None,
         "potential_max_v": float(np.max(potential)) if potential.size else None,
@@ -3682,6 +5591,8 @@ def serialize_analyzed_dataset(
             "smoothed_current_a": (
                 dataset.smoothed_current_a.tolist() if dataset.smoothed_current_a is not None else None
             ),
+            "cycle_values": dataset.cycle_values.tolist() if dataset.cycle_values is not None else None,
+            "cycle_source": dataset.cycle_source,
         },
     }
 
@@ -3936,6 +5847,11 @@ def apply_app_theme() -> None:
             color: #176236;
         }
         .status-review-recommended {
+            background: #fff6df;
+            border-color: #e8ca77;
+            color: #73510c;
+        }
+        .status-review-needed {
             background: #fff6df;
             border-color: #e8ca77;
             color: #73510c;
@@ -4478,6 +6394,71 @@ def render_analysis_result_cards(results: list[dict[str, Any]]) -> None:
         )
 
 
+def compact_suggested_current_unit(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text == "Not needed":
+        return "Not needed"
+    return text.replace(" based on value magnitude", "").strip()
+
+
+def render_unit_review_panel(
+    *,
+    current_col: str,
+    current_col_label: str,
+    suggested_unit: str,
+    current_unit_warning: str,
+    confirmed_current_unit_key: str,
+    selectbox_key: str,
+    button_key: str,
+) -> None:
+    suggested_label = display_unit_label(suggested_unit)
+    explanation = current_unit_review_explanation(current_col_label, suggested_unit, current_unit_warning)
+    reason = current_unit_review_reason(suggested_unit, current_unit_warning)
+    st.markdown(
+        f"""
+        <div class="analysis-card">
+            <div class="analysis-card-header">
+                <h4>Unit review required</h4>
+                <span class="status-badge status-review-needed">Review needed</span>
+            </div>
+            <p>{escape_html(explanation)}</p>
+            <div class="analysis-grid">
+                <div class="analysis-metric">
+                    <span>Suggested unit</span>
+                    <strong>{escape_html(suggested_label)}</strong>
+                </div>
+                <div class="analysis-metric">
+                    <span>Reason</span>
+                    <strong>{escape_html(reason)}</strong>
+                </div>
+                <div class="analysis-metric">
+                    <span>Current column</span>
+                    <strong title="{escape_html(current_col)}">{escape_html(current_col_label)}</strong>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    confirm_col1, confirm_col2 = st.columns([2, 1])
+    confirm_unit_options = ["A", "mA", "uA", "nA", "pA"]
+    suggested_value = suggested_unit if suggested_unit in confirm_unit_options else "uA"
+    with confirm_col1:
+        confirm_choice = st.selectbox(
+            "Confirm current unit",
+            confirm_unit_options,
+            index=confirm_unit_options.index(suggested_value),
+            key=selectbox_key,
+            format_func=display_unit_label,
+        )
+    with confirm_col2:
+        st.write("")
+        st.write("")
+        if st.button("Apply unit", key=button_key):
+            st.session_state[confirmed_current_unit_key] = confirm_choice
+            st.rerun()
+
+
 def render_parser_summary(
     parsed_datasets: list[ParsedDataset],
     experiment_type: str,
@@ -4485,6 +6466,7 @@ def render_parser_summary(
     display_current_unit: Optional[str] = None,
     current_source_override: Optional[str] = None,
     electrode_area_cm2: float = 1.0,
+    current_input_unit_override: Optional[str] = None,
 ) -> pd.DataFrame:
     parser_summary = make_parser_summary(
         parsed_datasets,
@@ -4492,6 +6474,7 @@ def render_parser_summary(
         display_current_unit,
         current_source_override,
         electrode_area_cm2,
+        current_input_unit_override,
     )
     st.subheader("Parser summary")
 
@@ -4510,12 +6493,14 @@ def render_parser_summary(
 
     advanced_fields = [
         ("Delimiter", "delimiter"),
+        ("Metadata rows before header", "metadata_rows_before_header"),
         ("Header row", "header_row"),
-        ("Header/metadata rows skipped", "rows_skipped"),
+        ("Rows skipped before numeric data", "rows_skipped"),
         ("Missing values", "missing_values"),
         ("Rows dropped", "rows_dropped"),
         ("Unit conversion", "unit_conversion"),
         ("Scan rate estimate", "scan_rate_estimate"),
+        ("Scan rate note", "scan_rate_note"),
         ("Cycle count", "cycle_count"),
     ]
 
@@ -4526,18 +6511,46 @@ def render_parser_summary(
             display_current_unit,
             current_source_override,
             electrode_area_cm2,
+            current_input_unit_override,
         )
+        magnitude_ack_key = current_magnitude_ack_key(key_prefix, dataset.filename)
+        magnitude_warning_acknowledged = bool(st.session_state.get(magnitude_ack_key))
         combined_warnings = []
         if dataset.warnings:
             combined_warnings.extend(dataset.warnings)
         combined_warnings.extend(backend_warnings_by_file.get(dataset.filename, []))
-        details["warnings"] = "; ".join(combined_warnings) if combined_warnings else "None"
+        if details.get("unit_header_warning"):
+            combined_warnings.append(str(details["unit_header_warning"]))
+        if details.get("current_unit_warning"):
+            combined_warnings.append(str(details["current_unit_warning"]))
+        if details.get("current_magnitude_warning") and not magnitude_warning_acknowledged:
+            combined_warnings.append(str(details["current_magnitude_warning"]))
+        unit_review_required = details.get("current_unit_confidence") == "Low"
+        details["warnings"] = (
+            "Unit review required"
+            if unit_review_required
+            else "; ".join(combined_warnings) if combined_warnings else "None"
+        )
 
-        current_unit_summary = str(details["raw_current_unit"])
-        if details["analysis_current_unit"] != details["raw_current_unit"]:
+        if unit_review_required:
+            current_unit_summary = "Ambiguous"
+        else:
+            current_unit_summary = str(details["raw_current_unit"])
+        if not unit_review_required and details["analysis_current_unit"] != details["raw_current_unit"]:
             current_unit_summary += f" \u2192 analysis {details['analysis_current_unit']}"
-        if details["display_current_unit"] != details["analysis_current_unit"]:
+        if not unit_review_required and details["display_current_unit"] != details["analysis_current_unit"]:
             current_unit_summary += f" \u2192 displayed as {details['display_current_unit']}"
+
+        y_quantity = str(details.get("y_quantity") or "Current")
+        unit_lines = [
+            ("Potential", "V"),
+            (f"{y_quantity} unit", current_unit_summary),
+            ("Current unit confidence", details["current_unit_confidence"]),
+        ]
+        if details.get("suggested_current_unit") not in {None, "", "Not needed"}:
+            unit_lines.append(("Suggested current unit", compact_suggested_current_unit(details["suggested_current_unit"])))
+        if details.get("unit_header_audit"):
+            unit_lines.append(("Unit audit", details["unit_header_audit"]))
 
         summary_cards = [
             (
@@ -4551,21 +6564,22 @@ def render_parser_summary(
                 "Column mapping",
                 [
                     ("Potential", details["potential_column"]),
-                    ("Current", details["current_column"]),
+                    ("Y-axis quantity", y_quantity),
+                    (f"{y_quantity} column", details["current_column"]),
                 ],
             ),
             (
                 "Units",
-                [
-                    ("Potential", "V"),
-                    ("Current", current_unit_summary),
-                ],
+                unit_lines,
             ),
             (
                 "Ranges",
                 [
                     ("Potential", details["potential_range"]),
-                    ("Current", details["current_range"]),
+                    (
+                        y_quantity,
+                        "Pending unit confirmation" if unit_review_required else details["current_range"],
+                    ),
                 ],
             ),
         ]
@@ -4594,6 +6608,16 @@ def render_parser_summary(
             """,
             unsafe_allow_html=True,
         )
+        if details.get("current_unit_warning") and not unit_review_required:
+            st.warning(str(details["current_unit_warning"]))
+        if details.get("current_magnitude_warning") and not unit_review_required:
+            if magnitude_warning_acknowledged:
+                st.info("Current magnitude warning acknowledged.")
+            else:
+                st.warning(str(details["current_magnitude_warning"]))
+                if st.button("Acknowledge current magnitude warning", key=magnitude_ack_key):
+                    st.session_state[magnitude_ack_key] = True
+                    st.rerun()
 
         with st.expander(f"Details: {dataset.filename}"):
             advanced_rows = [
@@ -4602,12 +6626,21 @@ def render_parser_summary(
             ]
             advanced_rows.extend(
                 [
+                    {"Field": "Raw potential column", "Value": str(details["raw_potential_column"])},
+                    {"Field": f"Raw {y_quantity.lower()} column", "Value": str(details["raw_current_column"])},
                     {"Field": "Raw potential range", "Value": str(details["raw_potential_range"])},
-                    {"Field": "Raw current range", "Value": str(details["raw_current_range"])},
-                    {"Field": "Analysis current range", "Value": str(details["analysis_current_range"])},
-                    {"Field": "Raw current unit", "Value": str(details["raw_current_unit"])},
-                    {"Field": "Analysis current unit", "Value": str(details["analysis_current_unit"])},
-                    {"Field": "Display current unit", "Value": str(details["display_current_unit"])},
+                    {"Field": f"Original {y_quantity.lower()} values", "Value": str(details["original_current_values"])},
+                    {"Field": f"Raw {y_quantity.lower()} range", "Value": str(details["raw_current_range"])},
+                    {"Field": f"Analysis {y_quantity.lower()} range", "Value": str(details["analysis_current_range"])},
+                    {"Field": f"Raw {y_quantity.lower()} unit", "Value": str(details["raw_current_unit"])},
+                    {"Field": f"Analysis {y_quantity.lower()} unit", "Value": str(details["analysis_current_unit"])},
+                    {"Field": f"Display {y_quantity.lower()} unit", "Value": str(details["display_current_unit"])},
+                    {"Field": "Current unit confidence detail", "Value": str(details["current_unit_confidence_detail"])},
+                    {"Field": "Suggested current unit", "Value": str(details["suggested_current_unit"])},
+                    {"Field": "Unit header warning", "Value": str(details["unit_header_warning"] or "None")},
+                    {"Field": "Unit header audit", "Value": str(details["unit_header_audit"] or "None")},
+                    {"Field": "Current magnitude warning", "Value": str(details["current_magnitude_warning"] or "None")},
+                    {"Field": "Current magnitude warning acknowledged", "Value": "Yes" if magnitude_warning_acknowledged else "No"},
                 ]
             )
             st.table(pd.DataFrame(advanced_rows))
@@ -4806,6 +6839,23 @@ def render_project_header(project_name: str, project_workspace: dict[str, Any]) 
     )
 
 
+def render_experiment_header(
+    target: Any,
+    experiment: dict[str, Any],
+    experiment_id: str,
+    type_label: str,
+) -> None:
+    target.markdown(
+        f"""
+        <div class="experiment-card">
+            <h3>{escape_html(experiment.get("name", experiment_id))}</h3>
+            <p>{escape_html(type_label)} · created {format_timestamp(experiment.get("created_at"))} · updated {format_timestamp(experiment.get("updated_at"))}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_project_dashboard(project_name: str, project_workspace: dict[str, Any]) -> None:
     experiments = project_workspace.get("experiments", {})
     render_create_experiment_form(project_name, project_workspace, key_prefix="dashboard")
@@ -4842,14 +6892,13 @@ def main() -> None:
     if experiment_type not in EXPERIMENT_TYPES:
         experiment_type = "auto"
         experiment["experiment_type"] = experiment_type
-    st.markdown(
-        f"""
-        <div class="experiment-card">
-            <h3>{escape_html(experiment.get("name", experiment_id))}</h3>
-            <p>{escape_html(experiment_short_label(experiment_type))} · created {format_timestamp(experiment.get("created_at"))} · updated {format_timestamp(experiment.get("updated_at"))}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+
+    experiment_header_slot = st.empty()
+    render_experiment_header(
+        experiment_header_slot,
+        experiment,
+        experiment_id,
+        experiment_header_type_label(effective_experiment_type(experiment)),
     )
 
     uploaded_files = st.file_uploader(
@@ -4885,6 +6934,12 @@ def main() -> None:
         experiment["updated_at"] = now_timestamp()
         save_project_workspaces()
     experiment_type = detected_experiment_type
+    render_experiment_header(
+        experiment_header_slot,
+        experiment,
+        experiment_id,
+        experiment_header_type_label(experiment_type, detection_warnings),
+    )
 
     st.caption(f"Detected data type: {experiment_label(experiment_type)}")
     for warning in detection_warnings:
@@ -4920,19 +6975,10 @@ def main() -> None:
     manual_current_col = selected_dataset.detected_current_col or selected_dataset.headers[min(1, len(selected_dataset.headers) - 1)]
 
     with data_details_expander:
-        st.markdown("**Detected metadata**")
-        if selected_dataset.metadata:
-            st.json(selected_dataset.metadata)
-        else:
-            st.write("No metadata rows detected before the numeric table.")
-            st.text_area(
-                "Manual file metadata",
-                placeholder=(
-                    "Add sample name, electrode, electrolyte, concentration, scan rate, instrument, "
-                    "reference electrode, or other file-specific metadata."
-                ),
-                key=f"manual_metadata::{active_project_name}::{experiment_id}::{selected_dataset.filename}",
-            )
+        render_detected_metadata(
+            selected_dataset.metadata,
+            f"manual_metadata::{active_project_name}::{experiment_id}::{selected_dataset.filename}",
+        )
 
         st.divider()
 
@@ -4966,7 +7012,22 @@ def main() -> None:
         with unit_col1:
             selected_potential_unit = st.selectbox("Potential input unit", ["Auto", "V", "mV"])
         with unit_col2:
-            selected_current_unit = st.selectbox("Current input unit", ["Auto", "A", "mA", "uA", "nA"])
+            current_unit_options = ["Auto", "A", "mA", "uA", "nA", "pA"]
+            confirmed_current_unit_key = (
+                f"cv_confirmed_current_unit::{active_project_name}::{experiment_id}::"
+                f"{selected_dataset.filename}::{manual_current_col}"
+            )
+            confirmed_current_unit = st.session_state.get(confirmed_current_unit_key)
+            current_unit_index = (
+                current_unit_options.index(confirmed_current_unit)
+                if confirmed_current_unit in current_unit_options
+                else 0
+            )
+            selected_current_unit = st.selectbox(
+                "Current input unit",
+                current_unit_options,
+                index=current_unit_index,
+            )
         with unit_col3:
             y_axis_quantity = st.selectbox("Y-axis quantity", ["Current", "Current density"])
 
@@ -5031,6 +7092,42 @@ def main() -> None:
             show_raw_with_smoothed = st.checkbox("Show raw trace when smoothed", value=True)
 
     with parser_summary_container:
+        current_input_unit_override = selected_current_unit if selected_current_unit != "Auto" else None
+        current_unit_is_low_confidence = current_unit_is_ambiguous(
+            selected_dataset,
+            manual_current_col,
+            selected_current_unit,
+        )
+        if current_unit_is_low_confidence and manual_current_col in selected_dataset.dataframe:
+            suggested_current_unit = suggested_current_unit_for_values(
+                selected_dataset.dataframe[manual_current_col].to_numpy(dtype=float)
+            )
+            unit_review_warning = current_unit_magnitude_warning(
+                selected_dataset,
+                manual_current_col,
+                selected_current_unit,
+                "A",
+                current_source,
+                electrode_area_cm2,
+            )
+            render_unit_review_panel(
+                current_col=manual_current_col,
+                current_col_label=user_facing_column_label(selected_dataset, manual_current_col),
+                suggested_unit=suggested_current_unit,
+                current_unit_warning=unit_review_warning,
+                confirmed_current_unit_key=confirmed_current_unit_key,
+                selectbox_key=(
+                    f"cv_confirm_current_unit_choice::{active_project_name}::"
+                    f"{experiment_id}::{selected_dataset.filename}::{manual_current_col}"
+                ),
+                button_key=(
+                    f"cv_apply_current_unit::{active_project_name}::"
+                    f"{experiment_id}::{selected_dataset.filename}::{manual_current_col}"
+                ),
+            )
+        elif selected_current_unit != "Auto":
+            st.success(f"Current unit confirmed by user: {display_unit_label(selected_current_unit)}")
+
         parser_summary = render_parser_summary(
             parsed_datasets,
             "cv",
@@ -5038,6 +7135,7 @@ def main() -> None:
             display_current_unit=current_display_unit,
             current_source_override=current_source,
             electrode_area_cm2=electrode_area_cm2,
+            current_input_unit_override=current_input_unit_override,
         )
 
     analyzed: list[AnalyzedDataset] = []
@@ -5098,12 +7196,66 @@ def main() -> None:
         current_display_unit,
         current_source,
         electrode_area_cm2,
+        selected_current_unit if selected_current_unit != "Auto" else None,
     )
-    analysis_current_a = (
+    full_analysis_current_a = (
         detailed_dataset.smoothed_current_a
         if use_smoothed_for_peaks and detailed_dataset.smoothed_current_a is not None
         else detailed_dataset.raw_current_a
     )
+    cycle_values = available_cycle_values(detailed_dataset.cycle_values)
+    cycle_assignment_uncertain = len(cycle_values) > 1 and detailed_dataset.cycle_source == "inferred"
+    selected_cycle_value: Optional[float] = None
+    selected_cycle_label: Optional[str] = None
+    selected_cycle_suffix = ""
+    selected_cycle_summary_label: Optional[str] = None
+    cycle_plot_mode = "Show all cycles overlay"
+
+    with cv_summary_container:
+        if len(cycle_values) > 1:
+            cycle_labels = [cycle_display_label(value) for value in cycle_values]
+            default_cycle_index = len(cycle_values) - 1
+            cycle_select_key = f"cv_selected_cycle::{active_project_name}::{experiment_id}::{selected_filename}"
+            if st.session_state.get(cycle_select_key) not in cycle_labels:
+                st.session_state[cycle_select_key] = cycle_labels[default_cycle_index]
+            selected_cycle_label = st.selectbox(
+                "Analyze cycle",
+                cycle_labels,
+                index=default_cycle_index,
+                key=cycle_select_key,
+            )
+            selected_cycle_value = cycle_values[cycle_labels.index(selected_cycle_label)]
+            selected_cycle_summary_label = analyzed_cycle_label(selected_cycle_value, len(cycle_values))
+            for message_level, cycle_message in cycle_assignment_messages(
+                detailed_dataset,
+                len(cycle_values),
+                selected_cycle_summary_label,
+            ):
+                if message_level == "warning":
+                    st.warning(cycle_message)
+                else:
+                    st.info(cycle_message)
+            cycle_plot_mode = st.radio(
+                "Plot cycles",
+                ["Show all cycles overlay", "Show selected cycle only"],
+                horizontal=True,
+                key=f"cv_cycle_plot_mode::{active_project_name}::{experiment_id}::{selected_filename}",
+            )
+            selected_cycle_suffix = f" — {selected_cycle_label}"
+
+    selected_cycle_mask = cycle_selection_mask(
+        detailed_dataset.cycle_values,
+        selected_cycle_value,
+        len(detailed_dataset.potential_v),
+    )
+    selected_potential_v = detailed_dataset.potential_v[selected_cycle_mask]
+    selected_raw_current_a = detailed_dataset.raw_current_a[selected_cycle_mask]
+    analysis_current_a = full_analysis_current_a[selected_cycle_mask]
+
+    if len(selected_potential_v) < 5:
+        st.error("The selected cycle has too few points for CV analysis.")
+        st.stop()
+        return
 
     with peak_controls_expander:
         st.subheader("Peak Selection & Baseline Correction")
@@ -5118,7 +7270,7 @@ def main() -> None:
             electrode_area_cm2,
         )
         current_range = float(np.nanmax(current_display_values) - np.nanmin(current_display_values))
-        auto_peak_params = auto_tune_cv_peak_parameters(detailed_dataset.potential_v, analysis_current_a)
+        auto_peak_params = auto_tune_cv_peak_parameters(selected_potential_v, analysis_current_a)
         auto_prominence_display = float(
             current_to_display(
                 np.array([auto_peak_params["min_prominence"]]),
@@ -5196,13 +7348,34 @@ def main() -> None:
             min_distance = int(min_distance_widget)
             min_abs_current_display = float(min_abs_current_widget)
 
-        peaks = detect_peaks(
-            detailed_dataset.potential_v,
-            analysis_current_a,
-            current_display_value_to_base(min_prominence_display, current_display_unit, current_source, electrode_area_cm2),
-            int(min_distance),
-            current_display_value_to_base(min_abs_current_display, current_display_unit, current_source, electrode_area_cm2),
+        min_prominence_a = current_display_value_to_base(
+            min_prominence_display,
+            current_display_unit,
+            current_source,
+            electrode_area_cm2,
         )
+        min_abs_current_a = current_display_value_to_base(
+            min_abs_current_display,
+            current_display_unit,
+            current_source,
+            electrode_area_cm2,
+        )
+        peaks = detect_peaks(
+            selected_potential_v,
+            analysis_current_a,
+            min_prominence_a,
+            int(min_distance),
+            min_abs_current_a,
+        )
+        all_cycle_peaks = peaks
+        if len(cycle_values) > 1:
+            all_cycle_peaks = detect_peaks(
+                detailed_dataset.potential_v,
+                full_analysis_current_a,
+                min_prominence_a,
+                int(min_distance),
+                min_abs_current_a,
+            )
 
         oxidation_peaks = [peak for peak in peaks if peak.peak_type == "oxidation"]
         reduction_peaks = [peak for peak in peaks if peak.peak_type == "reduction"]
@@ -5217,21 +7390,21 @@ def main() -> None:
                 oxidation_idx = st.slider(
                     "Oxidation peak index",
                     min_value=0,
-                    max_value=len(detailed_dataset.potential_v) - 1,
+                    max_value=len(selected_potential_v) - 1,
                     value=int(np.nanargmax(analysis_current_a)),
                 )
                 selected_oxidation_peak = make_manual_peak(
-                    "oxidation", oxidation_idx, detailed_dataset.potential_v, analysis_current_a
+                    "oxidation", oxidation_idx, selected_potential_v, analysis_current_a
                 )
             with manual_col2:
                 reduction_idx = st.slider(
                     "Reduction peak index",
                     min_value=0,
-                    max_value=len(detailed_dataset.potential_v) - 1,
+                    max_value=len(selected_potential_v) - 1,
                     value=int(np.nanargmin(analysis_current_a)),
                 )
                 selected_reduction_peak = make_manual_peak(
-                    "reduction", reduction_idx, detailed_dataset.potential_v, analysis_current_a
+                    "reduction", reduction_idx, selected_potential_v, analysis_current_a
                 )
         else:
             select_col1, select_col2 = st.columns(2)
@@ -5301,33 +7474,33 @@ def main() -> None:
         baseline_method = st.radio("Baseline method", ["None", "Linear"], horizontal=True)
         baseline_current: Optional[np.ndarray] = None
         anchor_a_idx = 0
-        anchor_b_idx = len(detailed_dataset.potential_v) - 1
+        anchor_b_idx = len(selected_potential_v) - 1
 
         if baseline_method == "Linear":
             reference_peak = selected_oxidation_peak or selected_reduction_peak
-            reference_idx = reference_peak.index if reference_peak else len(detailed_dataset.potential_v) // 2
-            default_span = max(5, len(detailed_dataset.potential_v) // 10)
+            reference_idx = reference_peak.index if reference_peak else len(selected_potential_v) // 2
+            default_span = max(5, len(selected_potential_v) // 10)
             default_a = max(0, reference_idx - default_span)
-            default_b = min(len(detailed_dataset.potential_v) - 1, reference_idx + default_span)
+            default_b = min(len(selected_potential_v) - 1, reference_idx + default_span)
 
             anchor_col1, anchor_col2 = st.columns(2)
             with anchor_col1:
                 anchor_a_idx = st.slider(
                     "Baseline anchor A index",
                     min_value=0,
-                    max_value=len(detailed_dataset.potential_v) - 1,
+                    max_value=len(selected_potential_v) - 1,
                     value=default_a,
                 )
             with anchor_col2:
                 anchor_b_idx = st.slider(
                     "Baseline anchor B index",
                     min_value=0,
-                    max_value=len(detailed_dataset.potential_v) - 1,
+                    max_value=len(selected_potential_v) - 1,
                     value=default_b,
                 )
 
             baseline_current = calculate_linear_baseline(
-                detailed_dataset.potential_v,
+                selected_potential_v,
                 analysis_current_a,
                 anchor_a_idx,
                 anchor_b_idx,
@@ -5340,7 +7513,7 @@ def main() -> None:
                     {
                         "anchor": "A",
                         "index": anchor_a_idx,
-                        "potential_V": detailed_dataset.potential_v[anchor_a_idx],
+                        "potential_V": selected_potential_v[anchor_a_idx],
                         f"current_{current_display_unit}": current_to_display(
                             np.array([analysis_current_a[anchor_a_idx]]),
                             current_display_unit,
@@ -5351,7 +7524,7 @@ def main() -> None:
                     {
                         "anchor": "B",
                         "index": anchor_b_idx,
-                        "potential_V": detailed_dataset.potential_v[anchor_b_idx],
+                        "potential_V": selected_potential_v[anchor_b_idx],
                         f"current_{current_display_unit}": current_to_display(
                             np.array([analysis_current_a[anchor_b_idx]]),
                             current_display_unit,
@@ -5373,6 +7546,15 @@ def main() -> None:
             index=CANDIDATE_PEAK_FILTER_OPTIONS.index("Top candidates"),
             key=f"cv_candidate_peak_display::{active_project_name}::{experiment_id}::{selected_filename}",
         )
+        include_all_cycle_candidates = False
+        if len(cycle_values) > 1:
+            include_all_cycle_candidates = st.checkbox(
+                "Include candidate peaks from all cycles",
+                value=False,
+                key=f"cv_candidate_all_cycles::{active_project_name}::{experiment_id}::{selected_filename}",
+            )
+        candidate_source_peaks = all_cycle_peaks if include_all_cycle_candidates else peaks
+        candidate_source_potential = detailed_dataset.potential_v if include_all_cycle_candidates else selected_potential_v
         selected_peak_roles = {}
         if selected_oxidation_peak is not None:
             selected_peak_roles[selected_oxidation_peak.id] = "Selected Epa"
@@ -5395,13 +7577,14 @@ def main() -> None:
                 "scan": scan_direction_label(peak.segment_direction),
                 "confidence": peak.confidence,
             }
-            for peak in peaks
+            for peak in candidate_source_peaks
         ]
         displayed_candidate_peaks = filter_candidate_peaks_for_display(
-            peaks,
+            candidate_source_peaks,
             selected_oxidation_peak,
             selected_reduction_peak,
             candidate_display_filter,
+            potential=candidate_source_potential,
         )
         displayed_candidate_rows = [
             {
@@ -5422,7 +7605,13 @@ def main() -> None:
             for peak in displayed_candidate_peaks
         ]
         if displayed_candidate_rows:
-            st.caption(f"Showing {len(displayed_candidate_rows)} of {len(full_candidate_rows)} candidate extrema.")
+            if candidate_display_filter == "Top candidates":
+                st.caption(
+                    "Showing selected Epa/Epc plus top candidate extrema. "
+                    "Download full candidate table for all local extrema."
+                )
+            else:
+                st.caption(f"Showing {len(displayed_candidate_rows)} of {len(full_candidate_rows)} candidate extrema.")
             st.table(pd.DataFrame(displayed_candidate_rows))
         elif full_candidate_rows:
             st.info("No candidate extrema match the selected display filter.")
@@ -5448,16 +7637,58 @@ def main() -> None:
         electrode_area_cm2,
         current_source,
     )
+    per_cycle_metrics_df = pd.DataFrame()
+    per_cycle_trend_messages: list[str] = []
+    if len(cycle_values) > 1:
+        per_cycle_metrics_df, per_cycle_trend_messages = build_per_cycle_cv_metrics(
+            detailed_dataset.potential_v,
+            full_analysis_current_a,
+            detailed_dataset.cycle_values,
+            cycle_values,
+            selected_cycle_value,
+            min_prominence_a,
+            int(min_distance),
+            min_abs_current_a,
+            current_display_unit,
+            electrode_area_cm2,
+            current_source,
+            metrics,
+            selected_oxidation_peak,
+            selected_reduction_peak,
+            auto_tune_peak_settings,
+        )
 
     quality_messages = cv_analysis_quality_messages(
         selected_oxidation_peak,
         selected_reduction_peak,
         metrics,
-        detailed_dataset.potential_v,
+        selected_potential_v,
     )
+    current_unit_review_needed = detailed_parser_details.get("current_unit_confidence") == "Low"
+    parser_confidence = parser_confidence_from_details(detailed_parser_details)
+    current_unit_warning = str(detailed_parser_details.get("current_unit_warning") or "")
+    current_magnitude_ack = bool(
+        st.session_state.get(
+            current_magnitude_ack_key(
+                f"cv_parser::{active_project_name}::{experiment_id}",
+                detailed_parsed_dataset.filename,
+            )
+        )
+    )
+    current_magnitude_warning = (
+        ""
+        if current_magnitude_ack
+        else str(detailed_parser_details.get("current_magnitude_warning") or "")
+    )
+    current_scale_warning = current_unit_warning or current_magnitude_warning
+    current_scale_review_needed = current_unit_review_needed or bool(current_magnitude_warning)
     with cv_summary_container:
         for message in quality_messages:
             st.warning(message)
+        if current_scale_review_needed and not current_unit_review_needed:
+            st.warning(
+                "Current-dependent metrics may be incorrectly scaled until current unit is confirmed."
+            )
 
         render_cv_analysis_summary(
             metrics,
@@ -5466,75 +7697,131 @@ def main() -> None:
             current_display_unit,
             electrode_area_cm2,
             current_source,
-            detailed_dataset.potential_v,
+            selected_potential_v,
             detailed_parser_details["scan_rate_estimate"],
             detailed_parser_details["cycle_count"],
+            selected_cycle_suffix,
+            cycle_assignment_uncertain,
+            selected_cycle_summary_label,
+            None,
+            None,
+            str(detailed_parser_details.get("current_unit_confidence") or "High"),
+            parser_confidence,
+            current_scale_warning,
         )
 
     fig = go.Figure()
     trace_mode = "lines+markers" if show_markers else "lines"
 
-    for dataset in analyzed:
-        raw_display = current_to_display(
-            dataset.raw_current_a,
-            current_display_unit,
-            dataset.current_source,
-            electrode_area_cm2,
+    def add_cv_trace(
+        x_values: np.ndarray,
+        y_values: np.ndarray,
+        name: str,
+        opacity: float = 1.0,
+        line_width: float = 2.0,
+        line_dash: Optional[str] = None,
+    ) -> None:
+        line_style: dict[str, object] = {"width": line_width}
+        if line_dash:
+            line_style["dash"] = line_dash
+        fig.add_trace(
+            go.Scatter(
+                x=x_values,
+                y=y_values,
+                mode=trace_mode,
+                name=name,
+                opacity=opacity,
+                line=line_style,
+                hovertemplate=(
+                    f"Potential: %{{x:.4g}} V<br>{current_hover_label(current_display_unit)}: %{{y:.4g}} "
+                    + current_display_unit
+                    + "<extra></extra>"
+                ),
+            )
         )
-        if dataset.smoothed_current_a is not None and show_raw_with_smoothed:
-            fig.add_trace(
-                go.Scatter(
-                    x=dataset.potential_v,
-                    y=raw_display,
-                    mode="lines",
-                    name=f"{dataset.sample_name} raw",
-                    opacity=0.35,
-                    hovertemplate=(
-                        f"Potential: %{{x:.4g}} V<br>{current_hover_label(current_display_unit)}: %{{y:.4g}} "
-                        + current_display_unit
-                        + "<extra></extra>"
-                    ),
-                )
-            )
-        elif dataset.smoothed_current_a is None:
-            fig.add_trace(
-                go.Scatter(
-                    x=dataset.potential_v,
-                    y=raw_display,
-                    mode=trace_mode,
-                    name=dataset.sample_name,
-                    hovertemplate=(
-                        f"Potential: %{{x:.4g}} V<br>{current_hover_label(current_display_unit)}: %{{y:.4g}} "
-                        + current_display_unit
-                        + "<extra></extra>"
-                    ),
-                )
-            )
 
-        if dataset.smoothed_current_a is not None:
-            smoothed_display = current_to_display(
-                dataset.smoothed_current_a,
+    for dataset in analyzed:
+        dataset_cycle_values = available_cycle_values(dataset.cycle_values)
+        is_selected_file = dataset.filename == detailed_dataset.filename
+        main_current_a = dataset.smoothed_current_a if dataset.smoothed_current_a is not None else dataset.raw_current_a
+
+        if len(dataset_cycle_values) > 1:
+            cycles_to_plot = dataset_cycle_values
+            if is_selected_file and cycle_plot_mode == "Show selected cycle only" and selected_cycle_value is not None:
+                cycles_to_plot = [selected_cycle_value]
+
+            for cycle_value in cycles_to_plot:
+                cycle_mask = cycle_selection_mask(dataset.cycle_values, cycle_value, len(dataset.potential_v))
+                if not np.any(cycle_mask):
+                    continue
+
+                is_selected_cycle = (
+                    is_selected_file
+                    and selected_cycle_value is not None
+                    and np.isclose(cycle_value, selected_cycle_value, rtol=0.0, atol=1e-9)
+                )
+                cycle_name = selected_cycle_trace_name(cycle_value, is_selected_cycle)
+                trace_name = cycle_name if is_selected_file else f"{dataset.sample_name} {cycle_name}"
+                opacity, line_width = selected_cycle_trace_style(is_selected_cycle)
+
+                if dataset.smoothed_current_a is not None and show_raw_with_smoothed:
+                    add_cv_trace(
+                        dataset.potential_v[cycle_mask],
+                        current_to_display(
+                            dataset.raw_current_a[cycle_mask],
+                            current_display_unit,
+                            dataset.current_source,
+                            electrode_area_cm2,
+                        ),
+                        f"{trace_name} raw",
+                        opacity=0.22 if is_selected_cycle else 0.14,
+                        line_width=1.2,
+                        line_dash="dot",
+                    )
+
+                add_cv_trace(
+                    dataset.potential_v[cycle_mask],
+                    current_to_display(
+                        main_current_a[cycle_mask],
+                        current_display_unit,
+                        dataset.current_source,
+                        electrode_area_cm2,
+                    ),
+                    trace_name,
+                    opacity=opacity,
+                    line_width=line_width,
+                )
+        else:
+            raw_display = current_to_display(
+                dataset.raw_current_a,
                 current_display_unit,
                 dataset.current_source,
                 electrode_area_cm2,
             )
-            fig.add_trace(
-                go.Scatter(
-                    x=dataset.potential_v,
-                    y=smoothed_display,
-                    mode=trace_mode,
-                    name=f"{dataset.sample_name} smoothed",
-                    hovertemplate=(
-                        f"Potential: %{{x:.4g}} V<br>{current_hover_label(current_display_unit)}: %{{y:.4g}} "
-                        + current_display_unit
-                        + "<extra></extra>"
-                    ),
+            if dataset.smoothed_current_a is not None and show_raw_with_smoothed:
+                add_cv_trace(
+                    dataset.potential_v,
+                    raw_display,
+                    f"{dataset.sample_name} raw",
+                    opacity=0.35,
+                    line_width=1.4,
                 )
-            )
+            elif dataset.smoothed_current_a is None:
+                add_cv_trace(dataset.potential_v, raw_display, dataset.sample_name)
 
-    if show_all_candidate_peaks and peaks:
-        oxidation_marker_peaks = [peak for peak in peaks if peak.peak_type == "oxidation"]
-        reduction_marker_peaks = [peak for peak in peaks if peak.peak_type == "reduction"]
+            if dataset.smoothed_current_a is not None:
+                smoothed_display = current_to_display(
+                    dataset.smoothed_current_a,
+                    current_display_unit,
+                    dataset.current_source,
+                    electrode_area_cm2,
+                )
+                add_cv_trace(dataset.potential_v, smoothed_display, f"{dataset.sample_name} smoothed")
+
+    if show_all_candidate_peaks and candidate_source_peaks:
+        candidate_marker_current = full_analysis_current_a if include_all_cycle_candidates else analysis_current_a
+        oxidation_marker_peaks = [peak for peak in candidate_source_peaks if peak.peak_type == "oxidation"]
+        reduction_marker_peaks = [peak for peak in candidate_source_peaks if peak.peak_type == "reduction"]
         for marker_peaks, symbol, name in [
             (oxidation_marker_peaks, "triangle-up", "Candidate oxidation peaks"),
             (reduction_marker_peaks, "triangle-down", "Candidate reduction peaks"),
@@ -5545,7 +7832,7 @@ def main() -> None:
                 go.Scatter(
                     x=[peak.potential for peak in marker_peaks],
                     y=current_to_display(
-                        np.array([analysis_current_a[peak.index] for peak in marker_peaks]),
+                        np.array([candidate_marker_current[peak.index] for peak in marker_peaks]),
                         current_display_unit,
                         current_source,
                         electrode_area_cm2,
@@ -5583,7 +7870,7 @@ def main() -> None:
     if baseline_current is not None:
         fig.add_trace(
             go.Scatter(
-                x=detailed_dataset.potential_v,
+                x=selected_potential_v,
                 y=current_to_display(baseline_current, current_display_unit, current_source, electrode_area_cm2),
                 mode="lines",
                 name="Linear baseline",
@@ -5592,7 +7879,7 @@ def main() -> None:
         )
         fig.add_trace(
             go.Scatter(
-                x=[detailed_dataset.potential_v[anchor_a_idx], detailed_dataset.potential_v[anchor_b_idx]],
+                x=[selected_potential_v[anchor_a_idx], selected_potential_v[anchor_b_idx]],
                 y=current_to_display(
                     np.array([analysis_current_a[anchor_a_idx], analysis_current_a[anchor_b_idx]]),
                     current_display_unit,
@@ -5618,15 +7905,21 @@ def main() -> None:
 
     with cv_plot_container:
         st.subheader("Interactive CV plot")
-        st.plotly_chart(fig, width="stretch")
+        if current_unit_review_needed:
+            st.info(
+                "CV plot paused until current unit is confirmed. Potential-dependent peak positions "
+                "were estimated, but current scale requires unit confirmation."
+            )
+        else:
+            st.plotly_chart(fig, width="stretch")
 
-        plot_html = fig.to_html(full_html=True, include_plotlyjs="cdn")
-        st.download_button(
-            "Download interactive plot as HTML",
-            data=plot_html,
-            file_name="voltscope_cv_plot.html",
-            mime="text/html",
-        )
+            plot_html = fig.to_html(full_html=True, include_plotlyjs="cdn")
+            st.download_button(
+                "Download interactive plot as HTML",
+                data=plot_html,
+                file_name="voltscope_cv_plot.html",
+                mime="text/html",
+            )
 
     with esw_expander:
         threshold_display = st.number_input(
@@ -5660,15 +7953,51 @@ def main() -> None:
         st.dataframe(esw_df, width="stretch")
 
     with cv_metrics_container:
+        if not per_cycle_metrics_df.empty:
+            st.subheader("Per-cycle CV metrics")
+            st.caption(
+                "Each row is analyzed independently using the current peak-selection settings. "
+                "The selected cycle row is marked and should match the main CV Analysis Summary."
+            )
+
+            def highlight_selected_cycle(row: pd.Series) -> list[str]:
+                if row.get("analyzed") == "Yes":
+                    return ["background-color: #fff7ed; font-weight: 600;" for _ in row]
+                return ["" for _ in row]
+
+            st.table(
+                per_cycle_metrics_df.style.apply(highlight_selected_cycle, axis=1),
+            )
+            if per_cycle_trend_messages:
+                st.markdown("**Trend summary**")
+                for trend_message in per_cycle_trend_messages:
+                    st.caption(trend_message)
+
         st.subheader("Detailed CV metrics")
         if peak_metric_rows:
             peak_metric_df = pd.DataFrame(peak_metric_rows)
             compact_metrics_df = metrics_table(metrics, current_display_unit, electrode_area_cm2, current_source)
+            if current_scale_review_needed and not compact_metrics_df.empty:
+                current_dependent_metrics = compact_metrics_df["metric"].isin(["Ipa", "Ipc", "|Ipa/Ipc|"])
+                if current_unit_review_needed:
+                    compact_metrics_df.loc[current_dependent_metrics, "value"] = "Pending unit confirmation"
+                compact_metrics_df.loc[current_dependent_metrics, "method"] = (
+                    compact_metrics_df.loc[current_dependent_metrics, "method"]
+                    + "; current unit needs confirmation"
+                )
             selected_peak_display_df = selected_peak_metrics_display_table(
                 peak_metric_df,
                 current_display_unit,
                 baseline_current is not None,
             )
+            if current_unit_review_needed and not selected_peak_display_df.empty:
+                current_columns = [
+                    column
+                    for column in selected_peak_display_df.columns
+                    if "current_" in str(column)
+                ]
+                for column in current_columns:
+                    selected_peak_display_df[column] = "Pending unit confirmation"
             st.dataframe(selected_peak_display_df, width="stretch", hide_index=True)
             st.table(compact_metrics_df)
         else:
@@ -5679,6 +8008,8 @@ def main() -> None:
     export_buffer = io.StringIO()
     export_sections = []
     export_sections.append("# ESW summary\n" + esw_df.to_csv(index=False))
+    if not per_cycle_metrics_df.empty:
+        export_sections.append("# Per-cycle CV metrics\n" + per_cycle_metrics_df.to_csv(index=False))
     if peak_metric_rows:
         export_sections.append("# Peak metrics\n" + peak_metric_df.to_csv(index=False))
         export_sections.append("# Compact metrics\n" + compact_metrics_df.to_csv(index=False))
