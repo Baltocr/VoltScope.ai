@@ -42,6 +42,8 @@ IMPEDANCE_UNITS_TO_OHM = {"ohm": 1.0, "kohm": 1e3, "Mohm": 1e6}
 PHASE_UNITS_TO_DEG = {"deg": 1.0, "rad": 180.0 / np.pi}
 CURRENT_MAGNITUDE_WARNING_A = 0.1
 CURRENT_MAGNITUDE_WARNING_UA = 1_000_000.0
+PARSER_DROPPED_ROWS_REVIEW_RATIO = 0.01
+PARSER_DROPPED_ROWS_STRONG_RATIO = 0.05
 WORKSPACE_STORE_PATH = Path(__file__).with_name("voltscope_project_workspaces.json")
 
 
@@ -115,6 +117,62 @@ class Peak:
     segment_index: int
     segment_direction: str
     confidence: str
+
+
+@dataclass
+class RedoxCouple:
+    id: str
+    oxidation_peak: Peak
+    reduction_peak: Peak
+    delta_ep_v: float
+    formal_potential_v: float
+    current_ratio: float
+    score: float
+    confidence: str
+    reason: str
+
+
+@dataclass
+class CVBehaviorResult:
+    behavior: str
+    label: str
+    oxidation_peak: Optional[Peak]
+    reduction_peak: Optional[Peak]
+    rejected_oxidation_peak: Optional[Peak]
+    rejected_reduction_peak: Optional[Peak]
+    pair_confidence: str
+    messages: list[str]
+    redox_couples: Optional[list[RedoxCouple]] = None
+    selected_couple_index: Optional[int] = None
+
+
+@dataclass
+class CVPeakAnalysis:
+    candidate_peaks: list[Peak]
+    oxidation_peak: Optional[Peak]
+    reduction_peak: Optional[Peak]
+    peak_rows: list[dict[str, Any]]
+    metrics: dict[str, Optional[float]]
+    behavior: CVBehaviorResult
+
+
+@dataclass
+class LSVOnsetResult:
+    onset_potential: Optional[float]
+    onset_direction: str
+    status: str
+    confidence: str
+    method: str
+    method_note: str
+    warning: str
+    threshold_base: Optional[float]
+    signed_threshold_base: Optional[float]
+    sustained_points_required: int
+    sustained_window_v: float
+    smoothing_method: str
+    smoothing_window: int
+    rejected_potential: Optional[float] = None
+    rejected_reason: str = ""
 
 
 @dataclass
@@ -267,11 +325,35 @@ def parse_metadata(lines: list[str]) -> dict[str, str]:
     return metadata
 
 
+def parse_manual_metadata_text(text: str) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    for idx, line in enumerate(str(text or "").splitlines()):
+        cleaned = line.strip().strip("#").strip()
+        if not cleaned:
+            continue
+        separator = ":" if ":" in cleaned else "=" if "=" in cleaned else None
+        if separator is not None:
+            key, value = cleaned.split(separator, 1)
+            key = key.strip()
+            value = value.strip()
+            if key and value:
+                metadata[key] = value
+            continue
+        if parse_scan_rate_value(cleaned) is not None and not any(
+            "scan" in normalize_label(key) and "rate" in normalize_label(key)
+            for key in metadata
+        ):
+            metadata["Manual scan rate"] = cleaned
+        else:
+            metadata[f"manual_metadata_line_{idx + 1}"] = cleaned
+    return metadata
+
+
 def metadata_rows_for_display(metadata: dict[str, str]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     parsed_rows: list[dict[str, str]] = []
     unparsed_rows: list[dict[str, str]] = []
     for key, value in metadata.items():
-        if key.startswith("metadata_line_"):
+        if key.startswith("metadata_line_") or key.startswith("manual_metadata_line_"):
             line_number = key.rsplit("_", 1)[-1]
             unparsed_rows.append({"Line": line_number, "Text": value})
         else:
@@ -297,6 +379,17 @@ def electrode_area_metadata_summary(metadata: dict[str, str]) -> Optional[str]:
         ):
             return normalize_electrode_area_text(value)
     return None
+
+
+def electrode_area_metadata_value(metadata: dict[str, str]) -> Optional[float]:
+    area_summary = electrode_area_metadata_summary(metadata)
+    if not area_summary:
+        return None
+    match = _NUMBER_RE.search(area_summary)
+    if not match:
+        return None
+    value = float(match.group(0))
+    return value if np.isfinite(value) and value > 0 else None
 
 
 def normalize_reference_electrode(value: Any) -> Optional[str]:
@@ -353,9 +446,75 @@ def reference_electrode_default_note(reference_electrode: Optional[str], source:
     return ""
 
 
+def parse_scan_rate_value(text: Any) -> Optional[float]:
+    normalized = str(text or "").strip().replace("µ", "u")
+    if not normalized:
+        return None
+    patterns = [
+        r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*(m?v)\s*/\s*s",
+        r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*(m?v)\s*(?:per\s+)?s(?:ec(?:ond)?)?\b",
+        r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*(m?v)\s*s\^-?1",
+        r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*(m?v)\s*s-1",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = float(match.group(1))
+        unit = match.group(2).lower()
+        if unit == "mv":
+            value *= 1e-3
+        return value if np.isfinite(value) and value > 0 else None
+    return None
+
+
+def scan_rate_from_metadata(metadata: dict[str, str]) -> Optional[float]:
+    for key, value in metadata.items():
+        key_label = normalize_label(key)
+        key_compact = re.sub(r"[^a-z0-9]+", "", key_label)
+        if "scanrate" in key_compact or ("scan" in key_label and "rate" in key_label):
+            value_match = _NUMBER_RE.search(str(value))
+            if value_match:
+                numeric_value = float(value_match.group(0))
+                key_tokens = [token for token in re.split(r"[^a-z0-9]+", key_label) if token]
+                key_unit = None
+                for idx, token in enumerate(key_tokens):
+                    next_token = key_tokens[idx + 1] if idx + 1 < len(key_tokens) else ""
+                    if token in {"mv", "millivolt", "millivolts"} and next_token in {"s", "sec", "second", "seconds"}:
+                        key_unit = "mV/s"
+                        break
+                    if token in {"v", "volt", "volts"} and next_token in {"s", "sec", "second", "seconds"}:
+                        key_unit = "V/s"
+                        break
+                if key_unit is None:
+                    if "mvpersecond" in key_compact or key_compact.endswith("mvs") or "mvs" in key_compact:
+                        key_unit = "mV/s"
+                    elif "vpersecond" in key_compact or key_compact.endswith("vs") or "vs" in key_compact:
+                        key_unit = "V/s"
+                if key_unit == "mV/s":
+                    numeric_value *= 1e-3
+                if key_unit in {"mV/s", "V/s"} and np.isfinite(numeric_value) and numeric_value > 0:
+                    return numeric_value
+        candidates = [str(value), f"{key} {value}"]
+        if "scanrate" in key_compact or ("scan" in key_label and "rate" in key_label):
+            candidates.insert(0, str(value))
+        for candidate in candidates:
+            scan_rate = parse_scan_rate_value(candidate)
+            if scan_rate is not None:
+                return scan_rate
+    return None
+
+
+def scan_rate_summary_from_value(scan_rate_v_s: float) -> str:
+    return f"{format_summary_number(scan_rate_v_s)} V/s ({format_summary_number(scan_rate_v_s * 1000)} mV/s)"
+
+
 def find_table_bounds(lines: list[str], delimiter: str) -> tuple[int, int, list[str], bool]:
+    saw_single_numeric_column = False
     for idx, line in enumerate(lines):
         tokens = split_line(line, delimiter)
+        if numeric_count(tokens) == 1:
+            saw_single_numeric_column = True
         if len(tokens) < 2:
             continue
 
@@ -376,7 +535,62 @@ def find_table_bounds(lines: list[str], delimiter: str) -> tuple[int, int, list[
             if is_numeric_row(next_tokens):
                 return idx, idx + 1, deduplicate_headers(tokens), True
 
+    if saw_single_numeric_column:
+        raise ValueError("The uploaded file must contain at least two usable numeric columns.")
     raise ValueError("Could not find a numeric data table in the uploaded file.")
+
+
+def dropped_rows_total_candidate_count(rows_imported: int, rows_dropped: int) -> int:
+    return max(int(rows_imported) + int(rows_dropped), 0)
+
+
+def dropped_rows_fraction(rows_imported: int, rows_dropped: int) -> float:
+    total = dropped_rows_total_candidate_count(rows_imported, rows_dropped)
+    if total <= 0:
+        return 0.0
+    return float(rows_dropped) / float(total)
+
+
+def dropped_rows_severity(rows_imported: int, rows_dropped: int) -> str:
+    if rows_dropped <= 0:
+        return "none"
+    fraction = dropped_rows_fraction(rows_imported, rows_dropped)
+    if fraction >= PARSER_DROPPED_ROWS_STRONG_RATIO:
+        return "strong"
+    if fraction >= PARSER_DROPPED_ROWS_REVIEW_RATIO:
+        return "review"
+    return "cleanup"
+
+
+def dropped_rows_cleanup_notice(rows_imported: int, rows_dropped: int) -> str:
+    if rows_dropped <= 0:
+        return ""
+    row_word = "row" if rows_dropped == 1 else "rows"
+    base = f"{rows_dropped} non-numeric data {row_word} were removed during cleanup."
+    fraction = dropped_rows_fraction(rows_imported, rows_dropped)
+    if fraction >= PARSER_DROPPED_ROWS_STRONG_RATIO:
+        return (
+            f"Strong cleanup warning: {base} "
+            f"That is {fraction:.1%} of candidate data rows; review the file before interpreting results."
+        )
+    if fraction >= PARSER_DROPPED_ROWS_REVIEW_RATIO:
+        return (
+            f"Data cleanup review recommended: {base} "
+            f"That is {fraction:.1%} of candidate data rows."
+        )
+    return base
+
+
+def dropped_rows_reason(rows_dropped: int) -> str:
+    if rows_dropped <= 0:
+        return "None"
+    return "non-numeric or corrupted values inside numeric data region."
+
+
+def dropped_rows_fraction_label(rows_imported: int, rows_dropped: int) -> str:
+    if rows_dropped <= 0:
+        return "0%"
+    return f"{dropped_rows_fraction(rows_imported, rows_dropped):.2%}"
 
 
 def current_unit_from_header_token(header: Optional[str]) -> Optional[str]:
@@ -528,6 +742,61 @@ def header_indicates_current_density(header: str) -> bool:
     if any(token in compact for token in ["currentdensity", "currentdens", "macm2", "uacm2", "nacm2", "pacm2", "acm2"]):
         return True
     return compact in {"j", "ja", "jma", "jua", "jna", "jpa"}
+
+
+def text_indicates_current_density(text: str) -> bool:
+    label = normalize_label(text)
+    compact = re.sub(r"[^a-z0-9]+", "", label)
+    density_patterns = [
+        "current density",
+        "current_density",
+        "current-density",
+        "do not normalize",
+        "do_not_normalize",
+        "already normalized",
+        "normalized current",
+        "ma/cm2",
+        "ma/cm^2",
+        "ma/cm²",
+        "ma cm2",
+        "ma_cm2",
+        "ua/cm2",
+        "ua/cm^2",
+        "µa/cm2",
+        "µa/cm^2",
+        "ua_cm2",
+        "a/cm2",
+        "a/cm^2",
+    ]
+    if any(pattern in label for pattern in density_patterns):
+        return True
+    if any(
+        token in compact
+        for token in [
+            "currentdensity",
+            "currentdens",
+            "currentperarea",
+            "donotnormalize",
+            "alreadynormalized",
+            "normalizedcurrent",
+            "jmacm2",
+            "juacm2",
+            "macm2",
+            "uacm2",
+            "acm2",
+        ]
+    ):
+        return True
+    return bool(re.search(r"(^|[^a-z0-9])j([^a-z0-9]|$)", label))
+
+
+def dataset_suggests_current_density_signal(dataset: ParsedDataset, current_col: Optional[str] = None) -> bool:
+    text_parts = [dataset.filename, *dataset.headers]
+    text_parts.extend(dataset.metadata.keys())
+    text_parts.extend(dataset.metadata.values())
+    if current_col:
+        text_parts.append(current_col)
+    return any(text_indicates_current_density(str(part)) for part in text_parts if part is not None)
 
 
 def score_potential_column(header: str, values: np.ndarray) -> float:
@@ -837,6 +1106,8 @@ def parse_electrochem_file(uploaded_file: Any) -> ParsedDataset:
 
     df = pd.DataFrame(rows, columns=headers)
     df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    if df.shape[1] < 2:
+        raise ValueError("The uploaded file must contain at least two usable numeric columns.")
     headers = list(df.columns)
     missing_values = int(df.isna().sum().sum())
 
@@ -860,6 +1131,9 @@ def parse_electrochem_file(uploaded_file: Any) -> ParsedDataset:
     warnings = []
     if not has_header:
         warnings.append("No header row was detected; generated generic column names.")
+    cleanup_notice = dropped_rows_cleanup_notice(len(df), rows_dropped)
+    if cleanup_notice:
+        warnings.append(cleanup_notice)
 
     return ParsedDataset(
         filename=uploaded_file.name,
@@ -945,6 +1219,61 @@ def current_density_unit_from_current_unit(current_unit: str) -> str:
     if current_unit in CURRENT_UNITS_TO_A:
         return f"{current_unit}/cm^2"
     return CURRENT_DENSITY_UNIT
+
+
+def current_unit_from_density_unit(current_density_unit: str) -> str:
+    mapping = {
+        "A/cm^2": "A",
+        "mA/cm^2": "mA",
+        "uA/cm^2": "uA",
+        "nA/cm^2": "nA",
+        "pA/cm^2": "pA",
+    }
+    return mapping.get(current_density_unit, current_density_unit)
+
+
+def confirmation_unit_options(current_source: str) -> list[str]:
+    if current_source == "Current density":
+        return ["A/cm^2", "mA/cm^2", "uA/cm^2", "nA/cm^2", "pA/cm^2"]
+    return ["A", "mA", "uA", "nA", "pA"]
+
+
+def confirmation_unit_type(current_source: str) -> str:
+    return "current_density" if current_source == "Current density" else "raw_current"
+
+
+def lsv_current_source_state_key(
+    project_name: str,
+    experiment_id: str,
+    filename: str,
+    current_col: Optional[str],
+) -> str:
+    return (
+        f"lsv_current_source::{project_name}::{experiment_id}::"
+        f"{filename}::{current_col or 'current'}"
+    )
+
+
+def confirmed_unit_source_for_lsv(
+    dataset: ParsedDataset,
+    current_col: Optional[str],
+    current_source_state_key: str,
+    session_state: Optional[dict[str, Any]] = None,
+) -> str:
+    state = st.session_state if session_state is None else session_state
+    session_source = state.get(current_source_state_key)
+    if session_source in {"Current", "Current density"}:
+        return str(session_source)
+    return current_source_guess_for_dataset(dataset, current_col)
+
+
+def unit_input_from_confirmed_unit(confirmed_unit: Any, current_source: str) -> Optional[str]:
+    if confirmed_unit is None:
+        return None
+    unit = str(confirmed_unit)
+    if current_source == "Current density":
+        unit = current_unit_from_density_unit(unit)
+    return unit if unit in CURRENT_UNITS_TO_A else None
 
 
 def current_density_from_base(
@@ -1034,6 +1363,8 @@ def lsv_axis_title(axis_quantity: str, display_units: dict[str, Any], reference_
         if reference_electrode:
             title += f" vs {reference_electrode}"
         return title
+    if display_units.get("unit_review_required"):
+        return lsv_unconfirmed_unit_label(display_units.get("current_source", "Current"))
     return current_axis_label(display_units["current"])
 
 
@@ -1196,6 +1527,24 @@ def suggested_current_unit_for_values(values: np.ndarray) -> str:
     return "pA"
 
 
+def suggested_current_unit_for_context(values: np.ndarray, current_source: str) -> str:
+    if current_source != "Current density":
+        return suggested_current_unit_for_values(values)
+    finite_abs = np.abs(np.asarray(values, dtype=float))
+    finite_abs = finite_abs[np.isfinite(finite_abs)]
+    finite_abs = finite_abs[finite_abs > 0]
+    if not finite_abs.size:
+        return "mA"
+    p95 = float(np.nanpercentile(finite_abs, 95))
+    if p95 < 1e-3:
+        return "A"
+    if p95 < 0.1:
+        return "uA"
+    if p95 < 1e3:
+        return "mA"
+    return "uA"
+
+
 def current_unit_magnitude_warning(
     dataset: ParsedDataset,
     current_col: Optional[str],
@@ -1215,7 +1564,7 @@ def current_unit_magnitude_warning(
     if not finite_abs_raw.size:
         return ""
 
-    suggested_unit = suggested_current_unit_for_values(current_values)
+    suggested_unit = suggested_current_unit_for_context(current_values, current_source)
     interpreted_current_a = convert_current_to_amps(current_values, interpreted_current_unit)
     interpreted_display = current_to_display(
         interpreted_current_a,
@@ -1230,15 +1579,25 @@ def current_unit_magnitude_warning(
     raw_values_look_scaled = 1 <= raw_p95 <= 1000 and suggested_unit != interpreted_current_unit
     interpreted_is_large = p95_interpreted >= 1e4
     if raw_values_look_scaled or interpreted_is_large:
+        interpreted_label = display_unit_label(
+            current_unit_label_for_summary(interpreted_current_unit, current_source)
+        )
         return (
             "Current unit may be wrong. The current column has no unit label and values are "
-            f"unusually large if interpreted as {display_unit_label(interpreted_current_unit)}."
+            f"unusually large if interpreted as {interpreted_label}."
         )
     return ""
 
 
 def current_unit_review_explanation(current_col_label: str, suggested_unit: str, current_unit_warning: str) -> str:
+    suggested_label = display_unit_label(suggested_unit)
+    is_density_suggestion = "/cm" in suggested_label
     if current_unit_warning:
+        if is_density_suggestion:
+            return (
+                "The current-density column has no unit in the header. The uploaded signal appears "
+                "to already be current density, but the unit must be confirmed before using current-dependent metrics."
+            )
         return (
             "The current column has no unit in the header. If interpreted as A, "
             "the current values are unusually large for a typical CV/LSV."
@@ -1248,19 +1607,30 @@ def current_unit_review_explanation(current_col_label: str, suggested_unit: str,
             "The current column has no unit in the header. Based on value magnitude, "
             "A is the most likely input unit. Please confirm before using current-dependent metrics."
         )
+    if is_density_suggestion:
+        return (
+            "The current-density signal has no unit in the header. Based on filename/metadata "
+            f"and value magnitude, {suggested_label} is the most likely input unit. "
+            "Please confirm before using current-density metrics."
+        )
     return (
         f"The current column '{current_col_label}' has no unit in the header. Based on value magnitude, "
-        f"{display_unit_label(suggested_unit)} is the most likely input unit. "
+        f"{suggested_label} is the most likely input unit. "
         "Please confirm before using current-dependent metrics."
     )
 
 
 def current_unit_review_reason(suggested_unit: str, current_unit_warning: str) -> str:
+    suggested_label = display_unit_label(suggested_unit)
     if current_unit_warning:
+        if "/cm" in suggested_label:
+            return "Suggested from filename/metadata and value magnitude; uploaded signal appears to be current density."
         return "Suggested based on value magnitude; interpreting as A gives unusually large currents."
+    if "/cm" in suggested_label:
+        return f"Suggested from filename/metadata and value magnitude; {suggested_label} is plausible."
     if suggested_unit == "A":
         return "Suggested based on value magnitude; A gives microamp-scale currents."
-    return f"Suggested based on value magnitude; {display_unit_label(suggested_unit)} gives a plausible current scale."
+    return f"Suggested based on value magnitude; {suggested_label} gives a plausible current scale."
 
 
 def current_magnitude_sanity_warning(
@@ -1301,14 +1671,16 @@ def missing_unit_header_warning(
 def unit_header_audit_note(
     current_col: Optional[str],
     selected_current_unit: str,
+    current_source: str = "Current",
 ) -> str:
     if selected_current_unit == "Auto":
         return ""
     if current_header_has_explicit_unit(current_col):
         return ""
+    confirmed_unit = current_unit_label_for_summary(selected_current_unit, current_source)
     return (
         "Column units were missing from header. Current unit was confirmed by user as "
-        f"{display_unit_label(selected_current_unit)}."
+        f"{display_unit_label(confirmed_unit)}."
     )
 
 
@@ -1617,6 +1989,19 @@ def expected_peak_direction(peak_type: str) -> Optional[str]:
     return None
 
 
+def peak_has_expected_current_sign(peak_type: str, current_value: float) -> bool:
+    if peak_type == "oxidation":
+        return current_value > 0
+    if peak_type == "reduction":
+        return current_value < 0
+    return False
+
+
+def peak_matches_scan_or_current_sign(peak_type: str, segment_direction: str, current_value: float) -> bool:
+    expected_direction = expected_peak_direction(peak_type)
+    return segment_direction == expected_direction or peak_has_expected_current_sign(peak_type, current_value)
+
+
 def confidence_rank(confidence: str) -> int:
     ranks = {
         "low": 0,
@@ -1626,6 +2011,10 @@ def confidence_rank(confidence: str) -> int:
         "manual": 4,
     }
     return ranks.get(confidence, 0)
+
+
+def cap_confidence(confidence: str, max_confidence: str) -> str:
+    return confidence if confidence_rank(confidence) <= confidence_rank(max_confidence) else max_confidence
 
 
 CANDIDATE_PEAK_FILTER_OPTIONS = [
@@ -1715,8 +2104,7 @@ def confidence_from_peak_context(
     min_prominence: float,
     min_abs_current: float,
 ) -> str:
-    expected_direction = expected_peak_direction(peak_type)
-    correct_segment = expected_direction is not None and segment_direction == expected_direction
+    correct_segment = peak_matches_scan_or_current_sign(peak_type, segment_direction, float(current[idx]))
     near_edge = is_index_near_segment_endpoint(start, end, idx)
 
     segment_current = current[start:end]
@@ -1776,12 +2164,59 @@ def confidence_from_peak_context(
     if dominance < 0.4 and score >= 4:
         return "medium"
     if score >= 7:
-        return "high"
-    if score >= 5:
-        return "medium-high"
-    if score >= 3:
-        return "medium"
-    return "low"
+        confidence = "high"
+    elif score >= 5:
+        confidence = "medium-high"
+    elif score >= 3:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    if prominence_to_noise < 3:
+        return cap_confidence(confidence, "low")
+    if prominence_to_noise < 5:
+        return cap_confidence(confidence, "medium")
+    if prominence_to_noise < 8:
+        return cap_confidence(confidence, "medium-high")
+    return confidence
+
+
+def peak_selection_strength(peak: Peak) -> float:
+    directional_current = float(peak.raw_current) if peak.peak_type == "oxidation" else float(-peak.raw_current)
+    return max(0.0, directional_current) + float(peak.prominence)
+
+
+def apply_candidate_ambiguity_confidence(peaks: list[Peak], potential: np.ndarray) -> None:
+    for peak_type in ["oxidation", "reduction"]:
+        candidates = [
+            peak
+            for peak in peaks
+            if peak.peak_type == peak_type
+            and peak_has_expected_current_sign(peak_type, peak.raw_current)
+            and not peak_is_near_segment_endpoint(potential, peak)
+            and peak.confidence != "manual"
+        ]
+        if len(candidates) < 3:
+            continue
+
+        selected = max(candidates, key=peak_selection_strength)
+        selected_strength = max(peak_selection_strength(selected), 1e-30)
+        selected_prominence = max(float(selected.prominence), 1e-30)
+        similar_candidates = [
+            peak
+            for peak in candidates
+            if peak.id != selected.id
+            and (
+                float(peak.prominence) >= 0.75 * selected_prominence
+                or peak_selection_strength(peak) >= 0.75 * selected_strength
+            )
+        ]
+        if len(similar_candidates) >= 2:
+            selected.confidence = cap_confidence(selected.confidence, "medium")
+            for peak in similar_candidates:
+                peak.confidence = cap_confidence(peak.confidence, "medium")
+        elif similar_candidates:
+            selected.confidence = cap_confidence(selected.confidence, "medium-high")
 
 
 def segment_extreme_peak(
@@ -2001,23 +2436,22 @@ def detect_peaks(
         type_counts[peak.peak_type] += 1
         prefix = "ox" if peak.peak_type == "oxidation" else "red"
         peak.id = f"{prefix}_{type_counts[peak.peak_type]}"
+    apply_candidate_ambiguity_confidence(filtered, potential)
     return filtered
 
 
 def default_primary_peak_index(peaks: list[Peak], peak_type: str) -> int:
     expected_direction = expected_peak_direction(peak_type)
 
-    def sort_key(index: int) -> tuple[bool, int, float, float]:
+    def sort_key(index: int) -> tuple[bool, float, bool, float, int]:
         peak = peaks[index]
-        if peak_type == "oxidation":
-            peak_height = float(peak.raw_current)
-        else:
-            peak_height = float(-peak.raw_current)
+        peak_height = peak_selection_strength(peak)
         return (
-            peak.segment_direction == expected_direction,
-            confidence_rank(peak.confidence),
+            peak_has_expected_current_sign(peak_type, peak.raw_current),
             peak_height,
+            peak.segment_direction == expected_direction,
             float(peak.prominence),
+            confidence_rank(peak.confidence),
         )
 
     return max(range(len(peaks)), key=sort_key)
@@ -2166,14 +2600,44 @@ def build_peak_metrics_rows(
     return rows, metrics
 
 
+def cv_pair_metrics_review_reason(
+    metrics: dict[str, Optional[float]],
+    pair_confidence: Optional[str],
+) -> Optional[str]:
+    epa = metrics.get("epa_V")
+    epc = metrics.get("epc_V")
+    if epa is None or epc is None:
+        return None
+    if epa < epc:
+        return "Invalid: Epa is lower than Epc; verify that the selected peaks belong to the same redox couple."
+    confidence = str(pair_confidence or "").strip()
+    if confidence.lower() not in {"high", "manual"}:
+        return (
+            f"Tentative: pair confidence is {confidence or 'not high'}; verify peak assignment before "
+            "interpreting reversible-pair metrics."
+        )
+    return None
+
+
+def format_reviewed_pair_metric(value: str, review_reason: Optional[str]) -> str:
+    if not review_reason:
+        return value
+    if review_reason.startswith("Invalid"):
+        return "Invalid"
+    return f"Tentative: {value}"
+
+
 def metrics_table(
     metrics: dict[str, Optional[float]],
     display_unit: str,
     electrode_area_cm2: float = 1.0,
     current_source: str = "Current",
+    cv_behavior: Optional[str] = None,
+    pair_confidence: Optional[str] = None,
 ) -> pd.DataFrame:
     rows = []
     display_label = display_unit_label(display_unit)
+    pair_metric_review_reason = cv_pair_metrics_review_reason(metrics, pair_confidence)
     if metrics["epa_V"] is not None:
         rows.append({"metric": "Epa", "value": f"{metrics['epa_V']:.4g} V", "method": "Maximum current on forward scan"})
     if metrics["ipa_A"] is not None:
@@ -2185,12 +2649,82 @@ def metrics_table(
         ipc_display = current_to_display(np.array([metrics["ipc_A"]]), display_unit, current_source, electrode_area_cm2)[0]
         rows.append({"metric": "Ipc", "value": f"{ipc_display:.4g} {display_label}", "method": "Current at Epc"})
     if metrics["delta_ep_V"] is not None:
-        rows.append({"metric": "\u0394Ep", "value": f"{metrics['delta_ep_V'] * 1000:.4g} mV", "method": "Epa - Epc"})
+        rows.append(
+            {
+                "metric": "\u0394Ep",
+                "value": format_reviewed_pair_metric(f"{metrics['delta_ep_V'] * 1000:.4g} mV", pair_metric_review_reason),
+                "method": "Epa - Epc" if not pair_metric_review_reason else f"Epa - Epc; {pair_metric_review_reason}",
+            }
+        )
     if metrics["epa_V"] is not None and metrics["epc_V"] is not None:
         formal_potential = (metrics["epa_V"] + metrics["epc_V"]) / 2
-        rows.append({"metric": "E\u00b0\u2032", "value": f"{formal_potential:.4g} V", "method": "(Epa + Epc) / 2"})
+        rows.append(
+            {
+                "metric": "E\u00b0\u2032",
+                "value": format_reviewed_pair_metric(f"{formal_potential:.4g} V", pair_metric_review_reason),
+                "method": "(Epa + Epc) / 2" if not pair_metric_review_reason else f"(Epa + Epc) / 2; {pair_metric_review_reason}",
+            }
+        )
     if metrics["ipa_ipc_ratio"] is not None:
-        rows.append({"metric": "|Ipa/Ipc|", "value": f"{metrics['ipa_ipc_ratio']:.4g}", "method": "abs(Ipa/Ipc)"})
+        rows.append(
+            {
+                "metric": "|Ipa/Ipc|",
+                "value": format_reviewed_pair_metric(f"{metrics['ipa_ipc_ratio']:.4g}", pair_metric_review_reason),
+                "method": "abs(Ipa/Ipc)" if not pair_metric_review_reason else f"abs(Ipa/Ipc); {pair_metric_review_reason}",
+            }
+        )
+    if cv_behavior == "irreversible_oxidation_only":
+        rows.extend(
+            [
+                {
+                    "metric": "Epc",
+                    "value": "No reliable cathodic peak",
+                    "method": "No reliable return peak detected on reverse scan",
+                },
+                {"metric": "Ipc", "value": "Not detected", "method": "No reliable cathodic peak"},
+                {
+                    "metric": "\u0394Ep",
+                    "value": "Not applicable",
+                    "method": "Requires a reliable Epa/Epc pair",
+                },
+                {
+                    "metric": "E\u00b0\u2032",
+                    "value": "Not applicable",
+                    "method": "Requires a reliable Epa/Epc pair",
+                },
+                {
+                    "metric": "|Ipa/Ipc|",
+                    "value": "Not meaningful",
+                    "method": "Requires a reliable cathodic return peak",
+                },
+            ]
+        )
+    elif cv_behavior == "irreversible_reduction_only":
+        rows.extend(
+            [
+                {
+                    "metric": "Epa",
+                    "value": "No reliable anodic peak",
+                    "method": "No reliable oxidation peak detected on forward scan",
+                },
+                {"metric": "Ipa", "value": "Not detected", "method": "No reliable anodic peak"},
+                {
+                    "metric": "\u0394Ep",
+                    "value": "Not applicable",
+                    "method": "Requires a reliable Epa/Epc pair",
+                },
+                {
+                    "metric": "E\u00b0\u2032",
+                    "value": "Not applicable",
+                    "method": "Requires a reliable Epa/Epc pair",
+                },
+                {
+                    "metric": "|Ipa/Ipc|",
+                    "value": "Not meaningful",
+                    "method": "Requires a reliable anodic return peak",
+                },
+            ]
+        )
     return pd.DataFrame(rows)
 
 
@@ -2261,13 +2795,452 @@ def format_potential_metric(value: Optional[float]) -> str:
     return f"{value:.4g} V"
 
 
+def candidate_peak_ambiguity_messages(
+    candidate_peaks: Optional[list[Peak]],
+    oxidation_peak: Optional[Peak],
+    reduction_peak: Optional[Peak],
+) -> list[str]:
+    if not candidate_peaks:
+        return []
+    messages = []
+    for selected_peak in [oxidation_peak, reduction_peak]:
+        if selected_peak is None:
+            continue
+        same_role = [
+            peak
+            for peak in candidate_peaks
+            if peak.id != selected_peak.id
+            and peak.peak_type == selected_peak.peak_type
+            and peak.segment_direction == selected_peak.segment_direction
+        ]
+        selected_prominence = max(float(selected_peak.prominence), 1e-30)
+        selected_strength = max(peak_selection_strength(selected_peak), 1e-30)
+        similar = [
+            peak
+            for peak in same_role
+            if float(peak.prominence) >= 0.75 * selected_prominence
+            or peak_selection_strength(peak) >= 0.75 * selected_strength
+        ]
+        if len(similar) >= 2:
+            messages.append(
+                "Several candidate extrema have similar prominence. Primary peak selection may be ambiguous."
+            )
+            break
+    return messages
+
+
+def peak_is_reliable_for_pair(peak: Optional[Peak], peak_type: str, potential: np.ndarray) -> bool:
+    if peak is None:
+        return False
+    if peak.confidence == "manual":
+        return True
+    if peak.peak_type != peak_type:
+        return False
+    if not peak_has_expected_current_sign(peak_type, peak.raw_current):
+        return False
+    if peak_is_near_segment_endpoint(potential, peak):
+        return False
+    return confidence_rank(peak.confidence) >= confidence_rank("medium-high")
+
+
+def peak_is_meaningful_for_couple(
+    peak: Peak,
+    peak_type: str,
+    potential: np.ndarray,
+    max_abs_current: float,
+) -> bool:
+    if peak.peak_type != peak_type:
+        return False
+    if peak_is_near_segment_endpoint(potential, peak):
+        return False
+    if confidence_rank(peak.confidence) < confidence_rank("medium"):
+        return False
+    if not peak_has_expected_current_sign(peak_type, peak.raw_current):
+        return False
+    if max_abs_current > 0 and abs(float(peak.raw_current)) < 0.25 * max_abs_current:
+        return False
+    return True
+
+
+def redox_pair_confidence(
+    oxidation_peak: Peak,
+    reduction_peak: Peak,
+    delta_ep_v: float,
+    current_ratio: float,
+) -> str:
+    lower_peak_confidence = min(
+        confidence_rank(oxidation_peak.confidence),
+        confidence_rank(reduction_peak.confidence),
+    )
+    if (
+        lower_peak_confidence >= confidence_rank("medium-high")
+        and 0.6 <= current_ratio <= 1.7
+        and 0.02 <= delta_ep_v <= 0.18
+    ):
+        return "High"
+    if (
+        lower_peak_confidence >= confidence_rank("medium")
+        and 0.45 <= current_ratio <= 2.2
+        and 0.015 <= delta_ep_v <= 0.25
+    ):
+        return "Medium-high"
+    return "Medium"
+
+
+def redox_pair_score(
+    oxidation_peak: Peak,
+    reduction_peak: Peak,
+    delta_ep_v: float,
+    current_ratio: float,
+) -> float:
+    strength = peak_selection_strength(oxidation_peak) + peak_selection_strength(reduction_peak)
+    ratio_penalty = min(abs(np.log(max(current_ratio, 1e-12))), np.log(4.0)) / np.log(4.0)
+    ratio_score = 1.0 - ratio_penalty
+    delta_score = max(0.0, 1.0 - abs(delta_ep_v - 0.08) / 0.30)
+    confidence_bonus = (
+        confidence_rank(oxidation_peak.confidence) + confidence_rank(reduction_peak.confidence)
+    ) * max(strength, 1e-30) * 0.06
+    return strength * (0.55 + 0.35 * ratio_score + 0.10 * delta_score) + confidence_bonus
+
+
+SLOPED_BASELINE_WARNING = (
+    "Sloped baseline/background suspected. Try linear baseline correction before interpreting peak current."
+)
+
+
+def detect_sloped_baseline_background(potential: np.ndarray, current: np.ndarray) -> bool:
+    finite = np.isfinite(potential) & np.isfinite(current)
+    potential = potential[finite]
+    current = current[finite]
+    if potential.size < 20:
+        return False
+
+    order = np.argsort(potential)
+    x = potential[order]
+    y = current[order]
+    span = max(float(np.nanmax(x) - np.nanmin(x)), 1e-15)
+    current_range = max(float(np.nanmax(y) - np.nanmin(y)), 1e-15)
+    edge_count = max(5, int(0.12 * len(y)))
+    low_edge = y[:edge_count]
+    high_edge = y[-edge_count:]
+    if low_edge.size < 3 or high_edge.size < 3:
+        return False
+
+    edge_drift = abs(float(np.nanmedian(high_edge) - np.nanmedian(low_edge)))
+    slope = edge_drift / span
+    residual = y - np.interp(x, [x[0], x[-1]], [float(np.nanmedian(low_edge)), float(np.nanmedian(high_edge))])
+    residual_noise = max(robust_current_noise(residual), 1e-15)
+    drift_to_noise = edge_drift / residual_noise
+
+    return edge_drift >= 0.18 * current_range and drift_to_noise >= 6 and slope > 0
+
+
+def detect_redox_couples(candidate_peaks: Optional[list[Peak]], potential: np.ndarray) -> list[RedoxCouple]:
+    if not candidate_peaks:
+        return []
+
+    max_abs_current = max((abs(float(peak.raw_current)) for peak in candidate_peaks), default=0.0)
+    oxidation_candidates = [
+        peak
+        for peak in candidate_peaks
+        if peak_is_meaningful_for_couple(peak, "oxidation", potential, max_abs_current)
+    ]
+    reduction_candidates = [
+        peak
+        for peak in candidate_peaks
+        if peak_is_meaningful_for_couple(peak, "reduction", potential, max_abs_current)
+    ]
+
+    plausible_pairs: list[RedoxCouple] = []
+    for oxidation_peak in oxidation_candidates:
+        for reduction_peak in reduction_candidates:
+            if max(confidence_rank(oxidation_peak.confidence), confidence_rank(reduction_peak.confidence)) < confidence_rank("medium-high"):
+                continue
+            delta_ep_v = float(oxidation_peak.potential - reduction_peak.potential)
+            if not 0.015 <= delta_ep_v <= 0.35:
+                continue
+            if reduction_peak.raw_current == 0:
+                continue
+            current_ratio = abs(float(oxidation_peak.raw_current / reduction_peak.raw_current))
+            if not 0.35 <= current_ratio <= 2.8:
+                continue
+
+            confidence = redox_pair_confidence(oxidation_peak, reduction_peak, delta_ep_v, current_ratio)
+            score = redox_pair_score(oxidation_peak, reduction_peak, delta_ep_v, current_ratio)
+            plausible_pairs.append(
+                RedoxCouple(
+                    id="",
+                    oxidation_peak=oxidation_peak,
+                    reduction_peak=reduction_peak,
+                    delta_ep_v=delta_ep_v,
+                    formal_potential_v=(float(oxidation_peak.potential) + float(reduction_peak.potential)) / 2,
+                    current_ratio=current_ratio,
+                    score=score,
+                    confidence=confidence,
+                    reason=(
+                        f"Paired by scan direction, \u0394Ep {delta_ep_v * 1000:.4g} mV, "
+                        f"and |Ipa/Ipc| {current_ratio:.4g}."
+                    ),
+                )
+            )
+
+    paired_oxidation_ids: set[str] = set()
+    paired_reduction_ids: set[str] = set()
+    selected_pairs: list[RedoxCouple] = []
+    for pair in sorted(plausible_pairs, key=lambda item: item.score, reverse=True):
+        if pair.oxidation_peak.id in paired_oxidation_ids or pair.reduction_peak.id in paired_reduction_ids:
+            continue
+        pair.id = f"Couple {len(selected_pairs) + 1}"
+        selected_pairs.append(pair)
+        paired_oxidation_ids.add(pair.oxidation_peak.id)
+        paired_reduction_ids.add(pair.reduction_peak.id)
+
+    return selected_pairs
+
+
+def behavior_from_redox_couple(
+    behavior: CVBehaviorResult,
+    selected_index: int,
+) -> CVBehaviorResult:
+    couples = behavior.redox_couples or []
+    if not couples:
+        return behavior
+    selected_index = max(0, min(selected_index, len(couples) - 1))
+    selected_couple = couples[selected_index]
+    return CVBehaviorResult(
+        behavior.behavior,
+        behavior.label,
+        selected_couple.oxidation_peak,
+        selected_couple.reduction_peak,
+        None,
+        None,
+        selected_couple.confidence,
+        behavior.messages,
+        couples,
+        selected_index,
+    )
+
+
+def classify_cv_behavior(
+    oxidation_peak: Optional[Peak],
+    reduction_peak: Optional[Peak],
+    metrics: dict[str, Optional[float]],
+    potential: np.ndarray,
+    candidate_peaks: Optional[list[Peak]] = None,
+    baseline_background_suspected: bool = False,
+) -> CVBehaviorResult:
+    oxidation_reliable = peak_is_reliable_for_pair(oxidation_peak, "oxidation", potential)
+    reduction_reliable = peak_is_reliable_for_pair(reduction_peak, "reduction", potential)
+    current_ratio = metrics.get("ipa_ipc_ratio")
+    high_oxidation_to_reduction_ratio = current_ratio is not None and current_ratio > 2.0
+    high_reduction_to_oxidation_ratio = current_ratio is not None and current_ratio < 0.5
+    ambiguity_messages = candidate_peak_ambiguity_messages(candidate_peaks, oxidation_peak, reduction_peak)
+    redox_couples = detect_redox_couples(candidate_peaks, potential)
+    baseline_messages = [SLOPED_BASELINE_WARNING] if baseline_background_suspected else []
+    irreversible_baseline_message = (
+        "Potential baseline drift may affect return-peak classification; review after baseline correction before "
+        "interpreting irreversible behavior."
+    )
+
+    if len(redox_couples) >= 2:
+        selected_couple = redox_couples[0]
+        return CVBehaviorResult(
+            "multiple_redox_couples",
+            "Multiple redox couples",
+            selected_couple.oxidation_peak,
+            selected_couple.reduction_peak,
+            None,
+            None,
+            selected_couple.confidence,
+            [
+                "Multiple redox couples detected. Metrics are calculated for the selected couple; "
+                "review pair assignment before interpreting results."
+            ]
+            + baseline_messages,
+            redox_couples,
+            0,
+        )
+
+    if oxidation_reliable and reduction_reliable:
+        if current_ratio is None or 0.5 <= current_ratio <= 2.0:
+            return CVBehaviorResult(
+                "reversible_like",
+                "Reversible-like",
+                oxidation_peak,
+                reduction_peak,
+                None,
+                None,
+                "High",
+                baseline_messages,
+            )
+        return CVBehaviorResult(
+            "quasi_reversible",
+            "Quasi-reversible / review needed",
+            oxidation_peak,
+            reduction_peak,
+            None,
+            None,
+            "Medium",
+            [
+                f"Peak current ratio looks unusual: |Ipa/Ipc| is {current_ratio:.4g}. "
+                "Confirm whether this trace is quasi-reversible, irreversible, or affected by baseline/noise."
+            ]
+            + baseline_messages,
+        )
+
+    if oxidation_reliable and (not reduction_reliable or high_oxidation_to_reduction_ratio):
+        return CVBehaviorResult(
+            "irreversible_oxidation_only",
+            "Irreversible oxidation-only",
+            oxidation_peak,
+            None,
+            None,
+            reduction_peak,
+            "Low",
+            [
+                "Irreversible or oxidation-only CV: strong oxidation peak detected, but no reliable reduction peak "
+                "was found. \u0394Ep, E\u00b0\u2032, and |Ipa/Ipc| are not reliable for this trace."
+            ]
+            + baseline_messages
+            + ([irreversible_baseline_message] if baseline_background_suspected else []),
+        )
+
+    if reduction_reliable and (not oxidation_reliable or high_reduction_to_oxidation_ratio):
+        return CVBehaviorResult(
+            "irreversible_reduction_only",
+            "Irreversible reduction-only",
+            None,
+            reduction_peak,
+            oxidation_peak,
+            None,
+            "Low",
+            [
+                "Irreversible or reduction-only CV: strong reduction peak detected, but no reliable oxidation peak "
+                "was found. \u0394Ep, E\u00b0\u2032, and |Ipa/Ipc| are not applicable because no reliable anodic "
+                "return peak was detected."
+            ]
+            + baseline_messages
+            + ([irreversible_baseline_message] if baseline_background_suspected else []),
+        )
+
+    if oxidation_peak is None and reduction_peak is None:
+        return CVBehaviorResult(
+            "no_reliable_peaks",
+            "No reliable peaks",
+            None,
+            None,
+            None,
+            None,
+            "Low",
+            ["No reliable primary Epa/Epc peaks were detected. Review the data mapping and peak settings."]
+            + baseline_messages,
+        )
+
+    messages = [
+        "Weak/noisy CV: selected Epa/Epc may be noise-sensitive. Try smoothing, baseline correction, "
+        "or manual peak override before interpreting peak currents."
+    ]
+    messages.extend(baseline_messages)
+    messages.extend(ambiguity_messages)
+    return CVBehaviorResult(
+        "noisy_ambiguous",
+        "Noisy / ambiguous",
+        oxidation_peak,
+        reduction_peak,
+        None,
+        None,
+        "Medium" if oxidation_peak is not None or reduction_peak is not None else "Low",
+        unique_messages(messages),
+    )
+
+
+def analyze_cv_default_peaks(
+    potential: np.ndarray,
+    current: np.ndarray,
+    min_prominence: float,
+    min_distance: int,
+    min_abs_current: float,
+    display_unit: str,
+    electrode_area_cm2: float = 1.0,
+    current_source: str = "Current",
+    baseline_current: Optional[np.ndarray] = None,
+    baseline_background_suspected: bool = False,
+) -> CVPeakAnalysis:
+    peaks = detect_peaks(
+        potential,
+        current,
+        min_prominence,
+        int(min_distance),
+        min_abs_current,
+    )
+    raw_oxidation_peak, raw_reduction_peak = select_default_primary_peaks(peaks)
+    _raw_rows, raw_metrics = build_peak_metrics_rows(
+        raw_oxidation_peak,
+        raw_reduction_peak,
+        baseline_current,
+        current,
+        display_unit,
+        electrode_area_cm2,
+        current_source,
+    )
+    behavior = classify_cv_behavior(
+        raw_oxidation_peak,
+        raw_reduction_peak,
+        raw_metrics,
+        potential,
+        peaks,
+        baseline_background_suspected,
+    )
+    peak_rows, metrics = build_peak_metrics_rows(
+        behavior.oxidation_peak,
+        behavior.reduction_peak,
+        baseline_current,
+        current,
+        display_unit,
+        electrode_area_cm2,
+        current_source,
+    )
+    return CVPeakAnalysis(
+        peaks,
+        behavior.oxidation_peak,
+        behavior.reduction_peak,
+        peak_rows,
+        metrics,
+        behavior,
+    )
+
+
+def unique_messages(messages: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for message in messages:
+        if message in seen:
+            continue
+        seen.add(message)
+        unique.append(message)
+    return unique
+
+
 def cv_analysis_quality_messages(
     oxidation_peak: Optional[Peak],
     reduction_peak: Optional[Peak],
     metrics: Optional[dict[str, Optional[float]]] = None,
     potential: Optional[np.ndarray] = None,
+    candidate_peaks: Optional[list[Peak]] = None,
+    cv_behavior: Optional[CVBehaviorResult] = None,
 ) -> list[str]:
     messages = []
+    if cv_behavior is not None and cv_behavior.messages:
+        messages.extend(cv_behavior.messages)
+        if cv_behavior.behavior in {
+            "irreversible_oxidation_only",
+            "irreversible_reduction_only",
+            "multiple_redox_couples",
+            "no_reliable_peaks",
+            "noisy_ambiguous",
+        }:
+            return unique_messages(messages)
+
     if oxidation_peak is None or reduction_peak is None:
         missing = []
         if oxidation_peak is None:
@@ -2302,6 +3275,19 @@ def cv_analysis_quality_messages(
             "Confirm the selected marker before using the metrics."
         )
 
+    noise_sensitive = [
+        peak.peak_type
+        for peak in [oxidation_peak, reduction_peak]
+        if peak is not None and peak.confidence == "medium"
+    ]
+    if noise_sensitive:
+        messages.append(
+            "Weak/noisy CV: selected Epa/Epc may be noise-sensitive. Try smoothing, baseline correction, "
+            "or manual peak override before interpreting peak currents."
+        )
+
+    messages.extend(candidate_peak_ambiguity_messages(candidate_peaks, oxidation_peak, reduction_peak))
+
     if metrics is not None:
         delta_ep = metrics.get("delta_ep_V")
         if delta_ep is not None and (delta_ep <= 0 or delta_ep < 0.005 or delta_ep > 1.0):
@@ -2316,7 +3302,7 @@ def cv_analysis_quality_messages(
                 f"Peak current ratio looks unusual: |Ipa/Ipc| is {current_ratio:.4g}. "
                 "Confirm peak selection, baseline correction, and data quality."
             )
-    return messages
+    return unique_messages(messages)
 
 
 def cv_analysis_status(
@@ -2325,14 +3311,27 @@ def cv_analysis_status(
     metrics: dict[str, Optional[float]],
     potential: np.ndarray,
     cycle_assignment_uncertain: bool = False,
+    candidate_peaks: Optional[list[Peak]] = None,
+    cv_behavior: Optional[CVBehaviorResult] = None,
 ) -> str:
+    if cv_behavior is not None:
+        if cv_behavior.behavior == "no_reliable_peaks":
+            return "Incomplete"
+        if cv_behavior.behavior in {
+            "irreversible_oxidation_only",
+            "irreversible_reduction_only",
+            "multiple_redox_couples",
+            "noisy_ambiguous",
+            "quasi_reversible",
+        }:
+            return "Review recommended"
     if oxidation_peak is None and reduction_peak is None:
         return "Failed"
     if oxidation_peak is None or reduction_peak is None:
         return "Incomplete"
     if cycle_assignment_uncertain:
         return "Review recommended"
-    if cv_analysis_quality_messages(oxidation_peak, reduction_peak, metrics, potential):
+    if cv_analysis_quality_messages(oxidation_peak, reduction_peak, metrics, potential, candidate_peaks):
         return "Review recommended"
     return "Passed"
 
@@ -2342,8 +3341,18 @@ def parser_confidence_from_details(details: dict[str, Any]) -> str:
         return "Low"
     if details.get("current_column") in {None, "Not detected"}:
         return "Low"
+    cleanup_severity = str(details.get("parser_cleanup_severity") or "none")
+    if cleanup_severity in {"review", "strong"}:
+        return "Medium"
     warnings = str(details.get("warnings", "None")).strip()
-    if warnings and warnings != "None":
+    cleanup_notice = str(details.get("parser_cleanup_notice") or "").strip()
+    warning_parts = [
+        part.strip()
+        for part in warnings.split(";")
+        if part.strip() and part.strip() != "None"
+    ]
+    non_cleanup_warnings = [part for part in warning_parts if not cleanup_notice or part != cleanup_notice]
+    if non_cleanup_warnings:
         return "Medium"
     return "High"
 
@@ -2369,8 +3378,18 @@ def cv_analysis_quality_label(
     metrics: dict[str, Optional[float]],
     potential: np.ndarray,
     cycle_assignment_uncertain: bool = False,
+    candidate_peaks: Optional[list[Peak]] = None,
+    cv_behavior: Optional[CVBehaviorResult] = None,
 ) -> str:
-    status = cv_analysis_status(oxidation_peak, reduction_peak, metrics, potential, cycle_assignment_uncertain)
+    status = cv_analysis_status(
+        oxidation_peak,
+        reduction_peak,
+        metrics,
+        potential,
+        cycle_assignment_uncertain,
+        candidate_peaks,
+        cv_behavior,
+    )
     if status != "Passed":
         return status
 
@@ -2384,6 +3403,85 @@ def cv_analysis_quality_label(
     if confidence_values:
         return ", ".join(confidence_values).title()
     return "Incomplete"
+
+
+def peak_confidence_display(peak: Optional[Peak], rejected_peak: Optional[Peak] = None) -> str:
+    if peak is not None:
+        return peak.confidence.replace("-", " ").title()
+    if rejected_peak is not None:
+        return "Not detected / Low"
+    return "Not detected"
+
+
+def selected_peak_legend_label(cv_behavior: Optional[CVBehaviorResult]) -> str:
+    if cv_behavior is None:
+        return "Selected Epa/Epc"
+    if cv_behavior.behavior == "irreversible_oxidation_only":
+        return "Selected Epa"
+    if cv_behavior.behavior == "irreversible_reduction_only":
+        return "Selected Epc"
+    if cv_behavior.behavior == "multiple_redox_couples":
+        return "Selected redox couple"
+    if cv_behavior.behavior == "no_reliable_peaks":
+        return "No selected peak"
+    return "Selected Epa/Epc"
+
+
+def candidate_peak_explanation(cv_behavior: Optional[CVBehaviorResult]) -> str:
+    prefix = "Candidate peaks are local extrema retained for transparency. "
+    if cv_behavior is None:
+        return prefix + "Only the selected Epa/Epc pair is used for CV metrics."
+    if cv_behavior.behavior == "irreversible_oxidation_only":
+        return prefix + "Only the selected Epa is used; reversible-pair metrics are not calculated."
+    if cv_behavior.behavior == "irreversible_reduction_only":
+        return prefix + "Only the selected Epc is used; reversible-pair metrics are not calculated."
+    if cv_behavior.behavior == "multiple_redox_couples":
+        return prefix + "Only the selected redox couple is used for the main CV metrics."
+    if cv_behavior.behavior == "no_reliable_peaks":
+        return prefix + "No primary peak is reliable enough for CV metrics."
+    return prefix + "Only the selected Epa/Epc pair is used for CV metrics."
+
+
+def candidate_rejection_reasons(cv_behavior: CVBehaviorResult) -> dict[str, str]:
+    reasons: dict[str, str] = {}
+    if cv_behavior.rejected_reduction_peak is not None:
+        reasons[cv_behavior.rejected_reduction_peak.id] = (
+            "Rejected as primary Epc because no reliable cathodic return peak was detected."
+        )
+    if cv_behavior.rejected_oxidation_peak is not None:
+        reasons[cv_behavior.rejected_oxidation_peak.id] = (
+            "Rejected as primary Epa because no reliable anodic return peak was detected."
+        )
+    return reasons
+
+
+def redox_couple_option_label(couple: RedoxCouple) -> str:
+    return (
+        f"{couple.id} — E\u00b0 {couple.formal_potential_v:.4g} V · "
+        f"\u0394Ep {couple.delta_ep_v * 1000:.4g} mV · "
+        f"|Ipa/Ipc| {couple.current_ratio:.4g}"
+    )
+
+
+def redox_couples_display_table(
+    couples: list[RedoxCouple],
+    selected_index: int,
+) -> pd.DataFrame:
+    rows = []
+    for index, couple in enumerate(couples):
+        rows.append(
+            {
+                "Couple": couple.id,
+                "Epa": f"{couple.oxidation_peak.potential:.4g} V",
+                "Epc": f"{couple.reduction_peak.potential:.4g} V",
+                "\u0394Ep": f"{couple.delta_ep_v * 1000:.4g} mV",
+                "E\u00b0": f"{couple.formal_potential_v:.4g} V",
+                "|Ipa/Ipc|": f"{couple.current_ratio:.4g}",
+                "Confidence": couple.confidence,
+                "Selected?": "Selected" if index == selected_index else "",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def metric_trend_summary(label: str, values: list[Optional[float]], unit: str) -> str:
@@ -2420,6 +3518,7 @@ def build_per_cycle_cv_metrics(
     selected_cycle_metrics: Optional[dict[str, Optional[float]]] = None,
     selected_oxidation_peak: Optional[Peak] = None,
     selected_reduction_peak: Optional[Peak] = None,
+    selected_cv_behavior: Optional[CVBehaviorResult] = None,
     auto_tune_each_cycle: bool = True,
 ) -> tuple[pd.DataFrame, list[str]]:
     rows: list[dict[str, Any]] = []
@@ -2448,6 +3547,7 @@ def build_per_cycle_cv_metrics(
             metrics = selected_cycle_metrics
             oxidation_peak = selected_oxidation_peak
             reduction_peak = selected_reduction_peak
+            behavior = selected_cv_behavior
         else:
             cycle_min_prominence = min_prominence_a
             cycle_min_distance = int(min_distance)
@@ -2458,23 +3558,20 @@ def build_per_cycle_cv_metrics(
                 cycle_min_distance = int(cycle_params["min_distance"])
                 cycle_min_abs_current = float(cycle_params["min_abs_current"])
 
-            peaks = detect_peaks(
+            cycle_analysis = analyze_cv_default_peaks(
                 cycle_potential,
                 cycle_current,
                 cycle_min_prominence,
                 cycle_min_distance,
                 cycle_min_abs_current,
-            )
-            oxidation_peak, reduction_peak = select_default_primary_peaks(peaks)
-            _peak_rows, metrics = build_peak_metrics_rows(
-                oxidation_peak,
-                reduction_peak,
-                None,
-                cycle_current,
                 display_unit,
                 electrode_area_cm2,
                 current_source,
             )
+            oxidation_peak = cycle_analysis.oxidation_peak
+            reduction_peak = cycle_analysis.reduction_peak
+            metrics = cycle_analysis.metrics
+            behavior = cycle_analysis.behavior
 
         epa = metrics.get("epa_V")
         epc = metrics.get("epc_V")
@@ -2482,6 +3579,10 @@ def build_per_cycle_cv_metrics(
         ipc = metrics.get("ipc_A")
         delta_ep = metrics.get("delta_ep_V")
         formal_potential = (epa + epc) / 2 if epa is not None and epc is not None else None
+        pair_metric_review_reason = cv_pair_metrics_review_reason(
+            metrics,
+            behavior.pair_confidence if behavior is not None else None,
+        )
         ipa_display = (
             current_to_display(np.array([ipa]), display_unit, current_source, electrode_area_cm2)[0]
             if ipa is not None
@@ -2504,18 +3605,27 @@ def build_per_cycle_cv_metrics(
                 f"Ipa ({display_label})": "Not detected" if ipa_display is None else f"{ipa_display:.4g}",
                 "Epc (V)": "Not detected" if epc is None else f"{epc:.4g}",
                 f"Ipc ({display_label})": "Not detected" if ipc_display is None else f"{ipc_display:.4g}",
-                "\u0394Ep (mV)": "Not detected" if delta_ep is None else f"{delta_ep * 1000:.4g}",
-                "E\u00b0\u2032 (V)": "Not detected" if formal_potential is None else f"{formal_potential:.4g}",
+                "\u0394Ep (mV)": (
+                    "Not detected"
+                    if delta_ep is None
+                    else format_reviewed_pair_metric(f"{delta_ep * 1000:.4g}", pair_metric_review_reason)
+                ),
+                "E\u00b0\u2032 (V)": (
+                    "Not detected"
+                    if formal_potential is None
+                    else format_reviewed_pair_metric(f"{formal_potential:.4g}", pair_metric_review_reason)
+                ),
                 "|Ipa/Ipc|": (
                     "Not detected"
                     if metrics.get("ipa_ipc_ratio") is None
-                    else f"{metrics['ipa_ipc_ratio']:.4g}"
+                    else format_reviewed_pair_metric(f"{metrics['ipa_ipc_ratio']:.4g}", pair_metric_review_reason)
                 ),
                 "analysis quality": cv_analysis_quality_label(
                     oxidation_peak,
                     reduction_peak,
                     metrics,
                     cycle_potential,
+                    cv_behavior=behavior,
                 ),
             }
         )
@@ -2561,6 +3671,8 @@ def render_cv_analysis_summary(
     unit_confidence: str = "High",
     parser_confidence: str = "High",
     current_unit_warning: str = "",
+    candidate_peaks: Optional[list[Peak]] = None,
+    cv_behavior: Optional[CVBehaviorResult] = None,
 ) -> None:
     epa = metrics.get("epa_V")
     epc = metrics.get("epc_V")
@@ -2579,13 +3691,19 @@ def render_cv_analysis_summary(
     if cycle_count and not str(cycle_count).startswith("Not detected"):
         cycle_count_label = str(cycle_count)
 
-    confidence_values = [
-        peak.confidence for peak in [oxidation_peak, reduction_peak] if peak is not None
-    ]
-    if oxidation_peak is None or reduction_peak is None:
+    confidence_values = [peak.confidence for peak in [oxidation_peak, reduction_peak] if peak is not None]
+    if cv_behavior is not None:
+        confidence_label = cv_behavior.pair_confidence
+    elif oxidation_peak is None or reduction_peak is None:
         confidence_label = "Incomplete"
     elif len(confidence_values) == 2 and all(value == "high" for value in confidence_values):
         confidence_label = "High"
+    elif any(value == "low" for value in confidence_values):
+        confidence_label = "Low"
+    elif any(value == "medium" for value in confidence_values):
+        confidence_label = "Medium"
+    elif len(confidence_values) == 2 and all(value in {"high", "medium-high"} for value in confidence_values):
+        confidence_label = "Medium-high"
     elif confidence_values:
         confidence_label = ", ".join(confidence_values).title()
     else:
@@ -2597,6 +3715,8 @@ def render_cv_analysis_summary(
         metrics,
         potential,
         cycle_assignment_uncertain,
+        candidate_peaks,
+        cv_behavior,
     )
     status = analysis_status_override or overall_analysis_status(
         peak_status,
@@ -2638,31 +3758,110 @@ def render_cv_analysis_summary(
             else f"{metrics['ipa_ipc_ratio']:.4g}{' (unit review)' if current_metrics_need_review else ''}"
         )
     )
+    epa_value = format_potential_metric(epa)
+    epc_value = format_potential_metric(epc)
+    delta_ep_value = "Not detected" if delta_ep_mv is None else f"{delta_ep_mv:.4g} mV"
+    formal_potential_value = format_potential_metric(formal_potential)
+    pair_metric_review_reason = cv_pair_metrics_review_reason(metrics, confidence_label)
+    if pair_metric_review_reason:
+        delta_ep_value = format_reviewed_pair_metric(delta_ep_value, pair_metric_review_reason)
+        formal_potential_value = format_reviewed_pair_metric(formal_potential_value, pair_metric_review_reason)
+        if not current_metrics_pending and metrics.get("ipa_ipc_ratio") is not None:
+            ratio_value = format_reviewed_pair_metric(ratio_value, pair_metric_review_reason)
+    if cv_behavior is not None:
+        if cv_behavior.behavior == "irreversible_oxidation_only":
+            epc_value = "No reliable cathodic peak"
+            ipc_value = "Not detected"
+            delta_ep_value = "Not applicable"
+            formal_potential_value = "Not applicable"
+            ratio_value = "Not meaningful"
+        elif cv_behavior.behavior == "irreversible_reduction_only":
+            epa_value = "No reliable anodic peak"
+            ipa_value = "Not detected"
+            delta_ep_value = "Not applicable"
+            formal_potential_value = "Not applicable"
+            ratio_value = "Not meaningful"
 
     title = f"CV Analysis Summary{title_suffix}"
-    summary_items = [
-        ("Analysis status", status),
-        ("Peak detection confidence", confidence_label),
+    primary_selected_couple = None
+    if cv_behavior is not None and cv_behavior.behavior == "multiple_redox_couples" and cv_behavior.redox_couples:
+        primary_selected_couple = (cv_behavior.redox_couples or [])[cv_behavior.selected_couple_index or 0].id
+
+    diagnostic_items = [
         ("Unit confidence", unit_confidence),
         ("Parser confidence", parser_confidence),
-        ("Epa", format_potential_metric(epa)),
-        ("Ipa", ipa_value),
-        ("Epc", format_potential_metric(epc)),
-        ("Ipc", ipc_value),
-        ("\u0394Ep", "Not detected" if delta_ep_mv is None else f"{delta_ep_mv:.4g} mV"),
-        ("E\u00b0\u2032", format_potential_metric(formal_potential)),
-        ("|Ipa/Ipc|", ratio_value),
-        ("Overall quality", analysis_quality_override or status),
+        ("Peak detection confidence", confidence_label),
+        *(
+            [
+                ("Oxidation peak confidence", peak_confidence_display(cv_behavior.oxidation_peak, cv_behavior.rejected_oxidation_peak)),
+                ("Reduction peak confidence", peak_confidence_display(cv_behavior.reduction_peak, cv_behavior.rejected_reduction_peak)),
+            ]
+            if cv_behavior is not None
+            else []
+        ),
         ("Scan mode", scan_mode),
     ]
     if switching_potential:
-        summary_items.append(("Switching potential", switching_potential))
-    if scan_rate_label:
-        summary_items.append(("Scan rate", scan_rate_label))
+        diagnostic_items.append(("Switching potential", switching_potential))
     if analyzed_cycle_label:
-        summary_items.append(("Analyzed cycle", analyzed_cycle_label))
+        diagnostic_items.append(("Analyzed cycle", analyzed_cycle_label))
     elif cycle_count_label:
-        summary_items.append(("Cycle count", cycle_count_label))
+        diagnostic_items.append(("Cycle count", cycle_count_label))
+    if scan_rate_label:
+        diagnostic_items.append(("Scan rate", scan_rate_label))
+
+    if cv_behavior is not None and cv_behavior.behavior == "multiple_redox_couples":
+        summary_items = [
+            ("Analysis status", status),
+            ("CV behavior", cv_behavior.label),
+            ("Primary selected couple", primary_selected_couple or "Not selected"),
+            ("Epa", epa_value),
+            ("Ipa", ipa_value),
+            ("Epc", epc_value),
+            ("Ipc", ipc_value),
+            ("\u0394Ep", delta_ep_value),
+            ("E\u00b0", formal_potential_value),
+            ("|Ipa/Ipc|", ratio_value),
+            ("Pair confidence", cv_behavior.pair_confidence),
+            ("Overall quality", analysis_quality_override or status),
+        ]
+    else:
+        summary_items = [
+        ("Analysis status", status),
+        ]
+        if cv_behavior is not None:
+            summary_items.extend(
+                [
+                ("CV behavior", cv_behavior.label),
+                ("Oxidation peak confidence", peak_confidence_display(cv_behavior.oxidation_peak, cv_behavior.rejected_oxidation_peak)),
+                ("Reduction peak confidence", peak_confidence_display(cv_behavior.reduction_peak, cv_behavior.rejected_reduction_peak)),
+                ("Pair confidence", cv_behavior.pair_confidence),
+                ]
+            )
+        summary_items.extend(
+            [
+            ("Peak detection confidence", confidence_label),
+            ("Unit confidence", unit_confidence),
+            ("Parser confidence", parser_confidence),
+            ("Epa", epa_value),
+            ("Ipa", ipa_value),
+            ("Epc", epc_value),
+            ("Ipc", ipc_value),
+            ("\u0394Ep", delta_ep_value),
+            ("E\u00b0\u2032", formal_potential_value),
+            ("|Ipa/Ipc|", ratio_value),
+            ("Overall quality", analysis_quality_override or status),
+            ("Scan mode", scan_mode),
+            ]
+        )
+        if switching_potential:
+            summary_items.append(("Switching potential", switching_potential))
+        if scan_rate_label:
+            summary_items.append(("Scan rate", scan_rate_label))
+        if analyzed_cycle_label:
+            summary_items.append(("Analyzed cycle", analyzed_cycle_label))
+        elif cycle_count_label:
+            summary_items.append(("Cycle count", cycle_count_label))
 
     metric_html = "\n".join(
         f"""
@@ -2685,6 +3884,14 @@ def render_cv_analysis_summary(
         """,
         unsafe_allow_html=True,
     )
+    if cv_behavior is not None and cv_behavior.behavior == "multiple_redox_couples":
+        with st.expander("Analysis diagnostics", expanded=False):
+            st.table(pd.DataFrame({"Field": [label for label, _value in diagnostic_items], "Value": [value for _label, value in diagnostic_items]}))
+    if pair_metric_review_reason and not (
+        cv_behavior is not None
+        and cv_behavior.behavior in {"irreversible_oxidation_only", "irreversible_reduction_only"}
+    ):
+        st.caption(pair_metric_review_reason)
     if current_metrics_pending:
         st.caption("Current-dependent metrics will be calculated after unit confirmation.")
 
@@ -2706,6 +3913,220 @@ def select_lsv_onset(result: ESWResult, direction: str) -> tuple[Optional[float]
     if result.cathodic_limit is not None:
         return result.cathodic_limit, "cathodic"
     return None, None
+
+
+def default_lsv_onset_smoothing_window(point_count: int) -> int:
+    if point_count < 7:
+        return 0
+    window = min(15, max(5, int(round(point_count * 0.015))))
+    if window % 2 == 0:
+        window += 1
+    return min(window, point_count if point_count % 2 == 1 else point_count - 1)
+
+
+def interpolate_threshold_crossing(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    threshold: float,
+) -> float:
+    if y2 == y1:
+        return float(x2)
+    return float(x1 + (threshold - y1) * (x2 - x1) / (y2 - y1))
+
+
+def analyze_lsv_onset(
+    potential_v: np.ndarray,
+    current_values: np.ndarray,
+    threshold_a: Optional[float],
+    direction: Optional[str] = None,
+    min_consecutive_points: int = 5,
+    min_potential_window_v: float = 0.05,
+    edge_fraction: float = 0.03,
+    use_smoothing: bool = True,
+    smoothing_window: Optional[int] = None,
+) -> LSVOnsetResult:
+    direction = direction or lsv_dominant_response_direction(current_values) or lsv_scan_direction(potential_v)
+    method = "Sustained threshold crossing"
+    threshold_a = float(threshold_a) if threshold_a is not None else None
+    signed_threshold = None if threshold_a is None else (threshold_a if direction == "anodic" else -threshold_a)
+    point_count = int(min(len(potential_v), len(current_values)))
+    smoothing_window = (
+        default_lsv_onset_smoothing_window(point_count)
+        if smoothing_window is None
+        else int(smoothing_window)
+    )
+
+    base_result = LSVOnsetResult(
+        None,
+        direction,
+        "Review needed",
+        "Not detected",
+        method,
+        "No reliable sustained threshold crossing was detected.",
+        "No reliable sustained threshold crossing was detected.",
+        threshold_a,
+        signed_threshold,
+        int(min_consecutive_points),
+        float(min_potential_window_v),
+        "Moving average" if use_smoothing and smoothing_window >= 3 else "None",
+        int(max(0, smoothing_window)),
+    )
+
+    if threshold_a is None or threshold_a <= 0 or point_count < 3:
+        return base_result
+
+    potential = np.asarray(potential_v[:point_count], dtype=float)
+    raw_current = np.asarray(current_values[:point_count], dtype=float)
+    finite = np.isfinite(potential) & np.isfinite(raw_current)
+    if np.sum(finite) < 3:
+        return base_result
+
+    if point_count < max(8, min_consecutive_points * 2):
+        sparse_result = calculate_esw(potential, raw_current, threshold_a)
+        sparse_onset, sparse_direction = select_lsv_onset(sparse_result, direction)
+        if sparse_onset is not None and sparse_direction is not None:
+            signed_sparse_threshold = threshold_a if sparse_direction == "anodic" else -threshold_a
+            return LSVOnsetResult(
+                sparse_onset,
+                sparse_direction,
+                "Passed",
+                "Limited by sparse data",
+                method,
+                (
+                    "Onset estimated by linear threshold interpolation. "
+                    "Sustained-crossing checks are limited because the trace has few points."
+                ),
+                "",
+                threshold_a,
+                signed_sparse_threshold,
+                int(min_consecutive_points),
+                float(min_potential_window_v),
+                "None",
+                0,
+            )
+        return base_result
+
+    detection_current = raw_current.copy()
+    if use_smoothing and smoothing_window >= 3 and point_count >= smoothing_window:
+        detection_current = moving_average(raw_current, smoothing_window)
+
+    comparison = detection_current >= signed_threshold if direction == "anodic" else detection_current <= signed_threshold
+    comparison &= np.isfinite(detection_current) & np.isfinite(potential)
+    edge_points = max(2, int(point_count * edge_fraction))
+    edge_points = min(edge_points, max(2, point_count // 4))
+    noise_floor = max(robust_current_noise(raw_current), robust_current_noise(detection_current), 1e-15)
+    response_magnitude = (
+        max(0.0, float(np.nanmax(detection_current[np.isfinite(detection_current)])))
+        if direction == "anodic"
+        else max(0.0, abs(float(np.nanmin(detection_current[np.isfinite(detection_current)]))))
+    )
+    if response_magnitude < noise_floor * 8:
+        base_result.rejected_reason = "Signal is not sufficiently above local noise for a reliable onset."
+        base_result.warning = "No reliable sustained threshold crossing was detected."
+        return base_result
+
+    first_rejected_potential = None
+    first_rejected_reason = ""
+    indices = np.flatnonzero(comparison)
+    for idx in indices:
+        if idx > 0 and comparison[idx - 1]:
+            continue
+
+        if idx < edge_points:
+            first_rejected_potential = float(potential[idx])
+            first_rejected_reason = "Rejected crossing because it occurs too close to the scan start."
+            continue
+        if idx >= point_count - edge_points:
+            first_rejected_potential = float(potential[idx])
+            first_rejected_reason = "Rejected crossing because it occurs too close to the scan end."
+            continue
+
+        run_end = idx
+        while run_end < point_count and bool(comparison[run_end]):
+            run_end += 1
+        run_length = run_end - idx
+        run_span = abs(float(potential[run_end - 1] - potential[idx])) if run_length > 0 else 0.0
+        if run_length < min_consecutive_points or run_span < min_potential_window_v:
+            first_rejected_potential = float(potential[idx])
+            first_rejected_reason = (
+                "Rejected crossing because the signal drops back below threshold too quickly "
+                "or spans too narrow a potential window."
+            )
+            continue
+
+        window_end = min(run_end, idx + max(min_consecutive_points, 5))
+        local_deltas = np.diff(detection_current[idx:window_end])
+        local_deltas = local_deltas[np.isfinite(local_deltas)]
+        if local_deltas.size:
+            median_delta = float(np.nanmedian(local_deltas))
+            if direction == "anodic" and median_delta < -noise_floor:
+                first_rejected_potential = float(potential[idx])
+                first_rejected_reason = "Rejected crossing because current does not grow after crossing."
+                continue
+            if direction == "cathodic" and median_delta > noise_floor:
+                first_rejected_potential = float(potential[idx])
+                first_rejected_reason = "Rejected crossing because cathodic current magnitude does not grow after crossing."
+                continue
+
+        if direction == "anodic":
+            post_growth = float(np.nanmax(detection_current[idx:]) - signed_threshold)
+        else:
+            post_growth = float(signed_threshold - np.nanmin(detection_current[idx:]))
+        if post_growth < max(abs(signed_threshold) * 0.35, noise_floor * 3):
+            first_rejected_potential = float(potential[idx])
+            first_rejected_reason = "Rejected crossing because it is not followed by sustained current growth."
+            continue
+
+        previous_idx = idx - 1
+        onset_potential = (
+            float(potential[idx])
+            if previous_idx < 0
+            else interpolate_threshold_crossing(
+                float(potential[previous_idx]),
+                float(detection_current[previous_idx]),
+                float(potential[idx]),
+                float(detection_current[idx]),
+                float(signed_threshold),
+            )
+        )
+        smoothing_note = (
+            f" Onset detected from smoothed signal ({smoothing_window}-point moving average); raw trace shown."
+            if use_smoothing and smoothing_window >= 3
+            else ""
+        )
+        return LSVOnsetResult(
+            onset_potential,
+            direction,
+            "Passed",
+            "Reliable",
+            method,
+            (
+                f"Onset = linearly interpolated potential where {direction} signal first crosses the threshold "
+                f"and remains past it for at least {min_consecutive_points} points / "
+                f"{min_potential_window_v * 1000:.0f} mV.{smoothing_note}"
+            ),
+            "",
+            threshold_a,
+            signed_threshold,
+            int(min_consecutive_points),
+            float(min_potential_window_v),
+            "Moving average" if use_smoothing and smoothing_window >= 3 else "None",
+            int(max(0, smoothing_window)),
+            first_rejected_potential,
+            first_rejected_reason,
+        )
+
+    if first_rejected_potential is not None:
+        base_result.rejected_potential = first_rejected_potential
+        base_result.rejected_reason = first_rejected_reason
+        if "too close" in first_rejected_reason:
+            base_result.warning = "No reliable sustained threshold crossing was detected."
+        else:
+            base_result.warning = "Possible false onset from noise spike; review smoothing/threshold settings."
+        base_result.method_note = base_result.warning
+    return base_result
 
 
 def readable_lsv_current_unit(
@@ -2781,6 +4202,50 @@ def format_lsv_threshold(
     return format_lsv_current_value(threshold_base, display_unit, current_source, electrode_area_cm2)
 
 
+def lsv_threshold_magnitude_and_crossing(
+    threshold_base: Optional[float],
+    display_unit: str,
+    current_source: str,
+    electrode_area_cm2: float,
+    direction: Optional[str],
+) -> tuple[str, str]:
+    if threshold_base is None:
+        return "Not available", "Not available"
+    magnitude_base = abs(float(threshold_base))
+    signed_base = -magnitude_base if direction == "cathodic" else magnitude_base
+    return (
+        format_lsv_threshold(magnitude_base, display_unit, current_source, electrode_area_cm2),
+        format_lsv_threshold(signed_base, display_unit, current_source, electrode_area_cm2),
+    )
+
+
+def lsv_crossing_threshold_label(direction: Optional[str]) -> str:
+    if direction == "cathodic":
+        return "Cathodic crossing threshold"
+    if direction == "anodic":
+        return "Anodic crossing threshold"
+    return "Crossing threshold"
+
+
+def lsv_threshold_plot_labels(
+    threshold_display: float,
+    display_unit: str,
+    direction: Optional[str],
+    unit_review_required: bool = False,
+) -> tuple[str, str]:
+    unit_label = "unit unconfirmed" if unit_review_required else display_unit_label(display_unit)
+    value = f"{abs(float(threshold_display)):g} {unit_label}"
+    if direction == "cathodic":
+        return f"Threshold magnitude: {value}", f"Cathodic crossing threshold: -{value}"
+    if direction == "anodic":
+        return f"Anodic crossing threshold: +{value}", f"Threshold magnitude: {value}"
+    return f"+{value}", f"-{value}"
+
+
+def lsv_unconfirmed_unit_label(current_source: str) -> str:
+    return "Current density (unit unconfirmed)" if current_source == "Current density" else "Signal (unit unconfirmed)"
+
+
 def lsv_threshold_quantity_label(display_unit: str) -> str:
     return "current density" if is_current_density_unit(display_unit) else "current"
 
@@ -2803,6 +4268,10 @@ def lsv_dominant_response_direction(current_values: np.ndarray) -> Optional[str]
     if abs(max_current) > 0:
         return "anodic"
     return None
+
+
+def lsv_analysis_direction(potential_v: np.ndarray, current_values: np.ndarray) -> str:
+    return lsv_dominant_response_direction(current_values) or lsv_scan_direction(potential_v)
 
 
 def lsv_auto_threshold_preset_label(display_unit: str) -> str:
@@ -2948,25 +4417,33 @@ def build_lsv_analysis_summary(
     )
     current_label = "current density" if is_current_density_unit(current_unit) else "current"
 
-    direction = lsv_scan_direction(potential_v)
-    onset_potential = None
-    onset_direction = direction
-    if threshold_a is not None and threshold_a > 0:
-        result = calculate_esw(potential_v, current_values, threshold_a)
-        onset_potential, onset_direction = select_lsv_onset(result, direction)
+    direction = lsv_analysis_direction(potential_v, current_values)
+    onset_result = analyze_lsv_onset(potential_v, current_values, threshold_a, direction)
+    onset_potential = onset_result.onset_potential
+    onset_direction = onset_result.onset_direction or direction
 
-    status = "Passed" if onset_potential is not None else "Review needed"
-    review_note = ""
+    status = onset_result.status
+    review_note = onset_result.warning
     if onset_potential is None:
-        review_note = "No threshold crossing was detected in the uploaded potential range. Review the threshold or uploaded data."
-        method_note = review_note
+        method_note = review_note or "No reliable sustained threshold crossing was detected."
     else:
-        signed_threshold = -threshold_a if onset_direction == "cathodic" else threshold_a
-        threshold_note = format_lsv_threshold(signed_threshold, current_unit, current_source, electrode_area_cm2)
+        threshold_note = format_lsv_threshold(
+            onset_result.signed_threshold_base,
+            current_unit,
+            current_source,
+            electrode_area_cm2,
+        )
         reference_note = f" Reported vs {reference_electrode}." if reference_electrode else ""
+        smoothing_note = (
+            f" Onset detected from smoothed signal ({onset_result.smoothing_window}-point moving average); raw trace shown."
+            if onset_result.smoothing_method != "None"
+            else ""
+        )
         method_note = (
             f"Onset = linearly interpolated potential where {onset_direction} "
-            f"{current_label} first crosses {threshold_note}.{reference_note}"
+            f"{current_label} first crosses {threshold_note} and remains past the threshold "
+            f"for at least {onset_result.sustained_points_required} points / "
+            f"{onset_result.sustained_window_v * 1000:.0f} mV.{reference_note}{smoothing_note}"
         )
     if unit_review_needed:
         status = "Review needed"
@@ -2988,12 +4465,14 @@ def build_lsv_analysis_summary(
 
     scan_rate = "Not available"
     scan_rate_note = ""
+    electrode_area_metadata = "Not detected"
     if parsed_dataset is not None:
         potential_col = record.get("columns", {}).get("potential")
         scan_rate_estimate = scan_rate_estimate_summary(parsed_dataset, potential_col)
         scan_rate = summarize_scan_rate_for_card(scan_rate_estimate) or "Not available"
         if scan_rate == "Not available":
             scan_rate_note = scan_rate_unavailable_reason(parsed_dataset, potential_col)
+        electrode_area_metadata = electrode_area_metadata_summary(parsed_dataset.metadata) or "Not detected"
 
     method_quantity = "Current-density" if is_current_density_unit(current_unit) else "Current"
     summary_direction = onset_direction or direction
@@ -3015,31 +4494,70 @@ def build_lsv_analysis_summary(
         primary_current = max_current
         primary_potential_label = f"Potential at max {current_label}"
         primary_potential = max_potential
+    threshold_magnitude, crossing_threshold = lsv_threshold_magnitude_and_crossing(
+        threshold_a,
+        current_unit,
+        current_source,
+        electrode_area_cm2,
+        summary_direction,
+    )
+    if unit_review_needed:
+        provisional_unit_label = lsv_unconfirmed_unit_label(current_source)
+        threshold_magnitude = f"{format_summary_number(abs(threshold_a)) if threshold_a is not None else 'Not available'} unit unconfirmed"
+        crossing_threshold = (
+            f"-{format_summary_number(abs(threshold_a))} unit unconfirmed"
+            if threshold_a is not None and summary_direction == "cathodic"
+            else threshold_magnitude
+        )
+        primary_current_value = "Pending unit confirmation"
+        max_value = "Pending unit confirmation"
+        min_value = "Pending unit confirmation"
+        onset_method = f"{provisional_unit_label} threshold crossing"
+    else:
+        primary_current_value = format_lsv_current_value(primary_current, current_unit, current_source, electrode_area_cm2)
+        max_value = format_lsv_current_value(max_current, current_unit, current_source, electrode_area_cm2)
+        min_value = format_lsv_current_value(min_current, current_unit, current_source, electrode_area_cm2)
+        onset_method = f"{method_quantity} threshold crossing"
 
     return {
         "status": status,
         "review_note": review_note,
         "onset_label": onset_label,
         "onset_potential": format_lsv_potential(onset_potential, reference_electrode),
-        "onset_method": f"{method_quantity} threshold crossing",
-        "threshold": format_lsv_threshold(threshold_a, current_unit, current_source, electrode_area_cm2),
+        "onset_method": onset_method,
+        "threshold": threshold_magnitude,
+        "threshold_magnitude": threshold_magnitude,
+        "crossing_threshold": crossing_threshold,
+        "crossing_threshold_label": lsv_crossing_threshold_label(summary_direction),
         "threshold_source": threshold_source,
         "threshold_rule": threshold_rule,
         "method_note": method_note,
+        "onset_confidence": onset_result.confidence,
+        "sustained_requirement": (
+            f"{onset_result.sustained_points_required} points / "
+            f"{onset_result.sustained_window_v * 1000:.0f} mV"
+        ),
+        "onset_detection_signal": (
+            f"{onset_result.smoothing_method}, {onset_result.smoothing_window} points"
+            if onset_result.smoothing_method != "None"
+            else "Raw signal"
+        ),
+        "rejected_crossing_reason": onset_result.rejected_reason,
         "direction": summary_direction.title(),
         "primary_current_label": primary_current_label,
-        "primary_current_value": format_lsv_current_value(primary_current, current_unit, current_source, electrode_area_cm2),
+        "primary_current_value": primary_current_value,
         "primary_potential_label": primary_potential_label,
         "primary_potential": format_lsv_potential(primary_potential, reference_electrode),
         "max_label": f"Max {current_label}",
-        "max_value": format_lsv_current_value(max_current, current_unit, current_source, electrode_area_cm2),
+        "max_value": max_value,
         "max_potential": format_lsv_potential(max_potential, reference_electrode),
         "min_label": f"Min {current_label}",
-        "min_value": format_lsv_current_value(min_current, current_unit, current_source, electrode_area_cm2),
+        "min_value": min_value,
         "min_potential": format_lsv_potential(min_potential, reference_electrode),
         "potential_range": format_fixed_range(finite_potential, "V", 3),
         "scan_rate": scan_rate,
         "scan_rate_note": scan_rate_note,
+        "electrode_area_metadata": electrode_area_metadata,
         "reference_electrode": reference_electrode_source_label(reference_electrode, reference_electrode_source),
         "reference_note": reference_electrode_default_note(reference_electrode, reference_electrode_source),
     }
@@ -3048,13 +4566,28 @@ def build_lsv_analysis_summary(
 def render_lsv_analysis_summary(summary: dict[str, str]) -> None:
     status = summary.get("status", "Review needed")
     status_class = status_badge_class(status)
+    direction = str(summary.get("direction", "")).lower()
+    threshold_items = [
+        (
+            "Threshold magnitude" if direction == "cathodic" else "Threshold",
+            summary.get("threshold_magnitude", summary.get("threshold", "Not available")),
+        )
+    ]
+    if direction == "cathodic":
+        threshold_items.append(
+            (
+                summary.get("crossing_threshold_label", "Cathodic crossing threshold"),
+                summary.get("crossing_threshold", "Not available"),
+            )
+        )
     summary_items = [
         ("Analysis status", status),
         (summary.get("onset_label", "Onset potential"), summary.get("onset_potential", "Not detected")),
         ("Onset method", summary.get("onset_method", "Threshold crossing")),
-        ("Threshold", summary.get("threshold", "Not available")),
+        *threshold_items,
         ("Threshold source", summary.get("threshold_source", "User-defined")),
         ("Threshold rule", summary.get("threshold_rule", "User-defined threshold.")),
+        ("Onset reliability", summary.get("onset_confidence", "Not available")),
         ("Direction", summary.get("direction", "Not available")),
         (summary.get("primary_current_label", "Max current"), summary.get("primary_current_value", "Not available")),
         (summary.get("primary_potential_label", "Potential at max current"), summary.get("primary_potential", "Not available")),
@@ -3062,6 +4595,8 @@ def render_lsv_analysis_summary(summary: dict[str, str]) -> None:
         ("Scan rate", summary.get("scan_rate", "Not available")),
         ("Reference electrode", summary.get("reference_electrode", "Not selected")),
     ]
+    if summary.get("electrode_area_metadata") not in {None, "", "Not detected"}:
+        summary_items.append(("Electrode area", str(summary["electrode_area_metadata"])))
     metric_html = "\n".join(
         f"""
         <div class="analysis-metric">
@@ -3098,6 +4633,7 @@ def format_lsv_display_state(
     threshold_a: Optional[float],
     reference_electrode: Optional[str],
     electrode_area_metadata: Optional[str] = None,
+    unit_review_required: bool = False,
 ) -> str:
     current_source = display_units.get("current_source", "Current")
     electrode_area_cm2 = float(display_units.get("electrode_area_cm2", 1.0))
@@ -3111,6 +4647,8 @@ def format_lsv_display_state(
         display_quantity = "Current density"
     if threshold_a is None:
         threshold_text = "not set"
+    elif unit_review_required:
+        threshold_text = f"{format_summary_number(abs(threshold_a))} unit unconfirmed"
     else:
         threshold_text = format_lsv_threshold(
             threshold_a,
@@ -3124,6 +4662,7 @@ def format_lsv_display_state(
         summary = (
             "Display: Current density from uploaded column, "
             f"threshold = {threshold_text}, reference = {reference_text}."
+            " Uploaded signal was treated as current density. Electrode-area normalization was skipped."
         )
         if electrode_area_metadata:
             summary += (
@@ -3133,16 +4672,22 @@ def format_lsv_display_state(
         return summary
 
     if display_quantity == "Current":
-        return (
+        summary = (
             f"Display: Current, threshold = {threshold_text}, "
             f"reference = {reference_text}."
         )
+        if electrode_area_metadata:
+            summary += f" Electrode area detected: {electrode_area_metadata}. Current density display is available."
+        return summary
 
     area_text = f"{electrode_area_cm2:.1f}" if electrode_area_cm2 == round(electrode_area_cm2) else f"{electrode_area_cm2:g}"
-    return (
+    summary = (
         f"Display: {display_quantity}, area = {area_text} cm\u00b2, "
         f"threshold = {threshold_text}, reference = {reference_text}."
     )
+    if electrode_area_metadata:
+        summary += f" Electrode area detected: {electrode_area_metadata}."
+    return summary
 
 
 def build_lsv_detailed_metrics(
@@ -3170,10 +4715,10 @@ def build_lsv_detailed_metrics(
     current_label = "current density" if is_density else "current"
     current_label_title = "current density" if is_density else "current"
 
-    direction = lsv_scan_direction(potential_v)
-    result = calculate_esw(potential_v, current_values, threshold_a) if threshold_a and threshold_a > 0 else ESWResult(None, None, None)
-    onset_potential, onset_direction = select_lsv_onset(result, direction)
-    onset_direction = onset_direction or direction
+    direction = lsv_analysis_direction(potential_v, current_values)
+    onset_result = analyze_lsv_onset(potential_v, current_values, threshold_a, direction)
+    onset_potential = onset_result.onset_potential
+    onset_direction = onset_result.onset_direction or direction
     if onset_direction == "cathodic":
         onset_label = "Cathodic onset potential"
     elif onset_direction == "anodic":
@@ -3198,27 +4743,89 @@ def build_lsv_detailed_metrics(
 
     scan_rate = "Not available"
     scan_rate_note = ""
+    electrode_area_metadata = "Not detected"
+    reference_metadata = "Not detected"
+    scan_rate_method = "Estimated from dE/dt when time and potential columns are available."
     if parsed_dataset is not None:
         potential_col = record.get("columns", {}).get("potential")
         scan_rate_estimate = scan_rate_estimate_summary(parsed_dataset, potential_col)
         scan_rate = summarize_scan_rate_for_card(scan_rate_estimate) or "Not available"
         if scan_rate == "Not available":
             scan_rate_note = scan_rate_unavailable_reason(parsed_dataset, potential_col)
+        scan_rate_method = scan_rate_method_summary(parsed_dataset, potential_col)
+        electrode_area_metadata = electrode_area_metadata_summary(parsed_dataset.metadata) or "Not detected"
+        reference_metadata = reference_electrode_from_metadata(parsed_dataset.metadata) or "Not detected"
 
-    direction_method = "Potential increases from start to end." if direction == "anodic" else "Potential decreases from start to end."
+    direction_method = (
+        "Uses the dominant LSV response direction when available; otherwise falls back to scan direction."
+    )
     threshold_method = threshold_rule
-    crossing_method = f"Linear interpolation where {current_label} crosses the selected threshold."
+    crossing_method = (
+        f"Linear interpolation where {current_label} crosses the selected threshold and stays past it "
+        f"for at least {onset_result.sustained_points_required} points / "
+        f"{onset_result.sustained_window_v * 1000:.0f} mV."
+    )
+    if onset_result.smoothing_method != "None":
+        crossing_method += (
+            f" Onset detection uses a {onset_result.smoothing_window}-point moving average; raw trace is preserved."
+        )
+    if onset_result.warning:
+        crossing_method = onset_result.warning
+    threshold_magnitude, crossing_threshold = lsv_threshold_magnitude_and_crossing(
+        threshold_a,
+        current_unit,
+        current_source,
+        electrode_area_cm2,
+        onset_direction,
+    )
+    unit_review_needed = bool(display_units.get("unit_review_required"))
+    if unit_review_needed:
+        threshold_magnitude = f"{format_summary_number(abs(threshold_a)) if threshold_a is not None else 'Not available'} unit unconfirmed"
+        crossing_threshold = (
+            f"-{format_summary_number(abs(threshold_a))} unit unconfirmed"
+            if threshold_a is not None and onset_direction == "cathodic"
+            else threshold_magnitude
+        )
+        max_current_value = "Pending unit confirmation"
+        min_current_value = "Pending unit confirmation"
+        onset_method_value = (
+            "Sustained current-density threshold crossing"
+            if current_source == "Current density"
+            else "Sustained signal threshold crossing"
+        )
+    else:
+        max_current_value = format_lsv_current_value(max_current, current_unit, current_source, electrode_area_cm2)
+        min_current_value = format_lsv_current_value(min_current, current_unit, current_source, electrode_area_cm2)
+        onset_method_value = "Sustained current-density threshold crossing" if is_density else "Sustained current threshold crossing"
+    threshold_rows = (
+        [
+            {
+                "Metric": "Threshold magnitude",
+                "Value": threshold_magnitude,
+                "Method": threshold_method,
+            },
+            {
+                "Metric": "Cathodic crossing threshold",
+                "Value": crossing_threshold,
+                "Method": "Signed threshold used for cathodic onset detection.",
+            },
+        ]
+        if onset_direction == "cathodic"
+        else [
+            {
+                "Metric": "Threshold",
+                "Value": threshold_magnitude,
+                "Method": threshold_method,
+            }
+        ]
+    )
     rows = [
         {
             "Metric": onset_label,
             "Value": format_lsv_potential(onset_potential, reference_electrode),
             "Method": crossing_method,
         },
-        {
-            "Metric": "Threshold",
-            "Value": format_lsv_threshold(threshold_a, current_unit, current_source, electrode_area_cm2),
-            "Method": threshold_method,
-        },
+        *threshold_rows,
         {
             "Metric": "Threshold source",
             "Value": threshold_source,
@@ -3226,8 +4833,32 @@ def build_lsv_detailed_metrics(
         },
         {
             "Metric": "Onset method",
-            "Value": "Current-density threshold crossing" if is_density else "Current threshold crossing",
-            "Method": "Uses the selected threshold and scan direction to select the relevant crossing.",
+            "Value": onset_method_value,
+            "Method": "Rejects isolated noisy or boundary crossings before selecting onset.",
+        },
+        {
+            "Metric": "Onset reliability",
+            "Value": onset_result.confidence,
+            "Method": onset_result.warning or "Sustained threshold behavior was detected.",
+        },
+        {
+            "Metric": "Sustained crossing requirement",
+            "Value": f"{onset_result.sustained_points_required} points / {onset_result.sustained_window_v * 1000:.0f} mV",
+            "Method": "Minimum duration/window required after threshold crossing.",
+        },
+        {
+            "Metric": "Onset detection signal",
+            "Value": (
+                f"{onset_result.smoothing_method}, {onset_result.smoothing_window} points"
+                if onset_result.smoothing_method != "None"
+                else "Raw signal"
+            ),
+            "Method": "Signal used for onset detection; displayed trace remains raw unless user changes display settings.",
+        },
+        {
+            "Metric": "Rejected crossing reason",
+            "Value": onset_result.rejected_reason or "None",
+            "Method": "Reason for rejecting the first candidate crossing, if any.",
         },
         {
             "Metric": "Direction",
@@ -3235,22 +4866,22 @@ def build_lsv_detailed_metrics(
             "Method": direction_method,
         },
         {
-            "Metric": f"Max {current_label_title}",
-            "Value": format_lsv_current_value(max_current, current_unit, current_source, electrode_area_cm2),
+            "Metric": f"Maximum anodic {current_label_title}",
+            "Value": max_current_value,
             "Method": f"Maximum {current_label} in the normalized LSV trace.",
         },
         {
-            "Metric": f"Potential at max {current_label_title}",
+            "Metric": f"Potential at maximum anodic {current_label_title}",
             "Value": format_lsv_potential(max_potential, reference_electrode),
             "Method": f"Potential value at the maximum {current_label}.",
         },
         {
-            "Metric": f"Min {current_label_title}",
-            "Value": format_lsv_current_value(min_current, current_unit, current_source, electrode_area_cm2),
+            "Metric": f"Maximum cathodic {current_label_title} / minimum {current_label_title}",
+            "Value": min_current_value,
             "Method": f"Minimum {current_label} in the normalized LSV trace.",
         },
         {
-            "Metric": f"Potential at min {current_label_title}",
+            "Metric": f"Potential at maximum cathodic {current_label_title}",
             "Value": format_lsv_potential(min_potential, reference_electrode),
             "Method": f"Potential value at the minimum {current_label}.",
         },
@@ -3262,7 +4893,17 @@ def build_lsv_detailed_metrics(
         {
             "Metric": "Scan rate",
             "Value": scan_rate,
-            "Method": scan_rate_note or "Estimated from dE/dt when time and potential columns are available.",
+            "Method": scan_rate_note or scan_rate_method,
+        },
+        {
+            "Metric": "Reference electrode metadata",
+            "Value": reference_metadata,
+            "Method": "Reference electrode parsed from file metadata, when available.",
+        },
+        {
+            "Metric": "Electrode area metadata",
+            "Value": electrode_area_metadata,
+            "Method": "Electrode area parsed from file metadata, when available.",
         },
         {
             "Metric": "Number of points",
@@ -3287,10 +4928,11 @@ def build_lsv_onset_annotation(
     if potential_v.size < 2 or current_values.size != potential_v.size:
         return None
 
-    direction = lsv_scan_direction(potential_v)
-    result = calculate_esw(potential_v, current_values, threshold_a)
-    onset_potential, onset_direction = select_lsv_onset(result, direction)
-    if onset_potential is None or onset_direction is None:
+    direction = lsv_analysis_direction(potential_v, current_values)
+    onset_result = analyze_lsv_onset(potential_v, current_values, threshold_a, direction)
+    onset_potential = onset_result.onset_potential
+    onset_direction = onset_result.onset_direction
+    if onset_result.status != "Passed" or onset_potential is None or onset_direction is None:
         return None
 
     potential_unit = display_units.get("potential", "V")
@@ -3307,6 +4949,7 @@ def build_lsv_onset_annotation(
     )[0]
     reference = f" vs {reference_electrode}" if reference_electrode else ""
     onset_label = f"Onset = {onset_potential:.3f} V{reference}"
+    threshold_unit_label = "unit unconfirmed" if display_units.get("unit_review_required") else display_unit_label(current_unit)
     return {
         "onset_potential_v": float(onset_potential),
         "onset_potential_display": float(potential_display),
@@ -3315,7 +4958,8 @@ def build_lsv_onset_annotation(
         "label": onset_label,
         "hover": (
             f"{onset_label}<br>"
-            f"Threshold: {current_display:.4g} {display_unit_label(current_unit)}"
+            f"{lsv_crossing_threshold_label(onset_direction)}: {current_display:.4g} {threshold_unit_label}<br>"
+            f"Reliability: {onset_result.confidence}"
         ),
     }
 
@@ -3585,6 +5229,27 @@ def current_source_guess_for_column(column: Optional[str]) -> str:
     return "Current"
 
 
+def current_source_guess_for_dataset(dataset: ParsedDataset, column: Optional[str]) -> str:
+    if column and header_indicates_current_density(column):
+        return "Current density"
+    if dataset_suggests_current_density_signal(dataset, column):
+        return "Current density"
+    return "Current"
+
+
+def uploaded_signal_kind(
+    dataset: Optional[ParsedDataset],
+    current_col: Optional[str],
+    current_source: str,
+    selected_current_unit: str = "Auto",
+) -> str:
+    if current_source == "Current density":
+        return "current_density"
+    if dataset is not None and current_unit_is_ambiguous(dataset, current_col, selected_current_unit):
+        return "unknown"
+    return "raw_current"
+
+
 def readable_parser_current_unit_for_lsv(
     parsed_datasets: list[ParsedDataset],
     current_source_override: Optional[str] = None,
@@ -3600,7 +5265,7 @@ def readable_parser_current_unit_for_lsv(
         current_values = dataset.dataframe[current_col].to_numpy(dtype=float)
         current_unit = resolve_role_unit_from_values("Auto", dataset, "current", current_col, current_values)
         current_arrays.append(convert_current_to_amps(current_values, current_unit))
-        detected_source = current_source_guess_for_column(current_col)
+        detected_source = current_source_guess_for_dataset(dataset, current_col)
         detected_sources.append(
             "Current density"
             if detected_source == "Current density"
@@ -3773,7 +5438,8 @@ def scan_rate_estimate_summary(dataset: ParsedDataset, potential_col: Optional[s
         excluded = {potential_col} if potential_col else set()
         time_col = detect_column_by_role(dataset.dataframe, "time", excluded=excluded)
     if not time_col or not potential_col or time_col not in dataset.dataframe or potential_col not in dataset.dataframe:
-        return "Not available"
+        metadata_scan_rate = scan_rate_from_metadata(dataset.metadata)
+        return scan_rate_summary_from_value(metadata_scan_rate) if metadata_scan_rate is not None else "Not available"
 
     time_values = dataset.dataframe[time_col].to_numpy(dtype=float)
     potential_values = dataset.dataframe[potential_col].to_numpy(dtype=float)
@@ -3782,12 +5448,15 @@ def scan_rate_estimate_summary(dataset: ParsedDataset, potential_col: Optional[s
     time_s = convert_role_to_base(time_values, "time", time_unit)
     potential_v = convert_role_to_base(potential_values, "potential", potential_unit)
     scan_rate = representative_scan_rate_v_s(time_s, potential_v)
-    if scan_rate is None:
-        return "Not available"
-    return f"{format_summary_number(scan_rate)} V/s ({format_summary_number(scan_rate * 1000)} mV/s)"
+    if scan_rate is not None:
+        return scan_rate_summary_from_value(scan_rate)
+    metadata_scan_rate = scan_rate_from_metadata(dataset.metadata)
+    return scan_rate_summary_from_value(metadata_scan_rate) if metadata_scan_rate is not None else "Not available"
 
 
 def scan_rate_unavailable_reason(dataset: ParsedDataset, potential_col: Optional[str]) -> str:
+    if scan_rate_from_metadata(dataset.metadata) is not None:
+        return ""
     time_col = dataset.detected_time_col
     if not time_col:
         excluded = {potential_col} if potential_col else set()
@@ -3797,6 +5466,29 @@ def scan_rate_unavailable_reason(dataset: ParsedDataset, potential_col: Optional
     if not potential_col or time_col not in dataset.dataframe or potential_col not in dataset.dataframe:
         return "Scan rate could not be estimated because the required time or potential column was unavailable."
     return "Scan rate could not be estimated from the available time and potential values."
+
+
+def scan_rate_method_summary(dataset: Optional[ParsedDataset], potential_col: Optional[str]) -> str:
+    if dataset is None:
+        return "Estimated from dE/dt when time and potential columns are available."
+    time_col = dataset.detected_time_col
+    if not time_col:
+        excluded = {potential_col} if potential_col else set()
+        time_col = detect_column_by_role(dataset.dataframe, "time", excluded=excluded)
+    if time_col and potential_col and time_col in dataset.dataframe and potential_col in dataset.dataframe:
+        time_values = dataset.dataframe[time_col].to_numpy(dtype=float)
+        potential_values = dataset.dataframe[potential_col].to_numpy(dtype=float)
+        time_unit = resolve_role_unit_from_values("Auto", dataset, "time", time_col, time_values)
+        potential_unit = resolve_role_unit_from_values("Auto", dataset, "potential", potential_col, potential_values)
+        scan_rate = representative_scan_rate_v_s(
+            convert_role_to_base(time_values, "time", time_unit),
+            convert_role_to_base(potential_values, "potential", potential_unit),
+        )
+        if scan_rate is not None:
+            return "Estimated from dE/dt using time and potential columns."
+    if scan_rate_from_metadata(dataset.metadata) is not None:
+        return "Parsed from file metadata."
+    return scan_rate_unavailable_reason(dataset, potential_col)
 
 
 def scan_rate_note_for_dataset(dataset: Optional[ParsedDataset], potential_col: Optional[str]) -> str:
@@ -3880,7 +5572,7 @@ def parser_summary_details(
     current_magnitude_warning = ""
     unit_header_warning = ""
     unit_header_audit = ""
-    detected_current_source = current_source_guess_for_column(current_col)
+    detected_current_source = current_source_guess_for_dataset(dataset, current_col)
     current_source = (
         "Current density"
         if detected_current_source == "Current density"
@@ -3895,8 +5587,10 @@ def parser_summary_details(
         current_label = current_unit_label_for_summary(current_unit, current_source)
         original_current_range = format_numeric_range(current_values, "raw values")
         if current_unit_is_ambiguous(dataset, current_col, current_input_unit_override or "Auto"):
+            suggested_unit = suggested_current_unit_for_context(current_values, current_source)
+            suggested_label = display_unit_label(current_unit_label_for_summary(suggested_unit, current_source))
             suggested_current_unit = (
-                f"{display_unit_label(suggested_current_unit_for_values(current_values))} "
+                f"{suggested_label} "
                 "based on value magnitude"
             )
             current_unit_warning = current_unit_magnitude_warning(
@@ -3932,8 +5626,14 @@ def parser_summary_details(
     unit_header_audit = unit_header_audit_note(
         current_col,
         current_input_unit_override or "Auto",
+        current_source,
     )
-    warnings = "; ".join(dataset.warnings) if dataset.warnings else "None"
+    cleanup_notice = dropped_rows_cleanup_notice(len(dataset.dataframe), dataset.rows_dropped)
+    cleanup_messages = [cleanup_notice] if cleanup_notice else []
+    warning_messages = [*dataset.warnings, *cleanup_messages]
+    warning_messages = unique_messages([message for message in warning_messages if message])
+    warnings = "; ".join(warning_messages) if warning_messages else "None"
+    cleanup_severity = dropped_rows_severity(len(dataset.dataframe), dataset.rows_dropped)
     current_label = current_unit_label_for_summary(current_unit, current_source)
     current_label_display = display_unit_label(current_label)
     analysis_current_unit = "A/cm^2" if current_source == "Current density" else "A"
@@ -3953,6 +5653,8 @@ def parser_summary_details(
     scan_rate_note = ""
     if scan_rate_estimate == "Not available":
         scan_rate_note = scan_rate_unavailable_reason(dataset, potential_col)
+    reference_electrode_metadata = reference_electrode_from_metadata(dataset.metadata) or "Not detected"
+    electrode_area_metadata = electrode_area_metadata_summary(dataset.metadata) or "Not detected"
 
     return {
         "file_name": dataset.filename,
@@ -3995,12 +5697,18 @@ def parser_summary_details(
         "rows_skipped": dataset.rows_skipped,
         "missing_values": dataset.missing_values,
         "rows_dropped": dataset.rows_dropped,
+        "rows_dropped_reason": dropped_rows_reason(dataset.rows_dropped),
+        "rows_dropped_fraction": dropped_rows_fraction_label(len(dataset.dataframe), dataset.rows_dropped),
+        "parser_cleanup_notice": cleanup_notice,
+        "parser_cleanup_severity": cleanup_severity,
         "unit_conversion": parser_unit_conversion_summary(potential_unit, current_unit, current_source, display_current_unit)
         if potential_col and current_col
         else "Not available",
         "scan_rate_estimate": scan_rate_estimate,
         "scan_rate_note": scan_rate_note,
         "cycle_count": cycle_count_summary(dataset, potential_col),
+        "reference_electrode_metadata": reference_electrode_metadata,
+        "electrode_area_metadata": electrode_area_metadata,
     }
 
 
@@ -4035,6 +5743,9 @@ def make_parser_summary(
             "rows_skipped_before_numeric_data": details["rows_skipped"],
             "missing_values": details["missing_values"],
             "rows_dropped": details["rows_dropped"],
+            "rows_dropped_reason": details["rows_dropped_reason"],
+            "rows_dropped_fraction": details["rows_dropped_fraction"],
+            "parser_cleanup_severity": details["parser_cleanup_severity"],
             "metadata_fields": len(dataset.metadata),
             "potential_range": details["potential_range"],
             "current_range": details["current_range"],
@@ -4046,8 +5757,10 @@ def make_parser_summary(
             "unit_header_audit": details["unit_header_audit"],
             "current_magnitude_warning": details["current_magnitude_warning"],
             "scan_rate_estimate": details["scan_rate_estimate"],
+            "reference_electrode_metadata": details["reference_electrode_metadata"],
+            "electrode_area_metadata": details["electrode_area_metadata"],
             "cycle_count": details["cycle_count"],
-            "warnings": "; ".join(dataset.warnings),
+            "warnings": details["warnings"],
         }
         for role in roles:
             row[f"detected_{role}"] = detected.get(role)
@@ -4057,7 +5770,7 @@ def make_parser_summary(
                 row[f"{role}_unit"] = resolve_role_unit_from_values("Auto", dataset, role, column, values)
         if experiment_type in {"cv", "lsv"} and detected.get("current"):
             row["current_source_guess"] = (
-                "Current density" if header_indicates_current_density(detected["current"]) else "Current"
+                current_source_guess_for_dataset(dataset, detected["current"])
             )
         rows.append(row)
     return pd.DataFrame(rows)
@@ -4104,9 +5817,7 @@ def cv_lsv_backend_warnings(parsed_datasets: list[ParsedDataset], experiment_typ
         for dataset in parsed_datasets:
             current_col = detect_experiment_columns(dataset, experiment_type).get("current")
             if current_col:
-                current_source_guesses.append(
-                    "Current density" if header_indicates_current_density(current_col) else "Current"
-                )
+                current_source_guesses.append(current_source_guess_for_dataset(dataset, current_col))
         if len(set(current_source_guesses)) > 1:
             warnings.append(
                 "Uploaded files appear to mix raw current and current-density columns. Use separate experiments or verify the current-source control before analysis."
@@ -4335,6 +6046,8 @@ def build_generic_results(
     lsv_threshold_display: Optional[float] = None,
     lsv_threshold_unit: Optional[str] = None,
     lsv_current_source: str = "Current",
+    lsv_electrode_area_cm2: float = 1.0,
+    lsv_selected_current_unit: str = "Auto",
 ) -> pd.DataFrame:
     rows = []
     for record in records:
@@ -4375,24 +6088,82 @@ def build_generic_results(
             potential_v = data["potential"]
             current_values = data["current"]
             current_summary_key = "current_density_A_cm2" if lsv_current_source == "Current density" else "current_A"
+            parsed_dataset = record.get("parsed_dataset")
+            scan_rate_estimate = "Not available"
+            reference_metadata = None
+            electrode_area_metadata = None
+            electrode_area_value = None
+            unit_confidence = "Not available"
+            unit_review_required = False
+            current_col = record.get("columns", {}).get("current")
+            if isinstance(parsed_dataset, ParsedDataset):
+                potential_col = record.get("columns", {}).get("potential")
+                scan_rate_estimate = scan_rate_estimate_summary(parsed_dataset, potential_col)
+                reference_metadata = reference_electrode_from_metadata(parsed_dataset.metadata)
+                electrode_area_metadata = electrode_area_metadata_summary(parsed_dataset.metadata)
+                electrode_area_value = electrode_area_metadata_value(parsed_dataset.metadata)
+                unit_confidence = current_unit_confidence(parsed_dataset, current_col, lsv_selected_current_unit)
+                unit_review_required = unit_confidence == "Low"
+            signal_kind = uploaded_signal_kind(parsed_dataset if isinstance(parsed_dataset, ParsedDataset) else None, current_col, lsv_current_source, lsv_selected_current_unit)
+            normalization_applied = lsv_current_source == "Current" and bool(
+                lsv_threshold_unit and is_current_density_unit(lsv_threshold_unit)
+            )
+            confirmed_unit = None
+            confirmed_unit_type = None
+            unit_confirmation_source = None
+            if unit_confidence == "Confirmed by user":
+                confirmed_unit = display_unit_label(
+                    current_unit_label_for_summary(lsv_selected_current_unit, lsv_current_source)
+                )
+                confirmed_unit_type = confirmation_unit_type(lsv_current_source)
+                unit_confirmation_source = "user"
             row.update(
                 {
                     "potential_min_V": float(np.nanmin(potential_v)),
                     "potential_max_V": float(np.nanmax(potential_v)),
                     f"{current_summary_key}_min": float(np.nanmin(current_values)),
                     f"{current_summary_key}_max": float(np.nanmax(current_values)),
+                    "scan_rate_estimate": scan_rate_estimate,
+                    "reference_electrode_metadata": reference_metadata,
+                    "electrode_area_metadata": electrode_area_metadata,
+                    "electrode_area_cm2": electrode_area_value or lsv_electrode_area_cm2,
+                    "unit_confidence": unit_confidence,
+                    "unit_review_required": unit_review_required,
+                    "y_axis_quantity": "Current density" if lsv_current_source == "Current density" else "Current",
+                    "uploaded_signal_kind": signal_kind,
+                    "normalization_applied": normalization_applied,
+                    "confirmed_unit": confirmed_unit,
+                    "confirmed_unit_type": confirmed_unit_type,
+                    "unit_confirmation_source": unit_confirmation_source,
                 }
             )
             if lsv_threshold_a is not None and lsv_threshold_a > 0:
-                result = calculate_esw(potential_v, current_values, lsv_threshold_a)
-                direction = lsv_scan_direction(potential_v)
-                onset_potential, onset_direction = select_lsv_onset(result, direction)
+                direction = lsv_analysis_direction(potential_v, current_values)
+                onset_result = analyze_lsv_onset(potential_v, current_values, lsv_threshold_a, direction)
+                threshold_magnitude, crossing_threshold = lsv_threshold_magnitude_and_crossing(
+                    lsv_threshold_a,
+                    lsv_threshold_unit or "display",
+                    lsv_current_source,
+                    lsv_electrode_area_cm2,
+                    onset_result.onset_direction or direction,
+                )
                 row.update(
                     {
                         f"threshold_{lsv_threshold_unit or 'display'}": lsv_threshold_display,
-                        "onset_direction": onset_direction or direction,
-                        "onset_potential_V": onset_potential,
-                        "operational_ESW_V": result.esw,
+                        "threshold_magnitude": threshold_magnitude,
+                        "crossing_threshold": crossing_threshold,
+                        "onset_direction": onset_result.onset_direction or direction,
+                        "onset_potential_V": onset_result.onset_potential,
+                        "onset_status": onset_result.status,
+                        "onset_confidence": onset_result.confidence,
+                        "onset_detection_method": onset_result.method,
+                        "onset_min_consecutive_points": onset_result.sustained_points_required,
+                        "onset_min_potential_window_V": onset_result.sustained_window_v,
+                        "onset_smoothing_method": onset_result.smoothing_method,
+                        "onset_smoothing_window": onset_result.smoothing_window,
+                        "rejected_onset_potential_V": onset_result.rejected_potential,
+                        "rejected_onset_reason": onset_result.rejected_reason,
+                        "operational_ESW_V": None,
                     }
                 )
         elif experiment_type == "eis":
@@ -4480,6 +6251,13 @@ def add_generic_trace(
 
         x_values, x_label, x_unit = lsv_axis_values(display_units.get("x_axis", "Potential"))
         y_values, y_label, y_unit = lsv_axis_values(display_units.get("y_axis", "Current density"))
+        if display_units.get("unit_review_required"):
+            if x_label != "Potential":
+                x_label = "Current density" if current_source == "Current density" else "Signal"
+                x_unit = "unit unconfirmed"
+            if y_label != "Potential":
+                y_label = "Current density" if current_source == "Current density" else "Signal"
+                y_unit = "unit unconfirmed"
         fig.add_trace(
             go.Scatter(
                 x=x_values,
@@ -4506,6 +6284,10 @@ def add_generic_trace(
 
 
 def render_detected_metadata(metadata: dict[str, str], manual_metadata_key: str) -> None:
+    manual_metadata = parse_manual_metadata_text(str(st.session_state.get(manual_metadata_key, "") or ""))
+    if manual_metadata:
+        metadata.update(manual_metadata)
+
     st.markdown("**Detected metadata**")
     parsed_rows, unparsed_rows = metadata_rows_for_display(metadata)
 
@@ -4643,10 +6425,44 @@ def render_generic_experiment_analysis(
         unit_cols = st.columns(min(3, len(roles)))
         for idx, role in enumerate(roles):
             with unit_cols[idx % len(unit_cols)]:
+                unit_options = unit_options_for_role(role)
+                unit_index = 0
+                unit_widget_key = f"generic_unit::{project_name}::{experiment_id}::{role}"
+                detected_column_for_role = (
+                    selected_detected.get(role)
+                    if column_mode == "Use detected columns per file"
+                    else manual_columns.get(role)
+                )
+                if is_lsv and role == "current":
+                    current_source_key_for_unit = lsv_current_source_state_key(
+                        project_name,
+                        experiment_id,
+                        selected_filename,
+                        detected_column_for_role,
+                    )
+                    confirmed_source_for_unit = confirmed_unit_source_for_lsv(
+                        selected_dataset,
+                        detected_column_for_role,
+                        current_source_key_for_unit,
+                    )
+                    confirmed_unit_key = (
+                        f"lsv_confirmed_current_unit::{project_name}::{experiment_id}::"
+                        f"{selected_dataset.filename}::{detected_column_for_role or role}"
+                    )
+                    confirmed_unit = st.session_state.get(confirmed_unit_key)
+                    confirmed_input_unit = unit_input_from_confirmed_unit(
+                        confirmed_unit,
+                        confirmed_source_for_unit,
+                    )
+                    if confirmed_input_unit in unit_options:
+                        unit_index = unit_options.index(confirmed_input_unit)
+                        if st.session_state.get(unit_widget_key) != confirmed_input_unit:
+                            st.session_state[unit_widget_key] = confirmed_input_unit
                 selected_units[role] = st.selectbox(
                     f"{role_label(role)} input unit",
-                    unit_options_for_role(role),
-                    key=f"generic_unit::{project_name}::{experiment_id}::{role}",
+                    unit_options,
+                    index=unit_index,
+                    key=unit_widget_key,
                 )
 
     if is_lsv and lsv_details_container is not None:
@@ -4708,12 +6524,15 @@ def render_generic_experiment_analysis(
                 current_col_for_units,
             )
 
-            current_source_default = 1 if current_col_for_units and header_indicates_current_density(current_col_for_units) else 0
-            current_source_key = (
-                f"lsv_current_source::{project_name}::{experiment_id}::"
-                f"{selected_filename}::{current_col_for_units or 'current'}"
+            inferred_current_source = current_source_guess_for_dataset(selected_dataset, current_col_for_units)
+            current_source_default = 1 if inferred_current_source == "Current density" else 0
+            current_source_key = lsv_current_source_state_key(
+                project_name,
+                experiment_id,
+                selected_filename,
+                current_col_for_units,
             )
-            if current_source_default == 1 and st.session_state.get(current_source_key) != "Current density":
+            if current_source_default == 1 and current_source_key not in st.session_state:
                 st.session_state[current_source_key] = "Current density"
             display_units["current_source"] = st.selectbox(
                 "Uploaded current column contains",
@@ -4766,7 +6585,10 @@ def render_generic_experiment_analysis(
             )
             if display_units["current_source"] == "Current density":
                 display_units["electrode_area_cm2"] = 1.0
-                st.info("The uploaded current column is already normalized, so electrode-area normalization is skipped.")
+                if current_col_for_units and header_indicates_current_density(current_col_for_units):
+                    st.info("The uploaded current column is already normalized, so electrode-area normalization is skipped.")
+                else:
+                    st.info("Uploaded signal appears to be current density; electrode-area normalization was skipped.")
                 detected_area_metadata = electrode_area_metadata_summary(selected_dataset.metadata)
                 if detected_area_metadata:
                     st.info(
@@ -4774,13 +6596,17 @@ def render_generic_experiment_analysis(
                         "No additional normalization applied."
                     )
             elif uses_current_density_axis:
+                area_key = f"lsv_electrode_area::{project_name}::{experiment_id}"
+                metadata_area_value = electrode_area_metadata_value(selected_dataset.metadata)
+                if metadata_area_value is not None and area_key not in st.session_state:
+                    st.session_state[area_key] = metadata_area_value
                 display_units["electrode_area_cm2"] = st.number_input(
                     "Electrode surface area (cm^2)",
                     min_value=0.000001,
-                    value=1.0,
+                    value=metadata_area_value or 1.0,
                     step=0.1,
                     format="%.6f",
-                    key=f"lsv_electrode_area::{project_name}::{experiment_id}",
+                    key=area_key,
                 )
                 area_text = (
                     f"{float(display_units['electrode_area_cm2']):.1f}"
@@ -4825,6 +6651,18 @@ def render_generic_experiment_analysis(
     if experiment_type == "lsv":
         electrode_area_cm2 = float(display_units.get("electrode_area_cm2", 1.0))
         current_source = display_units.get("current_source", "Current")
+        selected_dataset_for_review = next(
+            (dataset for dataset in parsed_datasets if dataset.filename == selected_filename),
+            selected_dataset,
+        )
+        selected_current_col_for_review = (
+            detect_experiment_columns(selected_dataset_for_review, "lsv").get("current")
+        )
+        display_units["unit_review_required"] = current_unit_is_ambiguous(
+            selected_dataset_for_review,
+            selected_current_col_for_review,
+            selected_units.get("current", "Auto"),
+        )
         display_units["current"] = lsv_display_unit_for_records(
             records,
             current_source,
@@ -4964,6 +6802,51 @@ def render_generic_experiment_analysis(
                         selected_units.get("current", "Auto"),
                     )
                 )
+                if (
+                    selected_current_unit_review_needed
+                    and isinstance(selected_parsed_dataset, ParsedDataset)
+                    and selected_current_col in selected_parsed_dataset.dataframe
+                ):
+                    selected_current_values = selected_parsed_dataset.dataframe[selected_current_col].to_numpy(dtype=float)
+                    selected_suggested_unit = suggested_current_unit_for_context(
+                        selected_current_values,
+                        display_units.get("current_source", "Current"),
+                    )
+                    selected_unit_review_warning = current_unit_magnitude_warning(
+                        selected_parsed_dataset,
+                        selected_current_col,
+                        selected_units.get("current", "Auto"),
+                        "A",
+                        display_units.get("current_source", "Current"),
+                        float(display_units.get("electrode_area_cm2", 1.0)),
+                    )
+                    render_unit_review_panel(
+                        current_col=selected_current_col,
+                        current_col_label=user_facing_column_label(selected_parsed_dataset, selected_current_col),
+                        suggested_unit=selected_suggested_unit,
+                        current_source=display_units.get("current_source", "Current"),
+                        current_unit_warning=selected_unit_review_warning,
+                        confirmed_current_unit_key=(
+                            f"lsv_confirmed_current_unit::{project_name}::{experiment_id}::"
+                            f"{selected_parsed_dataset.filename}::{selected_current_col}"
+                        ),
+                        confirmed_unit_type_key=(
+                            f"lsv_confirmed_current_unit_type::{project_name}::{experiment_id}::"
+                            f"{selected_parsed_dataset.filename}::{selected_current_col}"
+                        ),
+                        unit_confirmation_source_key=(
+                            f"lsv_unit_confirmation_source::{project_name}::{experiment_id}::"
+                            f"{selected_parsed_dataset.filename}::{selected_current_col}"
+                        ),
+                        selectbox_key=(
+                            f"lsv_confirm_current_unit_choice::{project_name}::{experiment_id}::"
+                            f"{selected_parsed_dataset.filename}::{selected_current_col}"
+                        ),
+                        button_key=(
+                            f"lsv_apply_current_unit::{project_name}::{experiment_id}::"
+                            f"{selected_parsed_dataset.filename}::{selected_current_col}"
+                        ),
+                    )
                 selected_current_magnitude_review_needed = False
                 if isinstance(selected_parsed_dataset, ParsedDataset):
                     selected_details = parser_summary_details(
@@ -4985,7 +6868,7 @@ def render_generic_experiment_analysis(
                         )
                     )
                 st.markdown(
-                    f"<div class=\"analysis-file\">{escape_html(format_lsv_display_state(display_units, lsv_threshold_a, reference_electrode, selected_metadata_area))}</div>",
+                    f"<div class=\"analysis-file\">{escape_html(format_lsv_display_state(display_units, lsv_threshold_a, reference_electrode, selected_metadata_area, bool(display_units.get('unit_review_required'))))}</div>",
                     unsafe_allow_html=True,
                 )
                 render_lsv_analysis_summary(
@@ -5010,27 +6893,33 @@ def render_generic_experiment_analysis(
             add_generic_trace(fig, record, experiment_type, display_units, show_markers)
 
         if experiment_type == "lsv" and lsv_threshold_display is not None and lsv_threshold_display > 0:
+            positive_threshold_label, negative_threshold_label = lsv_threshold_plot_labels(
+                lsv_threshold_display,
+                lsv_threshold_unit,
+                selected_threshold_direction,
+                bool(display_units.get("unit_review_required")),
+            )
             if display_units.get("y_axis") in {"Current", "Current density"}:
                 fig.add_hline(
                     y=lsv_threshold_display,
                     line_dash="dot",
-                    annotation_text=f"+{lsv_threshold_display:g} {display_unit_label(lsv_threshold_unit)}",
+                    annotation_text=positive_threshold_label,
                 )
                 fig.add_hline(
                     y=-lsv_threshold_display,
                     line_dash="dot",
-                    annotation_text=f"-{lsv_threshold_display:g} {display_unit_label(lsv_threshold_unit)}",
+                    annotation_text=negative_threshold_label,
                 )
             elif display_units.get("x_axis") in {"Current", "Current density"}:
                 fig.add_vline(
                     x=lsv_threshold_display,
                     line_dash="dot",
-                    annotation_text=f"+{lsv_threshold_display:g} {display_unit_label(lsv_threshold_unit)}",
+                    annotation_text=positive_threshold_label,
                 )
                 fig.add_vline(
                     x=-lsv_threshold_display,
                     line_dash="dot",
-                    annotation_text=f"-{lsv_threshold_display:g} {display_unit_label(lsv_threshold_unit)}",
+                    annotation_text=negative_threshold_label,
                 )
 
             selected_lsv_record = next(
@@ -5129,9 +7018,11 @@ def render_generic_experiment_analysis(
         plot_html = fig.to_html(full_html=True, include_plotlyjs="cdn")
         st.download_button(
             "Download interactive plot as HTML",
-            data=plot_html,
+            data=plot_html.encode("utf-8"),
             file_name=f"voltscope_{experiment_type}_plot.html",
             mime="text/html",
+            key=f"download_generic_plot::{project_name}::{experiment_id}::{experiment_type}",
+            on_click="ignore",
         )
 
     results_df = build_generic_results(
@@ -5141,6 +7032,8 @@ def render_generic_experiment_analysis(
         lsv_threshold_display=lsv_threshold_display,
         lsv_threshold_unit=lsv_threshold_unit,
         lsv_current_source=display_units.get("current_source", "Current"),
+        lsv_electrode_area_cm2=float(display_units.get("electrode_area_cm2", 1.0)),
+        lsv_selected_current_unit=selected_units.get("current", "Auto"),
     )
     metrics_context = lsv_metrics_container if lsv_metrics_container is not None else nullcontext()
     with metrics_context:
@@ -5177,9 +7070,11 @@ def render_generic_experiment_analysis(
         export_buffer.write(results_df.to_csv(index=False))
         st.download_button(
             "Download analysis results as CSV",
-            data=export_buffer.getvalue(),
+            data=export_buffer.getvalue().encode("utf-8"),
             file_name=f"voltscope_{experiment_type}_analysis_results.csv",
             mime="text/csv",
+            key=f"download_generic_analysis::{project_name}::{experiment_id}::{experiment_type}",
+            on_click="ignore",
         )
 
     store_generic_experiment_analysis(
@@ -5246,6 +7141,7 @@ def dataframe_records(dataframe: pd.DataFrame) -> list[dict[str, Any]]:
 
 
 def serialize_parsed_dataset(dataset: ParsedDataset) -> dict[str, Any]:
+    cleanup_notice = dropped_rows_cleanup_notice(len(dataset.dataframe), dataset.rows_dropped)
     return {
         "filename": dataset.filename,
         "dataframe": dataframe_records(dataset.dataframe),
@@ -5257,6 +7153,10 @@ def serialize_parsed_dataset(dataset: ParsedDataset) -> dict[str, Any]:
         "data_start_row": dataset.data_start_row,
         "rows_skipped": dataset.rows_skipped,
         "rows_dropped": dataset.rows_dropped,
+        "rows_dropped_reason": dropped_rows_reason(dataset.rows_dropped),
+        "rows_dropped_fraction": dropped_rows_fraction_label(len(dataset.dataframe), dataset.rows_dropped),
+        "parser_cleanup_notice": cleanup_notice,
+        "parser_cleanup_severity": dropped_rows_severity(len(dataset.dataframe), dataset.rows_dropped),
         "missing_values": dataset.missing_values,
         "detected_potential_col": dataset.detected_potential_col,
         "detected_current_col": dataset.detected_current_col,
@@ -6406,14 +8306,18 @@ def render_unit_review_panel(
     current_col: str,
     current_col_label: str,
     suggested_unit: str,
+    current_source: str = "Current",
     current_unit_warning: str,
     confirmed_current_unit_key: str,
     selectbox_key: str,
     button_key: str,
+    confirmed_unit_type_key: Optional[str] = None,
+    unit_confirmation_source_key: Optional[str] = None,
 ) -> None:
-    suggested_label = display_unit_label(suggested_unit)
-    explanation = current_unit_review_explanation(current_col_label, suggested_unit, current_unit_warning)
-    reason = current_unit_review_reason(suggested_unit, current_unit_warning)
+    suggested_display_unit = current_unit_label_for_summary(suggested_unit, current_source)
+    suggested_label = display_unit_label(suggested_display_unit)
+    explanation = current_unit_review_explanation(current_col_label, suggested_display_unit, current_unit_warning)
+    reason = current_unit_review_reason(suggested_display_unit, current_unit_warning)
     st.markdown(
         f"""
         <div class="analysis-card">
@@ -6441,11 +8345,11 @@ def render_unit_review_panel(
         unsafe_allow_html=True,
     )
     confirm_col1, confirm_col2 = st.columns([2, 1])
-    confirm_unit_options = ["A", "mA", "uA", "nA", "pA"]
-    suggested_value = suggested_unit if suggested_unit in confirm_unit_options else "uA"
+    confirm_unit_options = confirmation_unit_options(current_source)
+    suggested_value = suggested_display_unit if suggested_display_unit in confirm_unit_options else confirm_unit_options[0]
     with confirm_col1:
         confirm_choice = st.selectbox(
-            "Confirm current unit",
+            "Confirm current unit" if current_source == "Current" else "Confirm current-density unit",
             confirm_unit_options,
             index=confirm_unit_options.index(suggested_value),
             key=selectbox_key,
@@ -6456,6 +8360,10 @@ def render_unit_review_panel(
         st.write("")
         if st.button("Apply unit", key=button_key):
             st.session_state[confirmed_current_unit_key] = confirm_choice
+            if confirmed_unit_type_key:
+                st.session_state[confirmed_unit_type_key] = confirmation_unit_type(current_source)
+            if unit_confirmation_source_key:
+                st.session_state[unit_confirmation_source_key] = "user"
             st.rerun()
 
 
@@ -6498,6 +8406,9 @@ def render_parser_summary(
         ("Rows skipped before numeric data", "rows_skipped"),
         ("Missing values", "missing_values"),
         ("Rows dropped", "rows_dropped"),
+        ("Rows dropped reason", "rows_dropped_reason"),
+        ("Rows dropped fraction", "rows_dropped_fraction"),
+        ("Parser cleanup severity", "parser_cleanup_severity"),
         ("Unit conversion", "unit_conversion"),
         ("Scan rate estimate", "scan_rate_estimate"),
         ("Scan rate note", "scan_rate_note"),
@@ -6518,6 +8429,8 @@ def render_parser_summary(
         combined_warnings = []
         if dataset.warnings:
             combined_warnings.extend(dataset.warnings)
+        if details.get("parser_cleanup_notice"):
+            combined_warnings.append(str(details["parser_cleanup_notice"]))
         combined_warnings.extend(backend_warnings_by_file.get(dataset.filename, []))
         if details.get("unit_header_warning"):
             combined_warnings.append(str(details["unit_header_warning"]))
@@ -6525,12 +8438,15 @@ def render_parser_summary(
             combined_warnings.append(str(details["current_unit_warning"]))
         if details.get("current_magnitude_warning") and not magnitude_warning_acknowledged:
             combined_warnings.append(str(details["current_magnitude_warning"]))
+        combined_warnings = unique_messages([warning for warning in combined_warnings if warning])
         unit_review_required = details.get("current_unit_confidence") == "Low"
-        details["warnings"] = (
-            "Unit review required"
-            if unit_review_required
-            else "; ".join(combined_warnings) if combined_warnings else "None"
-        )
+        if unit_review_required:
+            review_warnings = ["Unit review required"]
+            if details.get("parser_cleanup_notice"):
+                review_warnings.append(str(details["parser_cleanup_notice"]))
+            details["warnings"] = "; ".join(unique_messages(review_warnings))
+        else:
+            details["warnings"] = "; ".join(combined_warnings) if combined_warnings else "None"
 
         if unit_review_required:
             current_unit_summary = "Ambiguous"
@@ -6583,6 +8499,15 @@ def render_parser_summary(
                 ],
             ),
         ]
+        metadata_lines = []
+        if details.get("scan_rate_estimate") not in {None, "", "Not available"}:
+            metadata_lines.append(("Scan rate", summarize_scan_rate_for_card(str(details["scan_rate_estimate"])) or details["scan_rate_estimate"]))
+        if details.get("reference_electrode_metadata") not in {None, "", "Not detected"}:
+            metadata_lines.append(("Reference electrode", details["reference_electrode_metadata"]))
+        if details.get("electrode_area_metadata") not in {None, "", "Not detected"}:
+            metadata_lines.append(("Electrode area", details["electrode_area_metadata"]))
+        if metadata_lines:
+            summary_cards.append(("Detected metadata", metadata_lines))
 
         metric_html = "\n".join(
             f"""
@@ -6626,6 +8551,8 @@ def render_parser_summary(
             ]
             advanced_rows.extend(
                 [
+                    {"Field": "Detected reference electrode", "Value": str(details["reference_electrode_metadata"])},
+                    {"Field": "Detected electrode area", "Value": str(details["electrode_area_metadata"])},
                     {"Field": "Raw potential column", "Value": str(details["raw_potential_column"])},
                     {"Field": f"Raw {y_quantity.lower()} column", "Value": str(details["raw_current_column"])},
                     {"Field": "Raw potential range", "Value": str(details["raw_potential_range"])},
@@ -6964,6 +8891,7 @@ def main() -> None:
     selected_dataset = next(dataset for dataset in parsed_datasets if dataset.filename == selected_filename)
 
     cv_summary_container = st.container()
+    cv_couple_selector_container = st.container()
     cv_plot_container = st.container()
     cv_metrics_container = st.container()
     peak_controls_expander = st.expander("Peak Selection & Baseline Correction", expanded=False)
@@ -7031,7 +8959,7 @@ def main() -> None:
         with unit_col3:
             y_axis_quantity = st.selectbox("Y-axis quantity", ["Current", "Current density"])
 
-        source_default = 1 if header_indicates_current_density(manual_current_col) else 0
+        source_default = 1 if current_source_guess_for_dataset(selected_dataset, manual_current_col) == "Current density" else 0
         current_source = st.selectbox(
             "Uploaded current column contains",
             ["Current", "Current density"],
@@ -7114,8 +9042,17 @@ def main() -> None:
                 current_col=manual_current_col,
                 current_col_label=user_facing_column_label(selected_dataset, manual_current_col),
                 suggested_unit=suggested_current_unit,
+                current_source=current_source,
                 current_unit_warning=unit_review_warning,
                 confirmed_current_unit_key=confirmed_current_unit_key,
+                confirmed_unit_type_key=(
+                    f"cv_confirmed_current_unit_type::{active_project_name}::{experiment_id}::"
+                    f"{selected_dataset.filename}::{manual_current_col}"
+                ),
+                unit_confirmation_source_key=(
+                    f"cv_unit_confirmation_source::{active_project_name}::{experiment_id}::"
+                    f"{selected_dataset.filename}::{manual_current_col}"
+                ),
                 selectbox_key=(
                     f"cv_confirm_current_unit_choice::{active_project_name}::"
                     f"{experiment_id}::{selected_dataset.filename}::{manual_current_col}"
@@ -7257,11 +9194,13 @@ def main() -> None:
         st.stop()
         return
 
+    baseline_background_suspected = detect_sloped_baseline_background(selected_potential_v, analysis_current_a)
+
     with peak_controls_expander:
         st.subheader("Peak Selection & Baseline Correction")
         st.caption(
             "Method: split the CV into forward and reverse scans, ignore the first/last 5% of each scan, "
-            "then select oxidation from the increasing scan maximum and reduction from the decreasing scan minimum."
+            "then select Epa/Epc from local extrema using scan direction, current sign, prominence, and noise."
         )
         current_display_values = current_to_display(
             analysis_current_a,
@@ -7431,13 +9370,74 @@ def main() -> None:
                 else:
                     st.info("No reduction peaks detected. Lower the prominence threshold or use manual selection.")
 
+        raw_selected_oxidation_peak = selected_oxidation_peak
+        raw_selected_reduction_peak = selected_reduction_peak
+        _behavior_rows, behavior_metrics = build_peak_metrics_rows(
+            raw_selected_oxidation_peak,
+            raw_selected_reduction_peak,
+            None,
+            analysis_current_a,
+            current_display_unit,
+            electrode_area_cm2,
+            current_source,
+        )
+        cv_behavior = classify_cv_behavior(
+            raw_selected_oxidation_peak,
+            raw_selected_reduction_peak,
+            behavior_metrics,
+            selected_potential_v,
+            peaks,
+            baseline_background_suspected,
+        )
+        show_all_detected_couples = False
+        if cv_behavior.behavior == "multiple_redox_couples" and cv_behavior.redox_couples:
+            with cv_couple_selector_container:
+                st.markdown("**Redox couple selection**")
+                couple_labels = [redox_couple_option_label(couple) for couple in cv_behavior.redox_couples]
+                selected_couple_label = st.selectbox(
+                    "Analyze redox couple",
+                    couple_labels,
+                    index=cv_behavior.selected_couple_index or 0,
+                    key=f"cv_selected_redox_couple::{active_project_name}::{experiment_id}::{selected_filename}",
+                )
+                selected_couple_index = couple_labels.index(selected_couple_label)
+                cv_behavior = behavior_from_redox_couple(cv_behavior, selected_couple_index)
+                couple_table = redox_couples_display_table(cv_behavior.redox_couples, selected_couple_index)
+
+                def highlight_selected_couple(row: pd.Series) -> list[str]:
+                    if row.get("Selected?") == "Selected":
+                        return ["background-color: #fff7ed; font-weight: 600;" for _ in row]
+                    return ["" for _ in row]
+
+                with st.expander("Detected couples", expanded=True):
+                    st.table(couple_table.style.apply(highlight_selected_couple, axis=1))
+                show_all_detected_couples = st.checkbox(
+                    "Show all detected couples on plot",
+                    value=False,
+                    key=f"cv_show_redox_couples::{active_project_name}::{experiment_id}::{selected_filename}",
+                )
+        selected_oxidation_peak = cv_behavior.oxidation_peak
+        selected_reduction_peak = cv_behavior.reduction_peak
+
         selected_primary_rows = []
+        missing_primary_status = {
+            "Selected primary Epa": (
+                "No reliable anodic peak"
+                if cv_behavior.behavior == "irreversible_reduction_only"
+                else "Not selected"
+            ),
+            "Selected primary Epc": (
+                "No reliable cathodic peak"
+                if cv_behavior.behavior == "irreversible_oxidation_only"
+                else "Not selected"
+            ),
+        }
         for role, peak in [("Selected primary Epa", selected_oxidation_peak), ("Selected primary Epc", selected_reduction_peak)]:
             if peak is None:
                 selected_primary_rows.append(
                     {
                         "role": role,
-                        "status": "Not selected",
+                        "status": missing_primary_status.get(role, "Not selected"),
                         "potential_V": None,
                         f"current_{current_display_unit}": None,
                         "scan": None,
@@ -7449,6 +9449,28 @@ def main() -> None:
                 {
                     "role": role,
                     "status": "Used for CV metrics",
+                    "potential_V": peak.potential,
+                    f"current_{current_display_unit}": current_to_display(
+                        np.array([analysis_current_a[peak.index]]),
+                        current_display_unit,
+                        current_source,
+                        electrode_area_cm2,
+                    )[0],
+                    "scan": scan_direction_label(peak.segment_direction),
+                    "confidence": peak.confidence,
+                }
+            )
+        rejected_peak_reasons = candidate_rejection_reasons(cv_behavior)
+        for role, peak in [
+            ("Rejected candidate Epa", cv_behavior.rejected_oxidation_peak),
+            ("Rejected candidate Epc", cv_behavior.rejected_reduction_peak),
+        ]:
+            if peak is None:
+                continue
+            selected_primary_rows.append(
+                {
+                    "role": role,
+                    "status": rejected_peak_reasons.get(peak.id, "Rejected as primary peak"),
                     "potential_V": peak.potential,
                     f"current_{current_display_unit}": current_to_display(
                         np.array([analysis_current_a[peak.index]]),
@@ -7536,15 +9558,67 @@ def main() -> None:
             )
             st.dataframe(anchor_summary, width="stretch")
 
+        if baseline_current is not None:
+            corrected_current_for_peak_selection = analysis_current_a - baseline_current
+            corrected_peaks = detect_peaks(
+                selected_potential_v,
+                corrected_current_for_peak_selection,
+                min_prominence_a,
+                int(min_distance),
+                min_abs_current_a,
+            )
+            peaks = corrected_peaks
+            if manual_peak_override:
+                if raw_selected_oxidation_peak is not None:
+                    raw_selected_oxidation_peak = make_manual_peak(
+                        "oxidation",
+                        raw_selected_oxidation_peak.index,
+                        selected_potential_v,
+                        corrected_current_for_peak_selection,
+                    )
+                if raw_selected_reduction_peak is not None:
+                    raw_selected_reduction_peak = make_manual_peak(
+                        "reduction",
+                        raw_selected_reduction_peak.index,
+                        selected_potential_v,
+                        corrected_current_for_peak_selection,
+                    )
+            else:
+                raw_selected_oxidation_peak, raw_selected_reduction_peak = select_default_primary_peaks(peaks)
+
+            _behavior_rows, behavior_metrics = build_peak_metrics_rows(
+                raw_selected_oxidation_peak,
+                raw_selected_reduction_peak,
+                baseline_current,
+                analysis_current_a,
+                current_display_unit,
+                electrode_area_cm2,
+                current_source,
+            )
+            cv_behavior = classify_cv_behavior(
+                raw_selected_oxidation_peak,
+                raw_selected_reduction_peak,
+                behavior_metrics,
+                selected_potential_v,
+                peaks,
+                baseline_background_suspected,
+            )
+            selected_oxidation_peak = cv_behavior.oxidation_peak
+            selected_reduction_peak = cv_behavior.reduction_peak
+            rejected_peak_reasons = candidate_rejection_reasons(cv_behavior)
+
     with candidate_peaks_expander:
-        st.caption(
-            "Candidate peaks are local extrema retained for transparency. Only the selected Epa/Epc pair is used for CV metrics."
-        )
+        st.caption(candidate_peak_explanation(cv_behavior))
         candidate_display_filter = st.selectbox(
             "Candidate peak display",
             CANDIDATE_PEAK_FILTER_OPTIONS,
             index=CANDIDATE_PEAK_FILTER_OPTIONS.index("Top candidates"),
             key=f"cv_candidate_peak_display::{active_project_name}::{experiment_id}::{selected_filename}",
+        )
+        show_candidate_debug_columns = st.checkbox(
+            "Show debug columns",
+            value=False,
+            key=f"cv_candidate_debug_columns::{active_project_name}::{experiment_id}::{selected_filename}",
         )
         include_all_cycle_candidates = False
         if len(cycle_values) > 1:
@@ -7555,30 +9629,89 @@ def main() -> None:
             )
         candidate_source_peaks = all_cycle_peaks if include_all_cycle_candidates else peaks
         candidate_source_potential = detailed_dataset.potential_v if include_all_cycle_candidates else selected_potential_v
+        candidate_display_label = display_unit_label(current_display_unit)
         selected_peak_roles = {}
         if selected_oxidation_peak is not None:
             selected_peak_roles[selected_oxidation_peak.id] = "Selected Epa"
         if selected_reduction_peak is not None:
             selected_peak_roles[selected_reduction_peak.id] = "Selected Epc"
+        rejected_peak_roles = {}
+        if cv_behavior.rejected_oxidation_peak is not None:
+            rejected_peak_roles[cv_behavior.rejected_oxidation_peak.id] = "Rejected candidate Epa"
+        if cv_behavior.rejected_reduction_peak is not None:
+            rejected_peak_roles[cv_behavior.rejected_reduction_peak.id] = "Rejected candidate Epc"
+        couple_peak_roles: dict[str, str] = {}
+        couple_peak_ids: dict[str, str] = {}
+        couple_peak_reasons: dict[str, str] = {}
+        if cv_behavior.behavior == "multiple_redox_couples" and cv_behavior.redox_couples:
+            selected_couple_index = cv_behavior.selected_couple_index or 0
+            for idx, couple in enumerate(cv_behavior.redox_couples):
+                is_selected_couple = idx == selected_couple_index
+                ox_role = "Selected couple Epa" if is_selected_couple else "Candidate couple Epa"
+                red_role = "Selected couple Epc" if is_selected_couple else "Candidate couple Epc"
+                reason = (
+                    "Used in selected redox-couple metrics."
+                    if is_selected_couple
+                    else f"Paired as {couple.id}; not selected for main metrics."
+                )
+                couple_peak_roles[couple.oxidation_peak.id] = ox_role
+                couple_peak_roles[couple.reduction_peak.id] = red_role
+                couple_peak_ids[couple.oxidation_peak.id] = couple.id
+                couple_peak_ids[couple.reduction_peak.id] = couple.id
+                couple_peak_reasons[couple.oxidation_peak.id] = reason
+                couple_peak_reasons[couple.reduction_peak.id] = reason
+        for message in candidate_peak_ambiguity_messages(
+            candidate_source_peaks,
+            selected_oxidation_peak,
+            selected_reduction_peak,
+        ):
+            st.warning(message)
 
-        full_candidate_rows = [
-            {
-                "role": selected_peak_roles.get(peak.id, "Candidate"),
+        def candidate_role_for_peak(peak: Peak) -> str:
+            if peak.id in couple_peak_roles:
+                return couple_peak_roles[peak.id]
+            if peak.id in selected_peak_roles:
+                return selected_peak_roles[peak.id]
+            if peak.id in rejected_peak_roles:
+                return rejected_peak_roles[peak.id]
+            if cv_behavior.behavior == "multiple_redox_couples":
+                if peak.peak_type == "oxidation":
+                    return "Unpaired oxidation candidate"
+                if peak.peak_type == "reduction":
+                    return "Unpaired reduction candidate"
+            return "Candidate"
+
+        def candidate_reason_for_peak(peak: Peak) -> str:
+            if peak.id in couple_peak_reasons:
+                return couple_peak_reasons[peak.id]
+            if peak.id in rejected_peak_reasons:
+                return rejected_peak_reasons[peak.id]
+            if cv_behavior.behavior == "multiple_redox_couples":
+                return "No plausible unused partner assigned by the current pairing heuristic."
+            return ""
+
+        full_candidate_rows = []
+        for peak in candidate_source_peaks:
+            row = {
+                "role": candidate_role_for_peak(peak),
+                "couple_id": couple_peak_ids.get(peak.id, ""),
                 "id": peak.id,
                 "extremum": local_extremum_label(peak),
-                "index": peak.index,
                 "potential_V": peak.potential,
-                f"current_{current_display_unit}": current_to_display(
+                f"current_{candidate_display_label}": current_to_display(
                     np.array([peak.raw_current]), current_display_unit, current_source, electrode_area_cm2
                 )[0],
-                f"prominence_{current_display_unit}": current_to_display(
+                f"prominence_{candidate_display_label}": current_to_display(
                     np.array([peak.prominence]), current_display_unit, current_source, electrode_area_cm2
                 )[0],
                 "scan": scan_direction_label(peak.segment_direction),
                 "confidence": peak.confidence,
+                "reason": candidate_reason_for_peak(peak),
             }
-            for peak in candidate_source_peaks
-        ]
+            if show_candidate_debug_columns:
+                row = {"index": peak.index, **row}
+            full_candidate_rows.append(row)
+
         displayed_candidate_peaks = filter_candidate_peaks_for_display(
             candidate_source_peaks,
             selected_oxidation_peak,
@@ -7586,24 +9719,27 @@ def main() -> None:
             candidate_display_filter,
             potential=candidate_source_potential,
         )
-        displayed_candidate_rows = [
-            {
-                "role": selected_peak_roles.get(peak.id, "Candidate"),
+        displayed_candidate_rows = []
+        for peak in displayed_candidate_peaks:
+            row = {
+                "role": candidate_role_for_peak(peak),
+                "couple_id": couple_peak_ids.get(peak.id, ""),
                 "id": peak.id,
                 "extremum": local_extremum_label(peak),
-                "index": peak.index,
                 "potential_V": peak.potential,
-                f"current_{current_display_unit}": current_to_display(
+                f"current_{candidate_display_label}": current_to_display(
                     np.array([peak.raw_current]), current_display_unit, current_source, electrode_area_cm2
                 )[0],
-                f"prominence_{current_display_unit}": current_to_display(
+                f"prominence_{candidate_display_label}": current_to_display(
                     np.array([peak.prominence]), current_display_unit, current_source, electrode_area_cm2
                 )[0],
                 "scan": scan_direction_label(peak.segment_direction),
                 "confidence": peak.confidence,
+                "reason": candidate_reason_for_peak(peak),
             }
-            for peak in displayed_candidate_peaks
-        ]
+            if show_candidate_debug_columns:
+                row = {"index": peak.index, **row}
+            displayed_candidate_rows.append(row)
         if displayed_candidate_rows:
             if candidate_display_filter == "Top candidates":
                 st.caption(
@@ -7622,9 +9758,11 @@ def main() -> None:
             full_candidate_csv = pd.DataFrame(full_candidate_rows).to_csv(index=False)
             st.download_button(
                 "Download full candidate peaks CSV",
-                data=full_candidate_csv,
+                data=full_candidate_csv.encode("utf-8"),
                 file_name=f"{Path(selected_filename).stem}_candidate_peaks.csv",
                 mime="text/csv",
+                key=f"download_cv_candidate_peaks::{active_project_name}::{experiment_id}::{selected_filename}",
+                on_click="ignore",
             )
 
 
@@ -7655,6 +9793,7 @@ def main() -> None:
             metrics,
             selected_oxidation_peak,
             selected_reduction_peak,
+            cv_behavior,
             auto_tune_peak_settings,
         )
 
@@ -7663,6 +9802,8 @@ def main() -> None:
         selected_reduction_peak,
         metrics,
         selected_potential_v,
+        peaks,
+        cv_behavior,
     )
     current_unit_review_needed = detailed_parser_details.get("current_unit_confidence") == "Low"
     parser_confidence = parser_confidence_from_details(detailed_parser_details)
@@ -7708,6 +9849,8 @@ def main() -> None:
             str(detailed_parser_details.get("current_unit_confidence") or "High"),
             parser_confidence,
             current_scale_warning,
+            peaks,
+            cv_behavior,
         )
 
     fig = go.Figure()
@@ -7860,12 +10003,39 @@ def main() -> None:
                     electrode_area_cm2,
                 ),
                 mode="markers+text",
-                name="Selected Epa/Epc",
+                name=selected_peak_legend_label(cv_behavior),
                 text=["Epa" if peak.peak_type == "oxidation" else "Epc" for peak in selected_peaks],
                 textposition="top center",
                 marker={"size": 14, "symbol": "star", "line": {"width": 1}},
             )
         )
+
+    if (
+        show_all_detected_couples
+        and cv_behavior.behavior == "multiple_redox_couples"
+        and cv_behavior.redox_couples
+    ):
+        selected_couple_index = cv_behavior.selected_couple_index or 0
+        for idx, couple in enumerate(cv_behavior.redox_couples):
+            if idx == selected_couple_index:
+                continue
+            couple_peaks = [couple.oxidation_peak, couple.reduction_peak]
+            fig.add_trace(
+                go.Scatter(
+                    x=[peak.potential for peak in couple_peaks],
+                    y=current_to_display(
+                        np.array([analysis_current_a[peak.index] for peak in couple_peaks]),
+                        current_display_unit,
+                        current_source,
+                        electrode_area_cm2,
+                    ),
+                    mode="markers+text",
+                    name=couple.id,
+                    text=["Epa", "Epc"],
+                    textposition="bottom center",
+                    marker={"size": 10, "symbol": "diamond-open", "line": {"width": 1}},
+                )
+            )
 
     if baseline_current is not None:
         fig.add_trace(
@@ -7916,9 +10086,11 @@ def main() -> None:
             plot_html = fig.to_html(full_html=True, include_plotlyjs="cdn")
             st.download_button(
                 "Download interactive plot as HTML",
-                data=plot_html,
+                data=plot_html.encode("utf-8"),
                 file_name="voltscope_cv_plot.html",
                 mime="text/html",
+                key=f"download_cv_plot::{active_project_name}::{experiment_id}::{selected_filename}",
+                on_click="ignore",
             )
 
     with esw_expander:
@@ -7976,7 +10148,14 @@ def main() -> None:
         st.subheader("Detailed CV metrics")
         if peak_metric_rows:
             peak_metric_df = pd.DataFrame(peak_metric_rows)
-            compact_metrics_df = metrics_table(metrics, current_display_unit, electrode_area_cm2, current_source)
+            compact_metrics_df = metrics_table(
+                metrics,
+                current_display_unit,
+                electrode_area_cm2,
+                current_source,
+                cv_behavior.behavior,
+                cv_behavior.pair_confidence,
+            )
             if current_scale_review_needed and not compact_metrics_df.empty:
                 current_dependent_metrics = compact_metrics_df["metric"].isin(["Ipa", "Ipc", "|Ipa/Ipc|"])
                 if current_unit_review_needed:
@@ -8017,9 +10196,11 @@ def main() -> None:
 
     st.download_button(
         "Download analysis results as CSV",
-        data=export_buffer.getvalue(),
+        data=export_buffer.getvalue().encode("utf-8"),
         file_name="voltscope_cv_analysis_results.csv",
         mime="text/csv",
+        key=f"download_cv_analysis::{active_project_name}::{experiment_id}",
+        on_click="ignore",
     )
 
     store_experiment_analysis(
