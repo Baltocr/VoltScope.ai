@@ -464,8 +464,8 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertEqual(density_default_axis, "Current density")
 
         raw_display_state = APP.format_lsv_display_state(display_units, 9.484e-6, "Ag/AgCl")
-        self.assertIn("Display: Current", raw_display_state)
-        self.assertIn("threshold = 9.484 µA", raw_display_state)
+        self.assertIn("Analyzed as: current vs potential", raw_display_state)
+        self.assertIn("Threshold: 9.484 µA", raw_display_state)
         self.assertNotIn("area =", raw_display_state)
 
         density_from_raw_state = APP.format_lsv_display_state(
@@ -478,8 +478,8 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             9.484e-6,
             "Ag/AgCl",
         )
-        self.assertIn("Display: Current density", density_from_raw_state)
-        self.assertIn("area = 0.196 cm²", density_from_raw_state)
+        self.assertIn("Analyzed as: current density vs potential", density_from_raw_state)
+        self.assertIn("Area: 0.196 cm²", density_from_raw_state)
 
         self.assertEqual(
             APP.reference_electrode_from_metadata({"Reference electrode": "SCE"}),
@@ -640,10 +640,11 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             "Ag/AgCl",
             APP.electrode_area_metadata_summary(dataset.metadata),
         )
-        self.assertIn("Current density from uploaded column", display_state)
-        self.assertIn("threshold = 5.795 mA/cm²", display_state)
-        self.assertIn("Electrode area metadata: 0.196 cm²", display_state)
-        self.assertIn("No additional normalization applied", display_state)
+        self.assertIn("Analyzed as: current density vs potential", display_state)
+        self.assertNotIn("\n", display_state)
+        self.assertIn("Units: mA/cm² · Threshold: 5.795 mA/cm²", display_state)
+        self.assertIn("Threshold: 5.795 mA/cm²", display_state)
+        self.assertIn("Area: 0.196 cm²", display_state)
         self.assertNotIn("area = 1.0 cm²", display_state)
 
         density_display_units = {
@@ -683,6 +684,7 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertEqual(summary["threshold_rule"], "Auto-selected as 10% of maximum anodic current density.")
         self.assertEqual(summary["reference_electrode"], "Ag/AgCl (from metadata)")
         self.assertEqual(summary["threshold"], "5.795 mA/cm²")
+        self.assertIn("electrode-area normalization was skipped", summary["normalization_note"])
         self.assertIn("anodic current density first crosses 5.795 mA/cm²", summary["method_note"])
         self.assertIn("Reported vs Ag/AgCl", summary["method_note"])
 
@@ -757,9 +759,42 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             "SCE",
             APP.electrode_area_metadata_summary(dataset.metadata),
         )
-        self.assertIn("Display: Current", display_state)
-        self.assertIn("Electrode area detected: 0.071 cm²", display_state)
-        self.assertIn("Current density display is available", display_state)
+        self.assertIn("Analyzed as: current vs potential", display_state)
+        self.assertNotIn("\n", display_state)
+        self.assertIn("Units: µA · Threshold: 8 µA", display_state)
+        self.assertIn("Area: 0.071 cm²", display_state)
+
+        raw_summary = APP.build_lsv_analysis_summary(
+            record,
+            dataset,
+            8.0e-6,
+            display_units,
+            "SCE",
+            reference_electrode_source="metadata",
+        )
+        self.assertIn(
+            "Current-density display is available, but current is currently selected",
+            raw_summary["normalization_note"],
+        )
+
+        density_display_units = {
+            **display_units,
+            "y_axis": "Current density",
+            "current": "uA/cm^2",
+            "electrode_area_cm2": 0.071,
+        }
+        density_summary = APP.build_lsv_analysis_summary(
+            record,
+            dataset,
+            8.0e-6,
+            density_display_units,
+            "SCE",
+            reference_electrode_source="metadata",
+        )
+        self.assertIn(
+            "Current was normalized by 0.071 cm² and displayed as current density",
+            density_summary["normalization_note"],
+        )
 
         metrics = APP.build_lsv_detailed_metrics(record, dataset, 8.0e-6, display_units, "SCE")
         metric_values = dict(zip(metrics["Metric"], metrics["Value"]))
@@ -946,9 +981,9 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             APP.electrode_area_metadata_summary(dataset.metadata),
             unit_review_required=True,
         )
-        self.assertIn("Current density from uploaded column", display_state)
-        self.assertIn("threshold = 3.529 unit unconfirmed", display_state)
-        self.assertIn("No additional normalization applied", display_state)
+        self.assertIn("Analyzed as: current density vs potential", display_state)
+        self.assertIn("Threshold: 3.529 unit unconfirmed", display_state)
+        self.assertIn("Area: 0.196 cm²", display_state)
         self.assertNotIn("area = 1.0 cm²", display_state)
 
         confirmed_details = APP.parser_summary_details(dataset, "lsv", "mA/cm^2", None, 1.0, "mA")
@@ -994,9 +1029,9 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             APP.electrode_area_metadata_summary(dataset.metadata),
             unit_review_required=False,
         )
-        self.assertIn("threshold = 3.529 mA/cm²", confirmed_display_state)
-        self.assertIn("Uploaded signal was treated as current density", confirmed_display_state)
-        self.assertIn("Electrode-area normalization was skipped", confirmed_display_state)
+        self.assertIn("Analyzed as: current density vs potential", confirmed_display_state)
+        self.assertIn("Threshold: 3.529 mA/cm²", confirmed_display_state)
+        self.assertIn("Area: 0.196 cm²", confirmed_display_state)
 
         results = APP.build_generic_results(
             [record],
@@ -1209,6 +1244,7 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             behavior,
         )
         self.assertTrue(any("Irreversible or oxidation-only CV" in message for message in messages))
+        self.assertTrue(any("not applicable because no reliable cathodic return peak" in message for message in messages))
         self.assertFalse(any("Weak/noisy CV" in message for message in messages))
         self.assertEqual(
             APP.cv_analysis_status(
@@ -1233,9 +1269,53 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertEqual(APP.selected_peak_legend_label(behavior), "Selected Epa")
         self.assertIn("Only the selected Epa is used", APP.candidate_peak_explanation(behavior))
         self.assertIn(
-            "no reliable cathodic return peak",
+            "insufficient cathodic return evidence",
             APP.candidate_rejection_reasons(behavior)[raw_reduction.id],
         )
+        data_quality_items, review_needed = APP.cv_data_quality_items(
+            "Review recommended",
+            False,
+            messages,
+            "High",
+            False,
+            behavior,
+        )
+        self.assertEqual(
+            data_quality_items,
+            [
+                "Parsed successfully",
+                "Oxidation peak detected",
+                "No reliable cathodic peak",
+                "Review recommended",
+            ],
+        )
+        self.assertTrue(review_needed)
+
+        audit_df = pd.DataFrame(
+            [
+                {
+                    "role": "Selected primary Epa",
+                    "status": "Used for CV metrics",
+                    "potential_V": behavior.oxidation_peak.potential,
+                    "current_uA": behavior.oxidation_peak.raw_current * 1e6,
+                    "scan": "Forward",
+                    "confidence": "medium high",
+                },
+                {
+                    "role": "Primary Epc",
+                    "status": "Not assigned: no reliable cathodic return peak",
+                    "potential_V": "\u2014",
+                    "current_uA": "\u2014",
+                    "scan": "\u2014",
+                    "confidence": "Low",
+                },
+            ]
+        )
+        display_audit = APP.cv_report_display_table(audit_df)
+        self.assertNotIn("nan", display_audit.to_string().lower())
+        self.assertEqual(display_audit.loc[0, "Confidence"], "Medium-High")
+        self.assertEqual(display_audit.loc[1, "E / V"], "\u2014")
+        self.assertEqual(display_audit.loc[1, "I / uA"], "\u2014")
 
     def test_irreversible_reduction_only_rejects_weak_return_peak(self) -> None:
         potential, current = irreversible_reduction_only_trace()
@@ -1316,7 +1396,7 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertEqual(APP.selected_peak_legend_label(behavior), "Selected Epc")
         self.assertIn("Only the selected Epc is used", APP.candidate_peak_explanation(behavior))
         self.assertIn(
-            "no reliable anodic return peak",
+            "insufficient anodic return evidence",
             APP.candidate_rejection_reasons(behavior)[raw_oxidation.id],
         )
 
@@ -1439,7 +1519,9 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertEqual(metric_values["\u0394Ep"], "Invalid")
         self.assertEqual(metric_values["E\u00b0\u2032"], "Invalid")
         self.assertEqual(metric_values["|Ipa/Ipc|"], "Invalid")
-        self.assertIn("Epa is lower than Epc", metric_methods["\u0394Ep"])
+        self.assertEqual(metric_methods["Epc"], "Selected reduction peak candidate")
+        self.assertIn("selected oxidation peak occurs at a lower potential", metric_methods["\u0394Ep"])
+        self.assertIn("Review candidate peaks", metric_methods["\u0394Ep"])
 
     def test_sloped_baseline_background_adds_review_recommendation(self) -> None:
         potential, current = sloped_baseline_background_trace()
@@ -1469,7 +1551,7 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         )
         self.assertTrue(any(APP.SLOPED_BASELINE_WARNING in message for message in messages))
         if analysis.behavior.behavior in {"irreversible_oxidation_only", "irreversible_reduction_only"}:
-            self.assertTrue(any("baseline drift may affect return-peak classification" in message for message in messages))
+            self.assertTrue(any("Baseline/background shape may affect return-peak classification" in message for message in messages))
 
         baseline = APP.calculate_linear_baseline(potential, current, 0, int(np.nanargmax(potential)))
         self.assertIsNotNone(baseline)
@@ -1707,23 +1789,54 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         inactive = APP.selected_peak_metrics_display_table(peak_metric_df, "uA", baseline_active=False)
         self.assertEqual(
             list(inactive.columns),
-            ["peak", "potential_V", "current_µA", "scan", "confidence", "method"],
+            ["Peak", "E / V", "I / µA", "Scan", "Confidence", "Method"],
         )
+        self.assertEqual(inactive.loc[0, "Peak"], "Oxidation")
+        self.assertEqual(inactive.loc[0, "E / V"], "0.3411")
+        self.assertEqual(inactive.loc[0, "I / µA"], "41.39")
 
         active = APP.selected_peak_metrics_display_table(peak_metric_df, "uA", baseline_active=True)
         self.assertEqual(
             list(active.columns),
             [
-                "peak",
-                "potential_V",
-                "raw_current_µA",
-                "baseline_current_µA",
-                "corrected_current_µA",
-                "scan",
-                "confidence",
-                "method",
+                "Peak",
+                "E / V",
+                "Raw I / µA",
+                "Baseline I / µA",
+                "Corrected I / µA",
+                "Scan",
+                "Confidence",
+                "Method",
             ],
         )
+
+    def test_selected_peak_method_is_neutral_when_reduction_is_not_reverse_scan(self) -> None:
+        potential = np.array([0.0, 0.1, 0.2, 0.3])
+        current = np.array([0.0, -1.0e-6, -3.0e-6, -1.0e-6])
+        reduction_peak = APP.Peak(
+            id="peak_red_forward",
+            peak_type="reduction",
+            index=2,
+            potential=0.2,
+            raw_current=-3.0e-6,
+            prominence=2.0e-6,
+            segment_index=0,
+            segment_direction="forward",
+            confidence="medium",
+        )
+
+        rows, _metrics = APP.build_peak_metrics_rows(
+            None,
+            reduction_peak,
+            None,
+            current,
+            "uA",
+            1.0,
+            "Current",
+        )
+
+        self.assertEqual(rows[0]["scan"], "Forward")
+        self.assertEqual(rows[0]["method"], "Minimum current candidate selected as reduction peak")
 
     def test_metadata_rows_for_display_separates_structured_and_unparsed_lines(self) -> None:
         parsed_rows, unparsed_rows = APP.metadata_rows_for_display(
@@ -2420,6 +2533,118 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertAlmostEqual(float(analysis.metrics["epa_V"]), 0.3772, delta=0.002)
         ipa_uA = APP.current_to_display(np.array([analysis.metrics["ipa_A"]]), "uA", "Current", 1.0)[0]
         self.assertAlmostEqual(float(ipa_uA), 0.8624, delta=0.005)
+
+    def test_demo_ui_copy_uses_updated_labels(self) -> None:
+        source = APP_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("Analyzing file", source)
+        self.assertIn("Quick interpretation", source)
+        self.assertIn("Generate detailed AI interpretation", source)
+        self.assertIn("Selected peak audit", source)
+        self.assertIn("Noise or baseline issue detected", source)
+        self.assertIn("Onset audit", source)
+        self.assertIn("Display & threshold controls", source)
+        self.assertIn("Parser details", source)
+        self.assertNotIn("Viewing file", source)
+        self.assertNotIn("Baseline drift detected", source)
+        self.assertNotIn("Generate AI interpretation", source)
+        self.assertNotIn("LSV Analysis & Display Controls", source)
+
+    def test_cv_run_context_uses_report_copy(self) -> None:
+        context = APP.format_cv_run_context(
+            "uA",
+            "Current",
+            "Forward/reverse",
+            1,
+            cycle_assignment_uncertain=True,
+        )
+
+        self.assertIn("Analyzed as: current vs potential", context)
+        self.assertNotIn("\n", context)
+        self.assertIn("Analyzed as: current vs potential · Units: µA", context)
+        self.assertIn("Units: µA", context)
+        self.assertIn("Scan mode: forward/reverse", context)
+        self.assertIn("Cycle count: 1 (inferred)", context)
+
+    def test_lsv_plot_threshold_labels_are_compact(self) -> None:
+        anodic_positive, anodic_negative = APP.lsv_threshold_plot_labels(
+            0.247205,
+            "mA/cm^2",
+            "anodic",
+        )
+        self.assertEqual(anodic_positive, "Threshold: +0.2472 mA/cm²")
+        self.assertEqual(anodic_negative, "Magnitude: 0.2472 mA/cm²")
+
+        cathodic_positive, cathodic_negative = APP.lsv_threshold_plot_labels(
+            7.439,
+            "uA",
+            "cathodic",
+        )
+        self.assertEqual(cathodic_positive, "Magnitude: 7.439 µA")
+        self.assertEqual(cathodic_negative, "Threshold: -7.439 µA")
+
+    def test_cv_quick_interpretation_changes_with_behavior(self) -> None:
+        reversible_text = APP.cv_interpretation_text(
+            None,
+            {"delta_ep_V": 0.059, "ipa_ipc_ratio": 1.02},
+            "High",
+        )
+        self.assertIn("reversible", reversible_text.lower())
+        self.assertIn("ideal one-electron reversible value", reversible_text)
+        self.assertIn("scan rate", reversible_text)
+
+        oxidation_only = APP.CVBehaviorResult(
+            behavior="irreversible_oxidation_only",
+            label="Irreversible oxidation-only",
+            oxidation_peak=None,
+            reduction_peak=None,
+            rejected_oxidation_peak=None,
+            rejected_reduction_peak=None,
+            pair_confidence="Low",
+            messages=[],
+        )
+        irreversible_text = APP.cv_interpretation_text(
+            oxidation_only,
+            {"delta_ep_V": None, "ipa_ipc_ratio": None},
+            "High",
+        )
+        self.assertIn("oxidation-dominant", irreversible_text)
+        self.assertIn("should not be treated as reversible-pair metrics", irreversible_text)
+
+    def test_lsv_quick_interpretation_direction_and_unit_review(self) -> None:
+        anodic_text = APP.lsv_interpretation_text(
+            {
+                "status": "Passed",
+                "direction": "Anodic",
+                "onset_potential": "0.477 V vs SCE",
+                "threshold": "10 µA",
+                "reference_electrode": "SCE (from metadata)",
+            }
+        )
+        self.assertIn("anodic onset", anodic_text)
+        self.assertIn("threshold rule", anodic_text)
+
+        cathodic_text = APP.lsv_interpretation_text(
+            {
+                "status": "Passed",
+                "direction": "Cathodic",
+                "onset_potential": "0.398 V vs Ag/AgCl",
+                "threshold": "9.48 µA",
+                "reference_electrode": "Ag/AgCl (default)",
+            }
+        )
+        self.assertIn("cathodic onset", cathodic_text)
+        self.assertIn("scan conditions", cathodic_text)
+
+        unit_review_text = APP.lsv_interpretation_text(
+            {
+                "status": "Review needed",
+                "direction": "Anodic",
+                "onset_potential": "Not detected",
+                "threshold": "unit unconfirmed",
+            }
+        )
+        self.assertIn("units require confirmation", unit_review_text)
 
 
 if __name__ == "__main__":
