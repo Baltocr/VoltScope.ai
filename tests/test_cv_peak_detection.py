@@ -172,6 +172,35 @@ class FakeUploadedFile:
 
 
 class CVPeakDetectionRegressionTest(unittest.TestCase):
+    def test_manual_metadata_can_complement_or_override_detected_fields(self) -> None:
+        detected = {
+            "reference_electrode": "SCE",
+            "scan_rate_mV_s": "10",
+        }
+        structured = {
+            "Reference electrode": "Ag/AgCl",
+            "Electrode area": "0.196 cm²",
+        }
+
+        complemented = APP.merge_manual_metadata(
+            detected,
+            structured,
+            {},
+            "Add/complement detected metadata",
+        )
+        self.assertEqual(APP.reference_electrode_from_metadata(complemented), "SCE")
+        self.assertEqual(APP.electrode_area_metadata_summary(complemented), "0.196 cm²")
+
+        overridden = APP.merge_manual_metadata(
+            detected,
+            structured,
+            {"Scan rate": "100 mV/s"},
+            "Override detected metadata with manual entries",
+        )
+        self.assertEqual(APP.reference_electrode_from_metadata(overridden), "Ag/AgCl")
+        self.assertAlmostEqual(APP.scan_rate_from_metadata(overridden), 0.1)
+        self.assertNotIn("scan_rate_mV_s", overridden)
+
     def test_lsv_analysis_summary_reports_onset_and_readable_units(self) -> None:
         potential = np.linspace(-0.1, 1.1, 650)
         max_current_a = 148.17590015810895e-6
@@ -231,9 +260,14 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertEqual(summary["max_value"], "148.2 µA/cm²")
         self.assertEqual(summary["potential_range"], "-0.100 to 1.100 V")
         self.assertEqual(summary["scan_rate"], "10 mV/s")
-        self.assertEqual(summary["reference_electrode"], "SCE (user-selected)")
+        self.assertEqual(summary["reference_electrode"], "SCE (confirmed)")
+        self.assertEqual(summary["metadata_completeness"], "Complete")
+        self.assertEqual(summary["missing_metadata"], "None")
+        self.assertIn("Uploaded signal: current", summary["normalization_status"])
+        self.assertIn("normalized by VoltScope", summary["normalization_status"])
         self.assertIn("0.477", summary["onset_potential"])
         self.assertIn("vs SCE", summary["onset_potential"])
+        self.assertIn("Onset was estimated using the selected threshold rule", summary["method_note"])
         self.assertIn("anodic current density first crosses 14.82 µA/cm²", summary["method_note"])
         self.assertIn("Reported vs SCE", summary["method_note"])
         self.assertEqual(APP.current_axis_label("uA/cm^2"), "Current density (µA/cm²)")
@@ -274,6 +308,8 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertEqual(metric_values["Maximum anodic current density"], "148.2 µA/cm²")
         self.assertEqual(metric_values["Potential range"], "-0.100 to 1.100 V")
         self.assertEqual(metric_values["Scan rate"], "10 mV/s")
+        self.assertIn("estimated", metric_values["Scan rate source"])
+        self.assertIn("Uploaded signal: current", metric_values["Normalization status"])
         self.assertEqual(metric_values["Number of points"], "650")
 
         results = APP.build_generic_results(
@@ -287,6 +323,109 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertIn("onset_potential_V", results.columns)
         self.assertNotIn("anodic_limit_V", results.columns)
         self.assertAlmostEqual(float(results.loc[0, "onset_potential_V"]), 0.477062626, delta=0.002)
+
+    def test_lsv_metadata_context_reports_reference_scan_rate_and_area(self) -> None:
+        potential = np.linspace(-0.1, 1.1, 650)
+        max_current_a = 148.17590015810895e-6
+        threshold_a = max_current_a * 0.1
+        slope_width = 0.045
+        inflection = 0.477062626 + 2.197224577 * slope_width
+        current = max_current_a / (1.0 + np.exp(-(potential - inflection) / slope_width))
+        time_s = (potential - potential[0]) / 0.01
+        dataset = APP.ParsedDataset(
+            filename="20_lsv_raw_current_with_area_metadata.txt",
+            dataframe=pd.DataFrame(
+                {
+                    "time_s": time_s,
+                    "Potential_V": potential,
+                    "Current_A": current,
+                }
+            ),
+            headers=["time_s", "Potential_V", "Current_A"],
+            metadata={
+                "Reference electrode": "SCE",
+                "Scan rate": "10 mV/s",
+                "Electrode area": "0.196 cm2",
+            },
+            delimiter=",",
+            has_header=True,
+            header_row=1,
+            data_start_row=2,
+            rows_skipped=1,
+            rows_dropped=0,
+            missing_values=0,
+            detected_potential_col="Potential_V",
+            detected_current_col="Current_A",
+            detected_time_col="time_s",
+            detected_units={"potential:Potential_V": "V", "current:Current_A": "A", "time:time_s": "s"},
+            warnings=[],
+        )
+        record = {
+            "filename": dataset.filename,
+            "sample_name": "20_lsv_raw_current_with_area_metadata",
+            "columns": {"potential": "Potential_V", "current": "Current_A"},
+            "data": {"potential": potential, "current": current},
+        }
+        display_units = {
+            "current_source": "Current",
+            "x_axis": "Potential",
+            "y_axis": "Current",
+            "potential": "V",
+            "current": "uA",
+            "electrode_area_cm2": 0.196,
+        }
+
+        summary = APP.build_lsv_analysis_summary(
+            record,
+            dataset,
+            threshold_a,
+            display_units,
+            "SCE",
+            threshold_source="Auto-selected",
+            threshold_rule="Auto-selected as 10% of maximum anodic current.",
+            reference_electrode_source="metadata",
+        )
+
+        self.assertEqual(summary["reference_electrode"], "SCE (from metadata)")
+        self.assertEqual(summary["scan_rate"], "10 mV/s")
+        self.assertEqual(summary["scan_rate_source"], "metadata")
+        self.assertEqual(summary["electrode_area_metadata"], "0.196 cm²")
+        self.assertEqual(
+            summary["normalization_status"],
+            "Uploaded signal: current. Electrode area detected: 0.196 cm². Current-density display is available.",
+        )
+        self.assertIn("0.477 V vs SCE", summary["onset_potential"])
+        self.assertIn("Onset was estimated using the selected threshold rule", summary["method_note"])
+        self.assertIn("Reported vs SCE", summary["method_note"])
+
+        detailed_metrics = APP.build_lsv_detailed_metrics(
+            record,
+            dataset,
+            threshold_a,
+            display_units,
+            "SCE",
+            threshold_source="Auto-selected",
+            threshold_rule="Auto-selected as 10% of maximum anodic current.",
+        )
+        metric_values = dict(zip(detailed_metrics["Metric"], detailed_metrics["Value"]))
+        self.assertEqual(metric_values["Scan rate"], "10 mV/s")
+        self.assertEqual(metric_values["Scan rate source"], "metadata")
+        self.assertEqual(metric_values["Electrode area metadata"], "0.196 cm²")
+        self.assertEqual(metric_values["Normalization status"], summary["normalization_status"])
+
+        payload = APP.build_lsv_ai_interpretation_payload(
+            filename=dataset.filename,
+            quick_interpretation=APP.lsv_interpretation_text(summary),
+            summary=summary,
+            warnings=[],
+            notes="",
+        )
+        self.assertEqual(payload["available_metadata"]["reference_electrode"], "SCE")
+        self.assertEqual(payload["available_metadata"]["scan_rate"], "10 mV/s")
+        self.assertEqual(payload["available_metadata"]["electrode_area"], "0.196 cm²")
+        self.assertEqual(payload["interpretation_guidance"]["normalization_status"], summary["normalization_status"])
+        self.assertIn("operational threshold-crossing onset", payload["interpretation_guidance"]["onset_wording"])
+        self.assertIn("Scan rate was 10 mV/s", payload["interpretation_guidance"]["suggested_lab_notebook_note"])
 
     def test_lsv_sustained_onset_rejects_boundary_crossing(self) -> None:
         potential = np.linspace(-0.1, 1.1, 300)
@@ -419,8 +558,12 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertEqual(summary["scan_rate"], "Not available")
         self.assertEqual(
             summary["scan_rate_note"],
-            "Scan rate could not be estimated because no time column was found.",
+            "Scan rate was not found in metadata and could not be estimated because no time column "
+            "was detected. Add scan rate metadata if scan-rate-dependent interpretation is needed.",
         )
+        self.assertEqual(summary["metadata_completeness"], "Incomplete")
+        self.assertIn("scan rate", summary["missing_metadata"])
+        self.assertIn("confirmed reference electrode", summary["missing_metadata"])
         self.assertEqual(summary["primary_current_label"], "Max cathodic current")
         self.assertEqual(summary["primary_current_value"], "-94.84 µA")
         self.assertEqual(summary["primary_potential_label"], "Potential at max cathodic current")
@@ -446,14 +589,16 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertEqual(detailed_values["Scan rate"], "Not available")
         self.assertEqual(
             detailed_methods["Scan rate"],
-            "Scan rate could not be estimated because no time column was found.",
+            "Scan rate was not found in metadata and could not be estimated because no time column "
+            "was detected. Add scan rate metadata if scan-rate-dependent interpretation is needed.",
         )
 
         parser_details = APP.parser_summary_details(dataset, "lsv", "uA", "Current", 1.0)
         self.assertEqual(parser_details["scan_rate_estimate"], "Not available")
         self.assertEqual(
             parser_details["scan_rate_note"],
-            "Scan rate could not be estimated because no time column was found.",
+            "Scan rate was not found in metadata and could not be estimated because no time column "
+            "was detected. Add scan rate metadata if scan-rate-dependent interpretation is needed.",
         )
 
         raw_axis_options, raw_default_axis = APP.lsv_axis_options_for_current_source("Current")
@@ -772,6 +917,7 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             "SCE",
             reference_electrode_source="metadata",
         )
+        self.assertEqual(raw_summary["metadata_completeness"], "Complete")
         self.assertIn(
             "Current-density display is available, but current is currently selected",
             raw_summary["normalization_note"],
@@ -791,6 +937,7 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             "SCE",
             reference_electrode_source="metadata",
         )
+        self.assertEqual(density_summary["metadata_completeness"], "Complete")
         self.assertIn(
             "Current was normalized by 0.071 cm² and displayed as current density",
             density_summary["normalization_note"],
@@ -867,6 +1014,7 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             "current": "A",
             "electrode_area_cm2": 1.0,
             "unit_review_required": True,
+            "suggested_current_unit": "uA",
         }
         self.assertEqual(APP.lsv_axis_title("Current", display_units, "Ag/AgCl"), "Signal (unit unconfirmed)")
         record = {
@@ -887,6 +1035,9 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertEqual(summary["status"], "Review needed")
         self.assertEqual(summary["primary_current_value"], "Pending unit confirmation")
         self.assertEqual(summary["threshold"], "3.529 unit unconfirmed")
+        self.assertEqual(summary["unit_status"], "Unconfirmed")
+        self.assertEqual(summary["suggested_unit"], "µA")
+        self.assertIn("unit is confirmed", summary["method_note"])
 
         fig = APP.go.Figure()
         APP.add_generic_trace(fig, record, "lsv", display_units, False)
@@ -969,6 +1120,7 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             "current": "A/cm^2",
             "electrode_area_cm2": 1.0,
             "unit_review_required": True,
+            "suggested_current_unit": "mA/cm^2",
         }
         self.assertEqual(
             APP.lsv_axis_title("Current density", display_units, "Ag/AgCl"),
@@ -982,6 +1134,9 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             unit_review_required=True,
         )
         self.assertIn("Analyzed as: current density vs potential", display_state)
+        self.assertIn("Units: unconfirmed", display_state)
+        self.assertIn("Suggested: mA/cm²", display_state)
+        self.assertNotIn("Units: A/cm²", display_state)
         self.assertIn("Threshold: 3.529 unit unconfirmed", display_state)
         self.assertIn("Area: 0.196 cm²", display_state)
         self.assertNotIn("area = 1.0 cm²", display_state)
@@ -1014,13 +1169,28 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             threshold_display * 1e-3,
             confirmed_display_units,
             "Ag/AgCl",
+            reference_electrode_source="default",
         )
         self.assertNotEqual(confirmed_summary["status"], "Review needed")
         self.assertEqual(confirmed_summary["threshold"], "3.529 mA/cm²")
         self.assertEqual(confirmed_summary["primary_current_value"], "35.29 mA/cm²")
         self.assertEqual(confirmed_summary["min_value"], "-0.563 mA/cm²")
+        self.assertEqual(confirmed_summary["unit_status"], "Confirmed")
+        self.assertEqual(confirmed_summary["metadata_completeness"], "Incomplete")
+        self.assertIn("scan rate", confirmed_summary["missing_metadata"])
+        self.assertIn("confirmed reference electrode", confirmed_summary["missing_metadata"])
+        self.assertEqual(confirmed_summary["reference_electrode"], "Ag/AgCl (default)")
         self.assertIn("0.443 V vs Ag/AgCl", confirmed_summary["onset_potential"])
         self.assertEqual(APP.lsv_axis_title("Current density", confirmed_display_units, "Ag/AgCl"), "Current density (mA/cm²)")
+        quality_items, quality_review = APP.lsv_data_quality_items(confirmed_summary, False)
+        self.assertNotIn("Metadata incomplete", quality_items)
+        self.assertNotIn("No review required", quality_items)
+        self.assertFalse(quality_review)
+        self.assertIn("Metadata completeness: Incomplete", APP.metadata_status_notice(confirmed_summary))
+        interpretation = APP.lsv_interpretation_text(confirmed_summary)
+        self.assertIn("scan rate is unavailable", interpretation)
+        self.assertIn("reference electrode is currently defaulted", interpretation)
+        self.assertIn("publication-ready", interpretation)
 
         confirmed_display_state = APP.format_lsv_display_state(
             confirmed_display_units,
@@ -1032,6 +1202,7 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertIn("Analyzed as: current density vs potential", confirmed_display_state)
         self.assertIn("Threshold: 3.529 mA/cm²", confirmed_display_state)
         self.assertIn("Area: 0.196 cm²", confirmed_display_state)
+        self.assertNotIn("unit unconfirmed", confirmed_display_state)
 
         results = APP.build_generic_results(
             [record],
@@ -1782,7 +1953,17 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
                     "scan": "Forward",
                     "confidence": "high",
                     "method": "Maximum current on forward scan",
-                }
+                },
+                {
+                    "peak": "reduction",
+                    "potential_V": 0.2108,
+                    "current_µA": -36.22,
+                    "baseline_current_µA": 0.0,
+                    "corrected_current_µA": -36.22,
+                    "scan": "Forward",
+                    "confidence": "medium",
+                    "method": "Minimum current candidate selected as reduction peak",
+                },
             ]
         )
 
@@ -1794,6 +1975,15 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertEqual(inactive.loc[0, "Peak"], "Oxidation")
         self.assertEqual(inactive.loc[0, "E / V"], "0.3411")
         self.assertEqual(inactive.loc[0, "I / µA"], "41.39")
+
+        review_needed = APP.selected_peak_metrics_display_table(
+            peak_metric_df,
+            "uA",
+            baseline_active=False,
+            review_needed=True,
+        )
+        self.assertEqual(review_needed.loc[0, "Peak"], "Selected candidate oxidation peak")
+        self.assertEqual(review_needed.loc[1, "Peak"], "Selected candidate reduction extremum")
 
         active = APP.selected_peak_metrics_display_table(peak_metric_df, "uA", baseline_active=True)
         self.assertEqual(
@@ -2575,6 +2765,15 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
         self.assertEqual(anodic_positive, "Threshold: +0.2472 mA/cm²")
         self.assertEqual(anodic_negative, "Magnitude: 0.2472 mA/cm²")
 
+        unconfirmed_positive, unconfirmed_negative = APP.lsv_threshold_plot_labels(
+            3.58251,
+            "A/cm^2",
+            "anodic",
+            unit_review_required=True,
+        )
+        self.assertEqual(unconfirmed_positive, "Threshold: 3.583 unit unconfirmed")
+        self.assertEqual(unconfirmed_negative, "Magnitude: 3.583 unit unconfirmed")
+
         cathodic_positive, cathodic_negative = APP.lsv_threshold_plot_labels(
             7.439,
             "uA",
@@ -2609,7 +2808,29 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             "High",
         )
         self.assertIn("oxidation-dominant", irreversible_text)
-        self.assertIn("should not be treated as reversible-pair metrics", irreversible_text)
+        self.assertIn("anodic oxidation peak can be used as an oxidation feature", irreversible_text)
+        self.assertIn("not applicable as reversible-pair metrics", irreversible_text)
+
+        noisy_behavior = APP.CVBehaviorResult(
+            behavior="noisy_ambiguous",
+            label="Noisy / ambiguous",
+            oxidation_peak=None,
+            reduction_peak=None,
+            rejected_oxidation_peak=None,
+            rejected_reduction_peak=None,
+            pair_confidence="Medium",
+            messages=[],
+        )
+        noisy_text = APP.cv_interpretation_text(
+            noisy_behavior,
+            {"epa_V": 0.3872, "epc_V": 0.5715, "delta_ep_V": -0.1843, "ipa_ipc_ratio": 1.72},
+            "High",
+        )
+        self.assertIn(
+            "Candidate peaks were detected, but the selected pair is not valid for reversible-pair metrics.",
+            noisy_text,
+        )
+        self.assertIn("review candidate peaks", noisy_text.lower())
 
     def test_lsv_quick_interpretation_direction_and_unit_review(self) -> None:
         anodic_text = APP.lsv_interpretation_text(
@@ -2634,7 +2855,8 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             }
         )
         self.assertIn("cathodic onset", cathodic_text)
-        self.assertIn("scan conditions", cathodic_text)
+        self.assertIn("selected threshold rule", cathodic_text)
+        self.assertIn("scan rate", cathodic_text)
 
         unit_review_text = APP.lsv_interpretation_text(
             {
@@ -2645,6 +2867,736 @@ class CVPeakDetectionRegressionTest(unittest.TestCase):
             }
         )
         self.assertIn("units require confirmation", unit_review_text)
+
+    def test_cv_ai_interpretation_payload_is_compact_and_metric_only(self) -> None:
+        oxidation_peak = APP.Peak(
+            id="ox_1",
+            peak_type="oxidation",
+            index=10,
+            potential=0.3852,
+            raw_current=26.8e-6,
+            prominence=20e-6,
+            segment_index=0,
+            segment_direction="increasing",
+            confidence="High",
+        )
+        reduction_peak = APP.Peak(
+            id="red_1",
+            peak_type="reduction",
+            index=20,
+            potential=0.295,
+            raw_current=-23.28e-6,
+            prominence=18e-6,
+            segment_index=1,
+            segment_direction="decreasing",
+            confidence="High",
+        )
+        behavior = APP.CVBehaviorResult(
+            behavior="reversible_like",
+            label="Reversible-like",
+            oxidation_peak=oxidation_peak,
+            reduction_peak=reduction_peak,
+            rejected_oxidation_peak=None,
+            rejected_reduction_peak=None,
+            pair_confidence="High",
+            messages=[],
+        )
+
+        payload = APP.build_cv_ai_interpretation_payload(
+            filename="01_clean_cv_standard_columns.csv",
+            quick_interpretation="Clean reversible-like CV.",
+            cv_behavior=behavior,
+            metrics={
+                "epa_V": 0.3852,
+                "ipa_A": 26.8034e-6,
+                "epc_V": 0.295,
+                "ipc_A": -23.275e-6,
+                "delta_ep_V": 0.0902,
+                "ipa_ipc_ratio": 1.152,
+            },
+            oxidation_peak=oxidation_peak,
+            reduction_peak=reduction_peak,
+            display_current_unit="uA",
+            current_source="Current",
+            electrode_area_cm2=1.0,
+            analysis_status="Passed",
+            parser_confidence="High",
+            unit_confidence="High",
+            peak_detection_confidence="High",
+            warnings=[],
+            scan_info={"scan_mode": "Forward/reverse", "cycle_count": 1},
+            metadata={
+                "Reference electrode": "SCE",
+                "Scan rate": "100 mV/s",
+                "Electrode area": "0.196 cm2",
+                "Instrument": "Synthetic Potentiostat 3000",
+            },
+            notes="",
+        )
+
+        serialized = str(payload)
+        self.assertEqual(payload["technique"], "CV")
+        self.assertEqual(payload["key_metrics"]["Epa"], "0.3852 V")
+        self.assertEqual(payload["key_metrics"]["Ipa"], "26.8 µA")
+        self.assertEqual(payload["key_metrics"]["Epc"], "0.295 V")
+        self.assertEqual(payload["key_metrics"]["Ipc"], "-23.28 µA")
+        self.assertEqual(payload["metric_validity"]["Epa"]["status"], "valid")
+        self.assertEqual(payload["metric_validity"]["ΔEp"]["status"], "valid")
+        self.assertEqual(payload["metric_status"]["delta_Ep"]["status"], "valid")
+        self.assertEqual(payload["available_metadata"]["reference_electrode"], "SCE")
+        self.assertEqual(payload["available_metadata"]["scan_rate"], "0.1 V/s (100 mV/s)")
+        self.assertEqual(payload["available_metadata"]["electrode_area"], "0.196 cm²")
+        self.assertEqual(payload["metadata_status"]["reference_electrode"]["status"], "detected")
+        self.assertEqual(payload["metadata_status"]["scan_rate"]["status"], "detected")
+        self.assertEqual(payload["metadata_status"]["electrode_area"]["status"], "detected")
+        self.assertEqual(payload["status_summary"]["analysis_status"], "Passed")
+        self.assertEqual(payload["status_summary"]["metadata_status"], "Complete")
+        self.assertEqual(payload["status_summary"]["unit_status"], "High confidence")
+        self.assertNotIn("electrode_area", payload["missing_metadata"])
+        self.assertNotIn("raw_current_a", serialized)
+        self.assertNotIn("potential_v", serialized)
+        self.assertNotIn("[0.", serialized)
+
+    def test_cv_ai_payload_tracks_inferred_and_missing_metadata_for_numeric_only_file(self) -> None:
+        oxidation_peak = APP.Peak(
+            id="ox_1",
+            peak_type="oxidation",
+            index=10,
+            potential=0.3852,
+            raw_current=26.8e-6,
+            prominence=20e-6,
+            segment_index=0,
+            segment_direction="increasing",
+            confidence="High",
+        )
+        reduction_peak = APP.Peak(
+            id="red_1",
+            peak_type="reduction",
+            index=20,
+            potential=0.295,
+            raw_current=-23.28e-6,
+            prominence=18e-6,
+            segment_index=1,
+            segment_direction="decreasing",
+            confidence="High",
+        )
+        behavior = APP.CVBehaviorResult(
+            behavior="reversible_like",
+            label="Reversible-like",
+            oxidation_peak=oxidation_peak,
+            reduction_peak=reduction_peak,
+            rejected_oxidation_peak=None,
+            rejected_reduction_peak=None,
+            pair_confidence="High",
+            messages=[],
+        )
+
+        payload = APP.build_cv_ai_interpretation_payload(
+            filename="01_clean_cv_standard_columns.csv",
+            quick_interpretation="Clean reversible-like CV.",
+            cv_behavior=behavior,
+            metrics={
+                "epa_V": 0.3852,
+                "ipa_A": 26.8034e-6,
+                "epc_V": 0.295,
+                "ipc_A": -23.275e-6,
+                "delta_ep_V": 0.0902,
+                "ipa_ipc_ratio": 1.152,
+            },
+            oxidation_peak=oxidation_peak,
+            reduction_peak=reduction_peak,
+            display_current_unit="uA",
+            current_source="Current",
+            electrode_area_cm2=1.0,
+            analysis_status="Passed",
+            parser_confidence="High",
+            unit_confidence="High",
+            peak_detection_confidence="High",
+            warnings=[],
+            scan_info={
+                "scan_mode": "Forward/reverse",
+                "scan_rate": "0.1 V/s (100 mV/s)",
+                "cycle_count": 1,
+                "cycle_assignment_uncertain": False,
+            },
+            metadata={},
+            notes="",
+        )
+
+        self.assertEqual(payload["metadata_status"]["scan_rate"]["status"], "inferred")
+        self.assertIn("time and potential", payload["metadata_status"]["scan_rate"]["source"])
+        self.assertEqual(payload["metadata_status"]["cycle_count"]["status"], "detected")
+        self.assertEqual(payload["metadata_status"]["scan_mode"]["status"], "inferred")
+        self.assertEqual(payload["metadata_status"]["electrode_area"]["status"], "missing")
+        self.assertEqual(payload["metadata_status"]["reference_electrode"]["status"], "missing")
+        self.assertEqual(payload["metadata_status"]["electrolyte"]["status"], "missing")
+        self.assertEqual(payload["metadata_status"]["concentration"]["status"], "missing")
+        self.assertEqual(payload["metadata_status"]["working_electrode"]["status"], "missing")
+        self.assertEqual(payload["metadata_status"]["counter_electrode"]["status"], "missing")
+        self.assertIn("reference_electrode", payload["missing_metadata"])
+        self.assertEqual(payload["status_summary"]["analysis_status"], "Passed")
+        self.assertEqual(payload["status_summary"]["metadata_status"], "Incomplete")
+        self.assertEqual(payload["status_summary"]["unit_status"], "High confidence")
+        self.assertEqual(payload["metric_status"]["Epa"]["status"], "valid")
+        self.assertEqual(payload["metric_status"]["peak_current_ratio"]["status"], "valid")
+
+    def test_cv_ai_payload_marks_current_metrics_pending_when_units_unconfirmed(self) -> None:
+        oxidation_peak = APP.Peak(
+            id="ox_1",
+            peak_type="oxidation",
+            index=10,
+            potential=0.309,
+            raw_current=9.1,
+            prominence=2.0,
+            segment_index=0,
+            segment_direction="increasing",
+            confidence="Medium",
+        )
+        behavior = APP.CVBehaviorResult(
+            behavior="noisy_ambiguous",
+            label="Noisy / ambiguous",
+            oxidation_peak=oxidation_peak,
+            reduction_peak=None,
+            rejected_oxidation_peak=None,
+            rejected_reduction_peak=None,
+            pair_confidence="Low",
+            messages=["Weak/noisy CV: selected Epa/Epc may be noise-sensitive."],
+        )
+
+        payload = APP.build_cv_ai_interpretation_payload(
+            filename="08_messy_excel_export_cv.csv",
+            quick_interpretation="Potential positions can be reviewed; current unit needs confirmation.",
+            cv_behavior=behavior,
+            metrics={
+                "epa_V": 0.309,
+                "ipa_A": 33.83,
+                "epc_V": None,
+                "ipc_A": None,
+                "delta_ep_V": None,
+                "ipa_ipc_ratio": None,
+            },
+            oxidation_peak=oxidation_peak,
+            reduction_peak=None,
+            display_current_unit="uA",
+            current_source="Current",
+            electrode_area_cm2=1.0,
+            analysis_status="Review needed",
+            parser_confidence="High",
+            unit_confidence="Low",
+            peak_detection_confidence="Low",
+            warnings=["Current unit is ambiguous."],
+        )
+
+        self.assertEqual(payload["analysis_status"], "Review needed")
+        self.assertEqual(payload["confidence"]["unit"], "Low")
+        self.assertEqual(payload["flags"]["behavior_classification"], "noisy_ambiguous")
+        self.assertTrue(payload["flags"]["requires_review"])
+        self.assertEqual(payload["metric_validity"]["Ipa"]["status"], "pending_unit_confirmation")
+        self.assertEqual(payload["metric_status"]["Ipa"]["status"], "pending_unit_confirmation")
+        self.assertEqual(payload["key_metrics"]["Ipa"], "Pending unit confirmation")
+        self.assertEqual(payload["key_metrics"]["Ipc"], "Pending unit confirmation")
+        self.assertIn("Current unit is ambiguous.", payload["warnings"])
+
+    def test_cv_ai_payload_requires_candidate_language_for_noisy_invalid_pair(self) -> None:
+        oxidation_peak = APP.Peak(
+            id="ox_1",
+            peak_type="oxidation",
+            index=10,
+            potential=0.3872,
+            raw_current=10.67e-6,
+            prominence=4.0e-6,
+            segment_index=0,
+            segment_direction="increasing",
+            confidence="Medium",
+        )
+        reduction_peak = APP.Peak(
+            id="red_1",
+            peak_type="reduction",
+            index=20,
+            potential=0.5715,
+            raw_current=-6.185e-6,
+            prominence=3.0e-6,
+            segment_index=0,
+            segment_direction="increasing",
+            confidence="Medium",
+        )
+        behavior = APP.CVBehaviorResult(
+            behavior="noisy_ambiguous",
+            label="Noisy / ambiguous",
+            oxidation_peak=oxidation_peak,
+            reduction_peak=reduction_peak,
+            rejected_oxidation_peak=None,
+            rejected_reduction_peak=None,
+            pair_confidence="Medium",
+            messages=["Several candidate extrema have similar prominence."],
+        )
+
+        payload = APP.build_cv_ai_interpretation_payload(
+            filename="09_cv_noisy_ambiguous.csv",
+            quick_interpretation="Candidate peaks were detected, but the selected pair is not valid.",
+            cv_behavior=behavior,
+            metrics={
+                "epa_V": 0.3872,
+                "ipa_A": 10.67e-6,
+                "epc_V": 0.5715,
+                "ipc_A": -6.185e-6,
+                "delta_ep_V": -0.1843,
+                "ipa_ipc_ratio": 1.725,
+            },
+            oxidation_peak=oxidation_peak,
+            reduction_peak=reduction_peak,
+            display_current_unit="uA",
+            current_source="Current",
+            electrode_area_cm2=1.0,
+            analysis_status="Review needed",
+            parser_confidence="High",
+            unit_confidence="High",
+            peak_detection_confidence="Medium",
+            warnings=[],
+        )
+
+        self.assertTrue(payload["flags"]["candidate_peak_language_required"])
+        self.assertFalse(payload["flags"]["reversible_pair_metrics_valid"])
+        self.assertEqual(payload["metric_status"]["delta_Ep"]["status"], "invalid")
+        self.assertEqual(payload["key_metrics"]["ΔEp"], "Invalid")
+        self.assertIn(
+            "Candidate peaks were detected, but the selected pair is not valid for reversible-pair metrics.",
+            payload["interpretation_guidance"]["pair_metrics_statement"],
+        )
+        prompt = APP.build_ai_interpretation_prompt(payload)
+        self.assertIn("candidate extrema or candidate peaks", prompt)
+        self.assertIn("not valid oxidation/reduction peaks", prompt)
+
+    def test_cv_ai_payload_marks_irreversible_pair_metrics_not_applicable(self) -> None:
+        oxidation_peak = APP.Peak(
+            id="ox_1",
+            peak_type="oxidation",
+            index=10,
+            potential=0.3852,
+            raw_current=29.05e-6,
+            prominence=24e-6,
+            segment_index=0,
+            segment_direction="increasing",
+            confidence="High",
+        )
+        behavior = APP.CVBehaviorResult(
+            behavior="irreversible_oxidation_only",
+            label="Irreversible oxidation-only",
+            oxidation_peak=oxidation_peak,
+            reduction_peak=None,
+            rejected_oxidation_peak=None,
+            rejected_reduction_peak=None,
+            pair_confidence="Low",
+            messages=["No reliable cathodic return peak was detected."],
+        )
+
+        payload = APP.build_cv_ai_interpretation_payload(
+            filename="11_cv_irreversible_oxidation_only.csv",
+            quick_interpretation="Oxidation-only CV.",
+            cv_behavior=behavior,
+            metrics={
+                "epa_V": 0.3852,
+                "ipa_A": 29.05e-6,
+                "epc_V": None,
+                "ipc_A": None,
+                "delta_ep_V": None,
+                "ipa_ipc_ratio": None,
+            },
+            oxidation_peak=oxidation_peak,
+            reduction_peak=None,
+            display_current_unit="uA",
+            current_source="Current",
+            electrode_area_cm2=1.0,
+            analysis_status="Review needed",
+            parser_confidence="High",
+            unit_confidence="High",
+            peak_detection_confidence="Medium",
+            warnings=[],
+        )
+
+        self.assertEqual(payload["flags"]["behavior_classification"], "irreversible_oxidation_only")
+        self.assertEqual(payload["metric_validity"]["Epa"]["status"], "valid")
+        self.assertEqual(payload["metric_validity"]["Epc"]["status"], "not_detected")
+        self.assertEqual(payload["metric_validity"]["ΔEp"]["status"], "not_applicable")
+        self.assertEqual(payload["metric_validity"]["E°′"]["status"], "not_applicable")
+        self.assertEqual(payload["metric_validity"]["|Ipa/Ipc|"]["status"], "not_applicable")
+        self.assertEqual(payload["metric_status"]["delta_Ep"]["status"], "not_applicable")
+        self.assertEqual(payload["metric_status"]["E0_prime"]["status"], "not_applicable")
+        self.assertEqual(payload["metric_status"]["peak_current_ratio"]["status"], "not_applicable")
+        self.assertEqual(payload["key_metrics"]["ΔEp"], "Not applicable")
+        self.assertEqual(payload["flags"]["oxidation_peak_confidence"], "High")
+        self.assertEqual(payload["flags"]["cathodic_return_peak_confidence"], "Not detected")
+        self.assertEqual(payload["flags"]["reversible_pair_confidence"], "Low")
+        self.assertIn("reliable anodic oxidation peak", payload["interpretation_guidance"]["peak_wording"])
+        self.assertIn(
+            "reversible-pair metrics are not applicable because no reliable cathodic return peak exists",
+            payload["interpretation_guidance"]["pair_metrics_statement"],
+        )
+        self.assertIn("confirming the reference electrode", payload["interpretation_guidance"]["recommended_next_steps"])
+
+        medium_high_peak = APP.Peak(
+            id="ox_medium_high",
+            peak_type="oxidation",
+            index=10,
+            potential=0.4994,
+            raw_current=24.1e-6,
+            prominence=20e-6,
+            segment_index=0,
+            segment_direction="increasing",
+            confidence="medium-high",
+        )
+        medium_high_behavior = APP.CVBehaviorResult(
+            behavior="irreversible_oxidation_only",
+            label="Irreversible oxidation-only",
+            oxidation_peak=medium_high_peak,
+            reduction_peak=None,
+            rejected_oxidation_peak=None,
+            rejected_reduction_peak=None,
+            pair_confidence="Low",
+            messages=[],
+        )
+        medium_high_payload = APP.build_cv_ai_interpretation_payload(
+            filename="oxidation_only.csv",
+            quick_interpretation="Oxidation-only CV.",
+            cv_behavior=medium_high_behavior,
+            metrics={
+                "epa_V": 0.4994,
+                "ipa_A": 24.1e-6,
+                "epc_V": None,
+                "ipc_A": None,
+                "delta_ep_V": None,
+                "ipa_ipc_ratio": None,
+            },
+            oxidation_peak=medium_high_peak,
+            reduction_peak=None,
+            display_current_unit="uA",
+            current_source="Current",
+            electrode_area_cm2=1.0,
+            analysis_status="Review needed",
+            parser_confidence="High",
+            unit_confidence="High",
+            peak_detection_confidence="Medium-High",
+            warnings=[],
+        )
+        self.assertIn(
+            "selected candidate anodic peak with Medium-High confidence",
+            medium_high_payload["interpretation_guidance"]["peak_wording"],
+        )
+
+    def test_lsv_ai_interpretation_payload_keeps_unit_review_context(self) -> None:
+        payload = APP.build_lsv_ai_interpretation_payload(
+            filename="21_lsv_current_density_do_not_normalize.csv",
+            quick_interpretation="Current-density units require confirmation.",
+            summary={
+                "status": "Review needed",
+                "metadata_completeness": "Incomplete",
+                "onset_label": "Anodic onset potential",
+                "onset_potential": "0.443 V vs Ag/AgCl",
+                "threshold": "3.583 unit unconfirmed",
+                "primary_current_label": "Max anodic current density",
+                "primary_current_value": "Pending unit confirmation",
+                "direction": "Anodic",
+                "reference_electrode": "Ag/AgCl (default)",
+                "reference_electrode_source": "default",
+                "review_note": "Unit confirmation required before interpreting current-dependent metrics.",
+                "scan_rate_note": "Scan rate was not found in metadata.",
+            },
+            warnings=[],
+            notes="",
+        )
+
+        self.assertEqual(payload["technique"], "LSV")
+        self.assertEqual(payload["analysis_status"], "Review needed")
+        self.assertEqual(payload["status_summary"]["analysis_status"], "Review needed")
+        self.assertEqual(payload["status_summary"]["metadata_status"], "Incomplete")
+        self.assertEqual(payload["status_summary"]["unit_status"], "Unconfirmed")
+        self.assertEqual(payload["key_metrics"]["threshold"], "3.583 unit unconfirmed")
+        self.assertTrue(payload["flags"]["unit_confirmation_required"])
+        self.assertEqual(payload["metric_validity"]["threshold"]["status"], "pending_unit_confirmation")
+        self.assertEqual(payload["metric_status"]["threshold"]["status"], "pending_unit_confirmation")
+        self.assertEqual(
+            payload["metric_validity"]["max_anodic_current_density"]["status"],
+            "pending_unit_confirmation",
+        )
+        self.assertEqual(payload["metric_status"]["max_current_density"]["status"], "pending_unit_confirmation")
+        self.assertEqual(payload["metadata_status"]["reference_electrode"]["status"], "defaulted")
+        self.assertIn("Unit confirmation required", " ".join(payload["warnings"]))
+        self.assertNotIn("trace", payload)
+
+    def test_lsv_ai_payload_reports_clean_onset_and_metadata(self) -> None:
+        payload = APP.build_lsv_ai_interpretation_payload(
+            filename="05_clean_lsv_standard.csv",
+            quick_interpretation="Clean anodic LSV onset.",
+            summary={
+                "status": "Passed",
+                "metadata_completeness": "Complete",
+                "onset_label": "Anodic onset potential",
+                "onset_potential": "0.477 V vs SCE",
+                "threshold": "14.82 µA",
+                "threshold_source": "Auto-selected",
+                "direction": "Anodic",
+                "primary_current_label": "Max anodic current",
+                "primary_current_value": "148.18 µA",
+                "potential_range": "-0.100 to 1.100 V",
+                "scan_rate": "10 mV/s",
+                "scan_rate_source": "metadata",
+                "reference_electrode": "SCE",
+                "reference_electrode_source": "metadata",
+            },
+            warnings=[],
+            notes="",
+        )
+
+        self.assertEqual(payload["analysis_status"], "Passed")
+        self.assertFalse(payload["flags"]["requires_review"])
+        self.assertEqual(payload["status_summary"]["analysis_status"], "Passed")
+        self.assertEqual(payload["status_summary"]["metadata_status"], "Complete")
+        self.assertEqual(payload["status_summary"]["unit_status"], "Confirmed")
+        self.assertEqual(payload["available_metadata"]["reference_electrode"], "SCE")
+        self.assertEqual(payload["available_metadata"]["scan_rate"], "10 mV/s")
+        self.assertEqual(payload["metadata_status"]["reference_electrode"]["status"], "detected")
+        self.assertEqual(payload["metadata_status"]["scan_rate"]["status"], "detected")
+        self.assertNotIn("reference_electrode", payload["missing_metadata"])
+        self.assertEqual(payload["metric_validity"]["onset potential"]["status"], "valid")
+        self.assertEqual(payload["metric_validity"]["threshold"]["status"], "valid")
+        self.assertEqual(payload["metric_status"]["onset_potential"]["status"], "valid")
+        self.assertEqual(payload["metric_status"]["max_current"]["status"], "valid")
+
+    def test_ai_interpretation_prompt_contains_guardrails_and_required_sections(self) -> None:
+        payload = {
+            "technique": "CV",
+            "filename": "sample.csv",
+            "analysis_status": "Review needed",
+            "available_metadata": {"reference_electrode": "SCE"},
+            "missing_metadata": ["scan_rate"],
+            "metadata_status": {
+                "scan_rate": {
+                    "value": "0.1 V/s (100 mV/s)",
+                    "unit": "mV/s",
+                    "status": "inferred",
+                    "source": "inferred from time and potential columns",
+                },
+                "reference_electrode": {
+                    "value": "",
+                    "unit": "",
+                    "status": "missing",
+                    "source": "not found in uploaded file",
+                },
+            },
+            "metric_validity": {
+                "Ipa": {
+                    "value": "Pending unit confirmation",
+                    "unit": "µA",
+                    "status": "pending_unit_confirmation",
+                    "reason": "Current unit must be confirmed.",
+                },
+                "ΔEp": {
+                    "value": "Not applicable",
+                    "unit": "mV",
+                    "status": "not_applicable",
+                    "reason": "No reliable Epa/Epc pair.",
+                },
+            },
+            "metric_status": {
+                "Ipa": {
+                    "value": "Pending unit confirmation",
+                    "unit": "µA",
+                    "status": "pending_unit_confirmation",
+                    "reason": "Current unit must be confirmed.",
+                },
+            },
+            "flags": {"behavior_classification": "irreversible_oxidation_only"},
+            "key_metrics": {"Epa": "0.385 V", "Ipa": "Pending unit confirmation"},
+            "warnings": ["Current unit is ambiguous."],
+        }
+        prompt = APP.build_ai_interpretation_prompt(payload)
+
+        self.assertIn("Use only the supplied JSON payload", prompt)
+        self.assertIn("Do not invent values", prompt)
+        self.assertIn("Never infer missing metadata", prompt)
+        self.assertIn("metadata_status", prompt)
+        self.assertIn("metric_status", prompt)
+        self.assertIn("defaulted", prompt)
+        self.assertIn("manual", prompt)
+        self.assertIn("reversible-like", prompt)
+        self.assertIn("metric_validity", prompt)
+        self.assertIn("pending_unit_confirmation", prompt)
+        self.assertIn("not_applicable", prompt)
+        self.assertIn("irreversible", prompt)
+        self.assertIn("unit-unconfirmed LSV", prompt)
+        self.assertIn("Summary", prompt)
+        self.assertIn("Key electrochemical interpretation", prompt)
+        self.assertIn("Data quality and limitations", prompt)
+        self.assertIn("Recommended next steps", prompt)
+        self.assertIn("Suggested lab notebook note", prompt)
+        self.assertIn("requires_researcher_review", prompt)
+        self.assertIn("reviewed by the researcher", prompt)
+        self.assertIn("Do not claim diffusion coefficients", prompt)
+        self.assertIn('"Ipa": "Pending unit confirmation"', prompt)
+
+    def test_ai_interpretation_structured_sections_parse_json_and_plain_text_falls_back(self) -> None:
+        content = """
+        {
+          "summary": "The CV is reversible-like.",
+          "key_interpretation": "The selected peaks are valid.",
+          "data_quality_and_limitations": "Reference metadata is missing.",
+          "recommended_next_steps": "Confirm metadata.",
+          "suggested_lab_notebook_note": "CV loaded and analyzed.",
+          "confidence": "medium",
+          "requires_researcher_review": true
+        }
+        """
+        sections, structured = APP.parse_ai_interpretation_sections(content)
+
+        self.assertTrue(structured)
+        self.assertEqual(sections["summary"], "The CV is reversible-like.")
+        self.assertTrue(sections["requires_researcher_review"])
+
+        fallback_sections, fallback_structured = APP.parse_ai_interpretation_sections("Summary\nPlain text")
+        self.assertFalse(fallback_structured)
+        self.assertEqual(fallback_sections, {})
+
+    def test_ai_researcher_review_label_hides_raw_boolean_values(self) -> None:
+        self.assertEqual(
+            APP.researcher_review_label(False),
+            "Researcher review: Recommended",
+        )
+        self.assertEqual(
+            APP.researcher_review_label(True),
+            "Researcher review: Required before quantitative use",
+        )
+        self.assertNotIn("False", APP.researcher_review_label(False))
+        self.assertNotIn("True", APP.researcher_review_label(True))
+
+    def test_interpretation_limitations_are_deterministic_from_payload_flags(self) -> None:
+        payload = {
+            "metadata_status": {
+                "reference_electrode": {
+                    "value": "",
+                    "unit": "",
+                    "status": "missing",
+                    "source": "not found in uploaded file",
+                },
+                "electrode_area": {
+                    "value": "",
+                    "unit": "cm²",
+                    "status": "missing",
+                    "source": "not found in uploaded file",
+                },
+            },
+            "missing_metadata": ["reference_electrode", "electrode_area"],
+            "flags": {
+                "unit_confirmation_required": True,
+                "requires_review": True,
+            },
+        }
+
+        limitations = APP.interpretation_limitations_from_payload(payload)
+
+        self.assertTrue(any("absolute potentials cannot be compared directly" in item for item in limitations))
+        self.assertTrue(any("current-density comparisons are limited" in item for item in limitations))
+        self.assertTrue(any("Unit confirmation required" in item for item in limitations))
+        self.assertTrue(any("Analysis requires review" in item for item in limitations))
+        self.assertTrue(any("raw arrays are not sent" in item for item in limitations))
+
+    def test_scan_rate_display_includes_source_when_available(self) -> None:
+        self.assertEqual(
+            APP.format_scan_rate_with_source("0.1002 V/s (100.2 mV/s)", "inferred"),
+            "100.2 mV/s (inferred)",
+        )
+        self.assertEqual(
+            APP.format_scan_rate_with_source("0.1 V/s (100 mV/s)", "metadata"),
+            "100 mV/s (metadata)",
+        )
+        self.assertEqual(
+            APP.format_scan_rate_with_source("Not available", "not available"),
+            "Not available",
+        )
+
+    def test_clean_cv_quick_interpretation_adds_metadata_caution_when_requested(self) -> None:
+        behavior = APP.CVBehaviorResult(
+            behavior="reversible_like",
+            label="Reversible-like",
+            oxidation_peak=None,
+            reduction_peak=None,
+            rejected_oxidation_peak=None,
+            rejected_reduction_peak=None,
+            pair_confidence="High",
+            messages=[],
+        )
+        text = APP.cv_interpretation_text(
+            behavior,
+            {"delta_ep_V": 0.09, "ipa_ipc_ratio": 1.1},
+            "High",
+            metadata_caution=True,
+        )
+
+        self.assertIn("Because some experimental metadata are missing", text)
+        self.assertIn("qualitative", text)
+
+    def test_ai_interpretation_hashes_track_payload_and_settings_changes(self) -> None:
+        payload = {
+            "payload_version": "voltscope_ai_interpretation_v1",
+            "technique": "CV",
+            "filename": "sample.csv",
+            "flags": {"requires_review": False},
+            "context": {"display_current_unit": "µA"},
+            "metric_status": {"Epa": {"value": "0.385 V", "status": "valid"}},
+            "metadata_status": {"scan_rate": {"value": "100 mV/s", "status": "inferred"}},
+        }
+        changed_payload = {
+            **payload,
+            "context": {"display_current_unit": "mA"},
+        }
+
+        self.assertNotEqual(APP.ai_interpretation_signature(payload), APP.ai_interpretation_signature(changed_payload))
+        self.assertNotEqual(APP.ai_analysis_settings_signature(payload), APP.ai_analysis_settings_signature(changed_payload))
+
+    def test_ai_interpretation_fallback_without_backend_configuration(self) -> None:
+        response = APP.generate_detailed_ai_interpretation(
+            {"technique": "CV", "key_metrics": {"Epa": "0.385 V"}},
+            environ={},
+        )
+
+        self.assertFalse(response.configured)
+        self.assertEqual(response.content, "")
+        self.assertEqual(response.model, "gpt-4.1-mini")
+        self.assertIn("not configured", response.error)
+        self.assertIn("OPENAI_API_KEY", response.error)
+        self.assertIn("Streamlit secrets", response.error)
+
+    def test_ai_backend_reads_streamlit_secrets_before_environment(self) -> None:
+        backend = APP.load_ai_interpretation_backend()
+
+        self.assertEqual(
+            backend.resolve_openai_api_key(
+                streamlit_secrets={"OPENAI_API_KEY": "secret-key"},
+                environ={"OPENAI_API_KEY": "env-key"},
+            ),
+            "secret-key",
+        )
+        self.assertEqual(
+            backend.resolve_openai_api_key(
+                streamlit_secrets={},
+                environ={"OPENAI_API_KEY": "env-key"},
+            ),
+            "env-key",
+        )
+        self.assertEqual(
+            backend.resolve_openai_model(
+                streamlit_secrets={},
+                environ={},
+            ),
+            "gpt-4.1-mini",
+        )
+
+    def test_ai_interpretation_stale_detection_uses_metric_signature(self) -> None:
+        payload = {"technique": "LSV", "key_metrics": {"onset": "0.443 V"}}
+        saved_state = {"signature": APP.ai_interpretation_signature(payload)}
+
+        self.assertFalse(APP.ai_interpretation_is_stale(saved_state, payload))
+        changed_payload = {"technique": "LSV", "key_metrics": {"onset": "0.477 V"}}
+        self.assertTrue(APP.ai_interpretation_is_stale(saved_state, changed_payload))
 
 
 if __name__ == "__main__":

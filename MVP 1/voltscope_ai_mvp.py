@@ -1,6 +1,6 @@
 """
-VoltScope AI MVP
-----------------
+VoltScope AI
+------------
 A Streamlit app for electrochemistry data analysis.
 
 Current features:
@@ -20,8 +20,12 @@ Run locally:
 
 import io
 import html
+import hashlib
+import importlib.util
 import json
+import logging
 import re
+import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
@@ -173,6 +177,14 @@ class LSVOnsetResult:
     smoothing_window: int
     rejected_potential: Optional[float] = None
     rejected_reason: str = ""
+
+
+@dataclass
+class AIInterpretationResponse:
+    content: str
+    error: str
+    configured: bool
+    model: str = "Not available"
 
 
 @dataclass
@@ -361,6 +373,97 @@ def metadata_rows_for_display(metadata: dict[str, str]) -> tuple[list[dict[str, 
     return parsed_rows, unparsed_rows
 
 
+MANUAL_METADATA_FIELDS: list[tuple[str, str, str]] = [
+    ("sample_name", "Sample name", "Sample or file label"),
+    ("reference_electrode", "Reference electrode", "SCE, Ag/AgCl, RHE..."),
+    ("working_electrode", "Working electrode", "Glassy carbon, Pt, Au..."),
+    ("counter_electrode", "Counter electrode", "Pt wire, graphite rod..."),
+    ("electrode_area", "Electrode area", "0.196 cm²"),
+    ("electrolyte", "Electrolyte", "0.6 M H2SO4"),
+    ("concentration", "Concentration", "10 mM analyte"),
+    ("scan_rate", "Scan rate", "100 mV/s"),
+    ("instrument", "Instrument", "Potentiostat model"),
+    ("technique", "Technique", "Cyclic Voltammetry, LSV..."),
+]
+
+
+def metadata_semantic_key(key: Any) -> str:
+    compact = re.sub(r"[^a-z0-9]+", "", normalize_label(str(key or "")))
+    if compact in {"samplename", "sample", "sampleid", "filename"}:
+        return "sample_name"
+    if compact in {"reference", "ref", "referenceelectrode", "refelectrode"} or (
+        "reference" in compact and "electrode" in compact
+    ):
+        return "reference_electrode"
+    if compact in {"workingelectrode", "working", "we"} or (
+        "working" in compact and "electrode" in compact
+    ):
+        return "working_electrode"
+    if compact in {"counterelectrode", "counter", "ce", "auxiliaryelectrode"} or (
+        ("counter" in compact or "auxiliary" in compact) and "electrode" in compact
+    ):
+        return "counter_electrode"
+    if compact in {"electrodearea", "surfacearea", "geometricarea", "electrodeareacm2"} or (
+        "area" in compact and "electrode" in compact
+    ):
+        return "electrode_area"
+    if compact in {"electrolyte", "solution"}:
+        return "electrolyte"
+    if compact in {"concentration", "molarity", "molality"}:
+        return "concentration"
+    if "scanrate" in compact or ("scan" in compact and "rate" in compact):
+        return "scan_rate"
+    if compact in {"instrument", "potentiostat"}:
+        return "instrument"
+    if compact in {"technique", "method"}:
+        return "technique"
+    return ""
+
+
+def metadata_contains_semantic(metadata: dict[str, str], semantic_key: str) -> bool:
+    return any(metadata_semantic_key(key) == semantic_key for key in metadata)
+
+
+def remove_metadata_semantic(metadata: dict[str, str], semantic_key: str) -> None:
+    for key in list(metadata.keys()):
+        if metadata_semantic_key(key) == semantic_key:
+            metadata.pop(key, None)
+
+
+def merge_manual_metadata(
+    detected_metadata: dict[str, str],
+    structured_metadata: dict[str, str],
+    freeform_metadata: dict[str, str],
+    mode: str,
+) -> dict[str, str]:
+    merged = dict(detected_metadata)
+    override_mode = "override" in mode.lower()
+
+    for label, value in structured_metadata.items():
+        semantic = metadata_semantic_key(label)
+        if override_mode:
+            remove_metadata_semantic(merged, semantic)
+            merged[label] = value
+        elif semantic and not metadata_contains_semantic(merged, semantic):
+            merged[label] = value
+        elif not semantic and label not in merged:
+            merged[label] = value
+
+    for label, value in freeform_metadata.items():
+        semantic = metadata_semantic_key(label)
+        if override_mode and semantic:
+            remove_metadata_semantic(merged, semantic)
+            merged[label] = value
+        elif override_mode:
+            merged[label] = value
+        elif semantic and not metadata_contains_semantic(merged, semantic):
+            merged[label] = value
+        elif not semantic and label not in merged:
+            merged[label] = value
+
+    return merged
+
+
 def normalize_electrode_area_text(value: Any) -> Optional[str]:
     text = str(value).strip()
     match = _NUMBER_RE.search(text)
@@ -434,7 +537,7 @@ def reference_electrode_source_label(reference_electrode: Optional[str], source:
     source_labels = {
         "metadata": "from metadata",
         "default": "default",
-        "user": "user-selected",
+        "user": "confirmed",
     }
     source_text = source_labels.get(source, source)
     return f"{reference_electrode} ({source_text})"
@@ -444,6 +547,99 @@ def reference_electrode_default_note(reference_electrode: Optional[str], source:
     if reference_electrode and source == "default":
         return f"Reference electrode was not found in the file; using default {reference_electrode}."
     return ""
+
+
+def metadata_completeness_for_lsv(
+    *,
+    scan_rate: str,
+    reference_electrode_source: str,
+    current_source: str,
+    display_units: dict[str, Any],
+    electrode_area_metadata: str,
+) -> tuple[str, str]:
+    missing: list[str] = []
+    if not scan_rate or scan_rate == "Not available":
+        missing.append("scan rate")
+    if reference_electrode_source == "default":
+        missing.append("confirmed reference electrode")
+
+    uses_density = current_source == "Current density" or "Current density" in {
+        display_units.get("x_axis"),
+        display_units.get("y_axis"),
+    }
+    area_value = float(display_units.get("electrode_area_cm2", 0.0) or 0.0)
+    area_available = electrode_area_metadata not in {None, "", "Not detected"} or (
+        current_source == "Current" and area_value > 0
+    )
+    if uses_density and not area_available:
+        missing.append("electrode area")
+
+    if not missing:
+        return "Complete", "None"
+    return "Incomplete", ", ".join(missing)
+
+
+def metadata_completeness_status_from_fields(
+    missing_metadata: Optional[list[str]] = None,
+    metadata_status: Optional[dict[str, dict[str, str]]] = None,
+) -> str:
+    missing = [str(field).strip() for field in (missing_metadata or []) if str(field).strip()]
+    metadata_status = metadata_status or {}
+    reference_status = metadata_status.get("reference_electrode", {})
+    if missing or reference_status.get("status") == "defaulted":
+        return "Incomplete"
+    review_statuses = {"low_confidence", "ambiguous", "review_recommended"}
+    if any(record.get("status") in review_statuses for record in metadata_status.values()):
+        return "Review recommended"
+    return "Complete"
+
+
+def unit_status_label(unit_confidence: str, unit_confirmation_required: bool = False) -> str:
+    if unit_confirmation_required:
+        return "Unconfirmed"
+    normalized = str(unit_confidence or "").strip().lower()
+    if normalized in {"confirmed", "confirmed by user", "user-confirmed"}:
+        return "Confirmed"
+    if normalized in {"low", "ambiguous", "review needed"}:
+        return "Review recommended"
+    if normalized in {"medium"}:
+        return "Medium confidence"
+    if normalized in {"high"}:
+        return "High confidence"
+    return str(unit_confidence or "Not available")
+
+
+def lsv_normalization_status_line(
+    current_source: str,
+    display_quantity: str,
+    electrode_area_cm2: float,
+    electrode_area_metadata: Optional[str],
+) -> str:
+    metadata_area = str(electrode_area_metadata or "").strip()
+    metadata_available = metadata_area not in {"", "None", "Not detected"}
+    area_text = metadata_area if metadata_available else (
+        f"{electrode_area_cm2:.1f} cm²"
+        if electrode_area_cm2 == round(electrode_area_cm2)
+        else f"{electrode_area_cm2:g} cm²"
+    )
+    if current_source == "Current density":
+        if metadata_available:
+            return (
+                f"Uploaded signal: current density. Electrode area detected: {metadata_area}. "
+                "Electrode-area normalization was skipped."
+            )
+        return "Uploaded signal: current density. Electrode-area normalization was skipped."
+    if display_quantity == "Current density":
+        return (
+            f"Uploaded signal: current. Current was normalized by VoltScope using electrode area = {area_text} "
+            "and displayed as current density."
+        )
+    if metadata_available:
+        return (
+            f"Uploaded signal: current. Electrode area detected: {metadata_area}. "
+            "Current-density display is available."
+        )
+    return "Uploaded signal: current."
 
 
 def parse_scan_rate_value(text: Any) -> Optional[float]:
@@ -2780,6 +2976,7 @@ def selected_peak_metrics_display_table(
     peak_metric_df: pd.DataFrame,
     display_unit: str,
     baseline_active: bool,
+    review_needed: bool = False,
 ) -> pd.DataFrame:
     display_label = display_unit_label(display_unit)
     current_col = f"current_{display_label}"
@@ -2816,9 +3013,17 @@ def selected_peak_metrics_display_table(
 
     display_df = display_df[[column for column in columns if column in display_df.columns]].copy()
     if "peak" in display_df.columns:
-        display_df["peak"] = display_df["peak"].map(
-            {"oxidation": "Oxidation", "reduction": "Reduction"}
-        ).fillna(display_df["peak"].astype(str).str.title())
+        peak_label_map = (
+            {
+                "oxidation": "Selected candidate oxidation peak",
+                "reduction": "Selected candidate reduction extremum",
+            }
+            if review_needed
+            else {"oxidation": "Oxidation", "reduction": "Reduction"}
+        )
+        display_df["peak"] = display_df["peak"].map(peak_label_map).fillna(
+            display_df["peak"].astype(str).str.title()
+        )
     if "potential_V" in display_df.columns:
         display_df["potential_V"] = display_df["potential_V"].map(format_voltage_table_value)
     current_columns = [
@@ -3725,9 +3930,33 @@ def summarize_scan_rate_for_card(scan_rate_estimate: str) -> Optional[str]:
     match = re.search(r"\(([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*mV/s\)", scan_rate_estimate)
     if match:
         value = float(match.group(1))
-        formatted = f"{value:.0f}" if abs(value) >= 10 else f"{value:.3g}"
+        if abs(value) >= 10:
+            formatted = f"{value:.0f}" if np.isclose(value, round(value), rtol=0, atol=0.05) else f"{value:.1f}"
+        else:
+            formatted = f"{value:.3g}"
         return f"{formatted} mV/s"
     return scan_rate_estimate
+
+
+def scan_rate_source_from_method(method: str) -> str:
+    normalized = str(method or "").lower()
+    if "metadata" in normalized:
+        return "metadata"
+    if "manual" in normalized or "user" in normalized:
+        return "manual"
+    if "dE/dt".lower() in normalized or "time and potential" in normalized:
+        return "inferred"
+    return "not available"
+
+
+def format_scan_rate_with_source(scan_rate_estimate: str, scan_rate_source: str = "") -> str:
+    label = summarize_scan_rate_for_card(scan_rate_estimate)
+    if not label:
+        return "Not available"
+    source = str(scan_rate_source or "").strip().lower()
+    if source in {"inferred", "metadata", "manual"}:
+        return f"{label} ({source})"
+    return label
 
 
 def render_cv_analysis_summary(
@@ -3739,6 +3968,7 @@ def render_cv_analysis_summary(
     current_source: str,
     potential: np.ndarray,
     scan_rate_estimate: str = "Not available",
+    scan_rate_source: str = "",
     cycle_count: str = "Not detected",
     title_suffix: str = "",
     cycle_assignment_uncertain: bool = False,
@@ -3763,7 +3993,7 @@ def render_cv_analysis_summary(
         switch_idx = segments[0][1] - 1
         if 0 <= switch_idx < len(potential) and np.isfinite(potential[switch_idx]):
             switching_potential = f"{potential[switch_idx]:.4g} V"
-    scan_rate_label = summarize_scan_rate_for_card(scan_rate_estimate)
+    scan_rate_display = format_scan_rate_with_source(scan_rate_estimate, scan_rate_source)
     cycle_count_label = None
     if cycle_count and not str(cycle_count).startswith("Not detected"):
         cycle_count_label = str(cycle_count)
@@ -3869,32 +4099,52 @@ def render_cv_analysis_summary(
         ("Analysis status", status),
         ("Unit confidence", unit_confidence),
         ("Parser confidence", parser_confidence),
-        ("Peak detection confidence", confidence_label),
-        ("Overall quality", analysis_quality_override or status),
-        *(
+    ]
+    if cv_behavior is not None and cv_behavior.behavior == "irreversible_oxidation_only":
+        diagnostic_items.extend(
             [
                 ("Oxidation peak confidence", peak_confidence_display(cv_behavior.oxidation_peak, cv_behavior.rejected_oxidation_peak)),
-                ("Reduction peak confidence", peak_confidence_display(cv_behavior.reduction_peak, cv_behavior.rejected_reduction_peak)),
-                ("Pair confidence", cv_behavior.pair_confidence),
+                ("Cathodic return peak confidence", peak_confidence_display(cv_behavior.reduction_peak, cv_behavior.rejected_reduction_peak)),
+                ("Reversible-pair confidence", cv_behavior.pair_confidence),
             ]
-            if cv_behavior is not None
-            else []
-        ),
-        ("Scan mode", scan_mode),
-    ]
+        )
+    elif cv_behavior is not None and cv_behavior.behavior == "irreversible_reduction_only":
+        diagnostic_items.extend(
+            [
+                ("Reduction peak confidence", peak_confidence_display(cv_behavior.reduction_peak, cv_behavior.rejected_reduction_peak)),
+                ("Anodic return peak confidence", peak_confidence_display(cv_behavior.oxidation_peak, cv_behavior.rejected_oxidation_peak)),
+                ("Reversible-pair confidence", cv_behavior.pair_confidence),
+            ]
+        )
+    else:
+        diagnostic_items.append(("Peak detection confidence", confidence_label))
+        if cv_behavior is not None:
+            diagnostic_items.extend(
+                [
+                    ("Oxidation peak confidence", peak_confidence_display(cv_behavior.oxidation_peak, cv_behavior.rejected_oxidation_peak)),
+                    ("Reduction peak confidence", peak_confidence_display(cv_behavior.reduction_peak, cv_behavior.rejected_reduction_peak)),
+                    ("Pair confidence", cv_behavior.pair_confidence),
+                ]
+            )
+    diagnostic_items.extend(
+        [
+            ("Overall quality", analysis_quality_override or status),
+            ("Scan mode", scan_mode),
+        ]
+    )
     if switching_potential:
         diagnostic_items.append(("Switching potential", switching_potential))
     if analyzed_cycle_label:
         diagnostic_items.append(("Analyzed cycle", analyzed_cycle_label))
     elif cycle_count_label:
         diagnostic_items.append(("Cycle count", cycle_count_label))
-    if scan_rate_label:
-        diagnostic_items.append(("Scan rate", scan_rate_label))
+    diagnostic_items.append(("Scan rate", scan_rate_display))
     if selected_couple_label:
         diagnostic_items.append(("Selected redox couple", selected_couple_label))
 
     summary_items = [
         ("CV behavior", behavior_label),
+        ("Scan rate", scan_rate_display),
         ("Epa", epa_value),
         ("Ipa", ipa_value),
         ("Epc", epc_value),
@@ -4285,6 +4535,12 @@ def lsv_threshold_plot_labels(
 ) -> tuple[str, str]:
     unit_label = "unit unconfirmed" if unit_review_required else display_unit_label(display_unit)
     value = f"{abs(float(threshold_display)):.4g} {unit_label}"
+    if unit_review_required:
+        if direction == "cathodic":
+            return f"Magnitude: {value}", f"Threshold: -{value}"
+        if direction == "anodic":
+            return f"Threshold: {value}", f"Magnitude: {value}"
+        return f"Threshold: {value}", f"Threshold: -{value}"
     if direction == "cathodic":
         return f"Magnitude: {value}", f"Threshold: -{value}"
     if direction == "anodic":
@@ -4490,14 +4746,24 @@ def build_lsv_analysis_summary(
             else ""
         )
         method_note = (
-            f"Onset = linearly interpolated potential where {onset_direction} "
-            f"{current_label} first crosses {threshold_note} and remains past the threshold "
+            f"Onset was estimated using the selected threshold rule: linearly interpolated potential where "
+            f"{onset_direction} {current_label} first crosses {threshold_note} and remains past the threshold "
             f"for at least {onset_result.sustained_points_required} points / "
             f"{onset_result.sustained_window_v * 1000:.0f} mV.{reference_note}{smoothing_note}"
         )
     if unit_review_needed:
         status = "Review needed"
         review_note = "Current-dependent metrics may be incorrectly scaled until current unit is confirmed."
+        threshold_text = (
+            f"{format_summary_number(abs(threshold_a))} unit unconfirmed"
+            if threshold_a is not None
+            else "unit unconfirmed"
+        )
+        reference_note = f" Reported vs {reference_electrode}." if reference_electrode else ""
+        method_note = (
+            f"Onset/current-dependent metrics are provisional until the {current_label} unit is confirmed. "
+            f"Threshold = {threshold_text}.{reference_note}"
+        )
 
     finite_current = current_values[np.isfinite(current_values)]
     finite_potential = potential_v[np.isfinite(potential_v)]
@@ -4563,6 +4829,7 @@ def build_lsv_analysis_summary(
         max_value = "Pending unit confirmation"
         min_value = "Pending unit confirmation"
         onset_method = f"{provisional_unit_label} threshold crossing"
+        method_quantity = "Current-density" if current_source == "Current density" else "Signal"
     else:
         primary_current_value = format_lsv_current_value(primary_current, current_unit, current_source, electrode_area_cm2)
         max_value = format_lsv_current_value(max_current, current_unit, current_source, electrode_area_cm2)
@@ -4588,10 +4855,31 @@ def build_lsv_analysis_summary(
             "Electrode area detected. Current-density display is available, but current is currently selected. "
             f"Detected area: {electrode_area_metadata}."
         )
+    normalization_status = lsv_normalization_status_line(
+        current_source,
+        "Current density" if prefer_density else "Current",
+        electrode_area_cm2,
+        electrode_area_metadata,
+    )
+    metadata_completeness, missing_metadata = metadata_completeness_for_lsv(
+        scan_rate=scan_rate,
+        reference_electrode_source=reference_electrode_source,
+        current_source=current_source,
+        display_units=display_units,
+        electrode_area_metadata=electrode_area_metadata,
+    )
+    if scan_rate == "Not available":
+        scan_rate_source = "not available"
+    elif parsed_dataset is not None and scan_rate_from_metadata(parsed_dataset.metadata) is not None:
+        scan_rate_source = "metadata"
+    else:
+        scan_rate_source = "estimated from time/potential data"
 
     return {
         "status": status,
         "review_note": review_note,
+        "metadata_completeness": metadata_completeness,
+        "missing_metadata": missing_metadata,
         "onset_label": onset_label,
         "onset_potential": format_lsv_potential(onset_potential, reference_electrode),
         "onset_method": onset_method,
@@ -4601,6 +4889,8 @@ def build_lsv_analysis_summary(
         "crossing_threshold_label": lsv_crossing_threshold_label(summary_direction),
         "threshold_source": threshold_source,
         "threshold_rule": threshold_rule,
+        "unit_status": "Unconfirmed" if unit_review_needed else "Confirmed",
+        "suggested_unit": display_unit_label(str(display_units.get("suggested_current_unit") or "")),
         "method_note": method_note,
         "onset_confidence": onset_result.confidence,
         "sustained_requirement": (
@@ -4628,7 +4918,10 @@ def build_lsv_analysis_summary(
         "scan_rate": scan_rate,
         "scan_rate_note": scan_rate_note,
         "electrode_area_metadata": electrode_area_metadata,
+        "normalization_status": normalization_status,
         "normalization_note": normalization_note,
+        "reference_electrode_source": reference_electrode_source,
+        "scan_rate_source": scan_rate_source,
         "reference_electrode": reference_electrode_source_label(reference_electrode, reference_electrode_source),
         "reference_note": reference_electrode_default_note(reference_electrode, reference_electrode_source),
     }
@@ -4658,6 +4951,7 @@ def render_lsv_analysis_summary(summary: dict[str, str]) -> None:
         (summary.get("primary_current_label", "Max current"), summary.get("primary_current_value", "Not available")),
         (summary.get("primary_potential_label", "Potential at max current"), summary.get("primary_potential", "Not available")),
         ("Reference electrode", summary.get("reference_electrode", "Not selected")),
+        ("Metadata completeness", summary.get("metadata_completeness", "Not available")),
     ]
     summary_items.append(("Scan rate", str(summary.get("scan_rate", "Not available"))))
     if summary.get("electrode_area_metadata") not in {None, "", "Not detected"}:
@@ -4669,14 +4963,36 @@ def render_lsv_analysis_summary(summary: dict[str, str]) -> None:
         ]
     )
     normalization_note = str(summary.get("normalization_note") or "").strip()
+    normalization_status = str(summary.get("normalization_status") or "").strip()
     diagnostic_items = [
+        ("Unit status", summary.get("unit_status", "Confirmed")),
+        (
+            "Suggested current-density unit"
+            if "current density" in str(summary.get("onset_method", "")).lower()
+            or "/cm" in str(summary.get("suggested_unit", ""))
+            else "Suggested current unit",
+            summary.get("suggested_unit") or "Not needed",
+        ),
         ("Onset method", summary.get("onset_method", "Threshold crossing")),
         *threshold_items,
         ("Threshold source", summary.get("threshold_source", "User-defined")),
         ("Threshold rule", summary.get("threshold_rule", "User-defined threshold.")),
         ("Potential range", summary.get("potential_range", "Not available")),
         ("Scan rate", summary.get("scan_rate", "Not available")),
+        ("Metadata completeness", summary.get("metadata_completeness", "Not available")),
+        ("Missing metadata", summary.get("missing_metadata", "None")),
+        ("Reference electrode source", summary.get("reference_electrode_source", "not available")),
+        ("Scan rate source", summary.get("scan_rate_source", "not available")),
     ]
+    if normalization_status:
+        diagnostic_items.append(("Normalization status", normalization_status))
+    if summary.get("unit_status") == "Unconfirmed":
+        diagnostic_items.append(
+            (
+                "Unit confirmation",
+                "Unit confirmation required before interpreting current-dependent metrics.",
+            )
+        )
     if normalization_note:
         diagnostic_items.append(("Normalization", normalization_note))
     if summary.get("rejected_crossing_reason"):
@@ -4702,6 +5018,8 @@ def render_lsv_analysis_summary(summary: dict[str, str]) -> None:
         """,
         unsafe_allow_html=True,
     )
+    if normalization_status:
+        st.caption(normalization_status)
     if summary.get("method_note"):
         st.caption(summary["method_note"])
     if summary.get("reference_note"):
@@ -4731,6 +5049,7 @@ def format_lsv_display_state(
     electrode_area_metadata: Optional[str] = None,
     unit_review_required: bool = False,
     scan_rate: Optional[str] = None,
+    normalization_status: Optional[str] = None,
 ) -> str:
     current_source = display_units.get("current_source", "Current")
     electrode_area_cm2 = float(display_units.get("electrode_area_cm2", 1.0))
@@ -4756,9 +5075,16 @@ def format_lsv_display_state(
     reference_text = reference_electrode or "Not selected"
 
     analyzed_quantity = "current density" if display_quantity == "Current density" else "current"
+    if unit_review_required:
+        unit_items = ["Units: unconfirmed"]
+        suggested_unit = str(display_units.get("suggested_current_unit") or "").strip()
+        if suggested_unit:
+            unit_items.append(f"Suggested: {display_unit_label(suggested_unit)}")
+    else:
+        unit_items = [f"Units: {display_unit_label(display_units.get('current', 'mA/cm^2'))}"]
     context_items = [
         f"Analyzed as: {analyzed_quantity} vs potential",
-        f"Units: {display_unit_label(display_units.get('current', 'mA/cm^2'))}",
+        *unit_items,
         f"Threshold: {threshold_text}",
     ]
     if reference_text:
@@ -4770,6 +5096,8 @@ def format_lsv_display_state(
         context_items.append(f"Area: {area_text} cm\u00b2")
     if scan_rate:
         context_items.append(f"Scan rate: {scan_rate.lower() if scan_rate == 'Not available' else scan_rate}")
+    if normalization_status:
+        context_items.append(str(normalization_status))
     return " \u00b7 ".join(context_items)
 
 
@@ -4852,6 +5180,7 @@ def build_lsv_detailed_metrics(
     electrode_area_metadata = "Not detected"
     reference_metadata = "Not detected"
     scan_rate_method = "Estimated from dE/dt when time and potential columns are available."
+    scan_rate_source_value = "not available"
     if parsed_dataset is not None:
         potential_col = record.get("columns", {}).get("potential")
         scan_rate_estimate = scan_rate_estimate_summary(parsed_dataset, potential_col)
@@ -4859,6 +5188,12 @@ def build_lsv_detailed_metrics(
         if scan_rate == "Not available":
             scan_rate_note = scan_rate_unavailable_reason(parsed_dataset, potential_col)
         scan_rate_method = scan_rate_method_summary(parsed_dataset, potential_col)
+        if scan_rate != "Not available":
+            if scan_rate_from_metadata(parsed_dataset.metadata) is not None:
+                scan_rate_source_value = "metadata"
+                scan_rate_method = "Parsed from file metadata."
+            else:
+                scan_rate_source_value = "estimated"
         electrode_area_metadata = electrode_area_metadata_summary(parsed_dataset.metadata) or "Not detected"
         reference_metadata = reference_electrode_from_metadata(parsed_dataset.metadata) or "Not detected"
 
@@ -4867,8 +5202,9 @@ def build_lsv_detailed_metrics(
     )
     threshold_method = threshold_rule
     crossing_method = (
-        f"Linear interpolation where {current_label} crosses the selected threshold and stays past it "
-        f"for at least {onset_result.sustained_points_required} points / "
+        f"Onset was estimated using the selected threshold rule: linearly interpolated potential where "
+        f"{current_label} crosses the selected threshold and stays past it for at least "
+        f"{onset_result.sustained_points_required} points / "
         f"{onset_result.sustained_window_v * 1000:.0f} mV."
     )
     if onset_result.smoothing_method != "None":
@@ -4899,10 +5235,18 @@ def build_lsv_detailed_metrics(
             if current_source == "Current density"
             else "Sustained signal threshold crossing"
         )
+        crossing_method = "Unit confirmation required before interpreting current-dependent metrics."
     else:
         max_current_value = format_lsv_current_value(max_current, current_unit, current_source, electrode_area_cm2)
         min_current_value = format_lsv_current_value(min_current, current_unit, current_source, electrode_area_cm2)
         onset_method_value = "Sustained current-density threshold crossing" if is_density else "Sustained current threshold crossing"
+    display_quantity = "Current density" if display_units.get("y_axis") == "Current density" else "Current"
+    normalization_status = lsv_normalization_status_line(
+        current_source,
+        display_quantity,
+        electrode_area_cm2,
+        electrode_area_metadata,
+    )
     threshold_rows = (
         [
             {
@@ -4926,6 +5270,18 @@ def build_lsv_detailed_metrics(
         ]
     )
     rows = [
+        {
+            "Metric": "Unit status",
+            "Value": "Unconfirmed" if unit_review_needed else "Confirmed",
+            "Method": "Unit confirmation required before interpreting current-dependent metrics."
+            if unit_review_needed
+            else "Current/current-density unit is confirmed or confidently detected.",
+        },
+        {
+            "Metric": "Suggested current-density unit" if current_source == "Current density" else "Suggested current unit",
+            "Value": display_unit_label(str(display_units.get("suggested_current_unit") or "Not needed")),
+            "Method": "Suggested from filename, metadata, or value magnitude when the header unit is missing.",
+        },
         {
             "Metric": onset_label,
             "Value": format_lsv_potential(onset_potential, reference_electrode),
@@ -5002,6 +5358,11 @@ def build_lsv_detailed_metrics(
             "Method": scan_rate_note or scan_rate_method,
         },
         {
+            "Metric": "Scan rate source",
+            "Value": scan_rate_source_value,
+            "Method": scan_rate_method,
+        },
+        {
             "Metric": "Reference electrode metadata",
             "Value": reference_metadata,
             "Method": "Reference electrode parsed from file metadata, when available.",
@@ -5010,6 +5371,11 @@ def build_lsv_detailed_metrics(
             "Metric": "Electrode area metadata",
             "Value": electrode_area_metadata,
             "Method": "Electrode area parsed from file metadata, when available.",
+        },
+        {
+            "Metric": "Normalization status",
+            "Value": normalization_status,
+            "Method": "Tracks whether the uploaded y-signal was raw current, current density, or normalized by VoltScope.",
         },
         {
             "Metric": "Number of points",
@@ -5541,7 +5907,7 @@ def representative_scan_rate_v_s(time_s: np.ndarray, potential_v: np.ndarray) ->
 def scan_rate_estimate_summary(dataset: ParsedDataset, potential_col: Optional[str]) -> str:
     time_col = dataset.detected_time_col
     if not time_col:
-        excluded = {potential_col} if potential_col else set()
+        excluded = {column for column in [potential_col, dataset.detected_current_col] if column}
         time_col = detect_column_by_role(dataset.dataframe, "time", excluded=excluded)
     if not time_col or not potential_col or time_col not in dataset.dataframe or potential_col not in dataset.dataframe:
         metadata_scan_rate = scan_rate_from_metadata(dataset.metadata)
@@ -5565,10 +5931,13 @@ def scan_rate_unavailable_reason(dataset: ParsedDataset, potential_col: Optional
         return ""
     time_col = dataset.detected_time_col
     if not time_col:
-        excluded = {potential_col} if potential_col else set()
+        excluded = {column for column in [potential_col, dataset.detected_current_col] if column}
         time_col = detect_column_by_role(dataset.dataframe, "time", excluded=excluded)
     if not time_col:
-        return "Scan rate could not be estimated because no time column was found."
+        return (
+            "Scan rate was not found in metadata and could not be estimated because no time column "
+            "was detected. Add scan rate metadata if scan-rate-dependent interpretation is needed."
+        )
     if not potential_col or time_col not in dataset.dataframe or potential_col not in dataset.dataframe:
         return "Scan rate could not be estimated because the required time or potential column was unavailable."
     return "Scan rate could not be estimated from the available time and potential values."
@@ -5579,7 +5948,7 @@ def scan_rate_method_summary(dataset: Optional[ParsedDataset], potential_col: Op
         return "Estimated from dE/dt when time and potential columns are available."
     time_col = dataset.detected_time_col
     if not time_col:
-        excluded = {potential_col} if potential_col else set()
+        excluded = {column for column in [potential_col, dataset.detected_current_col] if column}
         time_col = detect_column_by_role(dataset.dataframe, "time", excluded=excluded)
     if time_col and potential_col and time_col in dataset.dataframe and potential_col in dataset.dataframe:
         time_values = dataset.dataframe[time_col].to_numpy(dtype=float)
@@ -5756,6 +6125,8 @@ def parser_summary_details(
 
     metadata_rows_before_header = max((dataset.header_row or dataset.data_start_row) - 1, 0)
     scan_rate_estimate = scan_rate_estimate_summary(dataset, potential_col)
+    scan_rate_method = scan_rate_method_summary(dataset, potential_col)
+    scan_rate_source = scan_rate_source_from_method(scan_rate_method)
     scan_rate_note = ""
     if scan_rate_estimate == "Not available":
         scan_rate_note = scan_rate_unavailable_reason(dataset, potential_col)
@@ -5811,6 +6182,8 @@ def parser_summary_details(
         if potential_col and current_col
         else "Not available",
         "scan_rate_estimate": scan_rate_estimate,
+        "scan_rate_method": scan_rate_method,
+        "scan_rate_source": scan_rate_source,
         "scan_rate_note": scan_rate_note,
         "cycle_count": cycle_count_summary(dataset, potential_col),
         "reference_electrode_metadata": reference_electrode_metadata,
@@ -6390,12 +6763,9 @@ def add_generic_trace(
 
 
 def render_detected_metadata(metadata: dict[str, str], manual_metadata_key: str) -> None:
-    manual_metadata = parse_manual_metadata_text(str(st.session_state.get(manual_metadata_key, "") or ""))
-    if manual_metadata:
-        metadata.update(manual_metadata)
-
+    detected_metadata = dict(metadata)
     st.markdown("**Detected metadata**")
-    parsed_rows, unparsed_rows = metadata_rows_for_display(metadata)
+    parsed_rows, unparsed_rows = metadata_rows_for_display(detected_metadata)
 
     if parsed_rows:
         st.dataframe(pd.DataFrame(parsed_rows), width="stretch", hide_index=True)
@@ -6408,18 +6778,63 @@ def render_detected_metadata(metadata: dict[str, str], manual_metadata_key: str)
         with st.expander("Unparsed metadata lines", expanded=False):
             st.dataframe(pd.DataFrame(unparsed_rows), width="stretch", hide_index=True)
 
-    if metadata:
-        with st.expander("Advanced/debug raw metadata", expanded=False):
-            st.json(metadata)
+    st.markdown("**Manual file metadata**")
+    manual_mode_key = f"{manual_metadata_key}::mode"
+    manual_mode = st.radio(
+        "Manual metadata mode",
+        ["Add/complement detected metadata", "Override detected metadata with manual entries"],
+        horizontal=False,
+        key=manual_mode_key,
+    )
+    st.caption(
+        "Use add/complement to fill missing metadata without replacing detected values. "
+        "Use override when the file metadata is wrong and the manual entry should be used instead."
+    )
 
-    st.text_area(
-        "Manual file metadata",
+    structured_manual: dict[str, str] = {}
+    field_columns = st.columns(2)
+    for idx, (field_id, label, placeholder) in enumerate(MANUAL_METADATA_FIELDS):
+        with field_columns[idx % 2]:
+            value = st.text_input(
+                label,
+                placeholder=placeholder,
+                key=f"{manual_metadata_key}::{field_id}",
+            )
+        if str(value or "").strip():
+            structured_manual[label] = str(value).strip()
+
+    freeform_text = st.text_area(
+        "Additional metadata lines",
         placeholder=(
-            "Add sample name, electrode, electrolyte, concentration, scan rate, instrument, "
-            "reference electrode, or other file-specific metadata."
+            "Optional: add extra metadata as 'Field: value' lines, such as electrolyte, scan rate, "
+            "instrument, reference electrode, or other file-specific metadata."
         ),
         key=manual_metadata_key,
     )
+    freeform_manual = parse_manual_metadata_text(str(freeform_text or ""))
+    effective_metadata = merge_manual_metadata(
+        detected_metadata,
+        structured_manual,
+        freeform_manual,
+        manual_mode,
+    )
+    metadata.clear()
+    metadata.update(effective_metadata)
+
+    manual_applied = bool(structured_manual or freeform_manual)
+    if manual_applied:
+        st.caption(
+            "Manual metadata applied: "
+            + ("matching detected fields are overridden." if "override" in manual_mode.lower() else "missing fields are complemented.")
+        )
+        effective_rows, _effective_unparsed = metadata_rows_for_display(effective_metadata)
+        if effective_rows:
+            st.markdown("**Metadata used by analysis**")
+            st.dataframe(pd.DataFrame(effective_rows), width="stretch", hide_index=True)
+
+    if effective_metadata:
+        with st.expander("Advanced/debug raw metadata", expanded=False):
+            st.json(effective_metadata)
 
 
 def render_generic_experiment_analysis(
@@ -6789,6 +7204,20 @@ def render_generic_experiment_analysis(
             selected_current_col_for_review,
             selected_units.get("current", "Auto"),
         )
+        display_units.pop("suggested_current_unit", None)
+        if (
+            display_units["unit_review_required"]
+            and selected_current_col_for_review
+            and selected_current_col_for_review in selected_dataset_for_review.dataframe
+        ):
+            suggested_input_unit = suggested_current_unit_for_context(
+                selected_dataset_for_review.dataframe[selected_current_col_for_review].to_numpy(dtype=float),
+                current_source,
+            )
+            display_units["suggested_current_unit"] = current_unit_label_for_summary(
+                suggested_input_unit,
+                current_source,
+            )
         display_units["current"] = lsv_display_unit_for_records(
             records,
             current_source,
@@ -7006,7 +7435,7 @@ def render_generic_experiment_analysis(
                     selected_current_unit_review_needed or selected_current_magnitude_review_needed,
                 )
                 st.markdown(
-                    f"<div class=\"analysis-file\">{escape_html(format_lsv_display_state(display_units, lsv_threshold_a, reference_electrode, selected_metadata_area, bool(display_units.get('unit_review_required')), selected_lsv_summary_for_interpretation.get('scan_rate')))}</div>",
+                    f"<div class=\"analysis-file\">{escape_html(format_lsv_display_state(display_units, lsv_threshold_a, reference_electrode, selected_metadata_area, bool(display_units.get('unit_review_required')), selected_lsv_summary_for_interpretation.get('scan_rate'), selected_lsv_summary_for_interpretation.get('normalization_status')))}</div>",
                     unsafe_allow_html=True,
                 )
                 lsv_quality_items, lsv_quality_review = lsv_data_quality_items(
@@ -7015,6 +7444,7 @@ def render_generic_experiment_analysis(
                 )
                 render_data_quality_strip(lsv_quality_items, lsv_quality_review)
                 render_lsv_analysis_summary(selected_lsv_summary_for_interpretation)
+                render_metadata_status_notice(selected_lsv_summary_for_interpretation)
                 render_recommended_actions(
                     [
                         str(selected_lsv_summary_for_interpretation.get("review_note") or ""),
@@ -7034,7 +7464,8 @@ def render_generic_experiment_analysis(
                 else "Current"
             )
             reference_caption = f", reported vs {reference_electrode}" if reference_electrode else ""
-            st.caption(f"{lsv_plot_quantity} vs potential{reference_caption}")
+            review_caption = " \u00b7 unit confirmation required" if display_units.get("unit_review_required") else ""
+            st.caption(f"{lsv_plot_quantity} vs potential{reference_caption}{review_caption}")
         fig = go.Figure()
         for record in records:
             add_generic_trace(fig, record, experiment_type, display_units, show_markers)
@@ -7172,9 +7603,28 @@ def render_generic_experiment_analysis(
             on_click="ignore",
         )
         if is_lsv:
+            lsv_quick_interpretation = lsv_interpretation_text(selected_lsv_summary_for_interpretation)
+            selected_lsv_warnings = []
+            if selected_lsv_summary_for_interpretation:
+                selected_lsv_warnings = compact_text_list(
+                    [
+                        selected_lsv_summary_for_interpretation.get("review_note", ""),
+                        selected_lsv_summary_for_interpretation.get("scan_rate_note", ""),
+                    ]
+                )
             render_interpretation_panel(
-                lsv_interpretation_text(selected_lsv_summary_for_interpretation),
+                lsv_quick_interpretation,
                 key=f"lsv_ai_interpretation_placeholder::{project_name}::{experiment_id}",
+                ai_payload=build_lsv_ai_interpretation_payload(
+                    filename=selected_filename,
+                    quick_interpretation=lsv_quick_interpretation,
+                    summary=selected_lsv_summary_for_interpretation,
+                    warnings=selected_lsv_warnings,
+                    notes=str(project_workspace.get("experiments", {}).get(experiment_id, {}).get("notes", "")),
+                ),
+                project_workspace=project_workspace,
+                experiment_id=experiment_id,
+                interpretation_id=f"lsv::{selected_filename}",
             )
 
     results_df = build_generic_results(
@@ -8628,9 +9078,17 @@ def render_recommended_actions(messages: list[str], key_prefix: str) -> None:
             action = "Review peak controls"
         elif "unit" in lowered:
             title = "Confirm units"
+            if "density" in lowered:
+                message = "Confirm the current-density unit before using current-density-dependent metrics."
+            elif "current" in lowered:
+                message = "Confirm the current unit before using current-dependent metrics."
             action = "Review unit mapping"
         elif "scan rate" in lowered:
-            title = "Scan rate unavailable"
+            title = "Add scan-rate metadata"
+            message = (
+                "Scan rate was not found in metadata and could not be estimated because no time column "
+                "was detected. Add scan rate metadata if scan-rate-dependent interpretation is needed."
+            )
             action = "Add scan-rate metadata"
         elif "cycle" in lowered:
             title = "Review cycle selection"
@@ -8653,7 +9111,14 @@ def render_recommended_actions(messages: list[str], key_prefix: str) -> None:
                 action = "Review candidate peaks"
         else:
             title = "Review recommended"
-            action = "Open advanced details"
+            if "selected oxidation peak occurs at a lower potential" in lowered or "invalid" in lowered:
+                message = (
+                    "Review candidate peaks, smoothing, and baseline correction before using \u0394Ep, "
+                    "E\u00b0\u2032, or peak-current ratio."
+                )
+                action = "Review candidate peaks"
+            else:
+                action = "Open advanced details"
         card = (title, message, action)
         if card in seen_action_cards:
             continue
@@ -8830,14 +9295,1354 @@ def lsv_data_quality_items(summary: Optional[dict[str, str]], unit_review_requir
         items.extend(["Onset detected", "Sustained threshold crossing confirmed"])
     else:
         items.append("Onset review recommended")
+    metadata_status = summary.get("metadata_completeness")
     if status == "Passed":
-        items.append("No review required")
+        if metadata_status == "Complete":
+            items.append("No review required")
     elif status:
         items.append(status)
-    return items, status != "Passed"
+    return items, status != "Passed" or metadata_status == "Review recommended"
 
 
-def render_interpretation_panel(text: str, key: str) -> None:
+def metadata_status_notice(summary: Optional[dict[str, Any]]) -> Optional[str]:
+    if not summary:
+        return None
+    metadata_status = str(summary.get("metadata_completeness") or "").strip()
+    if metadata_status not in {"Incomplete", "Review recommended"}:
+        return None
+    missing = str(summary.get("missing_metadata") or "").strip()
+    if missing and missing != "None":
+        return f"Metadata completeness: {metadata_status}. Missing or unconfirmed: {missing}."
+    return f"Metadata completeness: {metadata_status}."
+
+
+def render_metadata_status_notice(summary: Optional[dict[str, Any]]) -> None:
+    notice = metadata_status_notice(summary)
+    if not notice:
+        return
+    st.warning(
+        notice
+        + " Analysis can still pass when the numerical result is valid, but confirm metadata before publication-level interpretation."
+    )
+
+
+def cv_metadata_summary_from_parser_details(details: dict[str, Any], current_source: str) -> dict[str, Any]:
+    missing: list[str] = []
+    if details.get("scan_rate_estimate") == "Not available":
+        missing.append("scan rate")
+    if details.get("reference_electrode_metadata") == "Not detected":
+        missing.append("reference electrode")
+    if current_source == "Current density" and details.get("electrode_area_metadata") == "Not detected":
+        missing.append("electrode area")
+    return {
+        "metadata_completeness": "Incomplete" if missing else "Complete",
+        "missing_metadata": ", ".join(missing) if missing else "None",
+    }
+
+
+def compact_text_list(values: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    compacted: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        compacted.append(text)
+    return compacted
+
+
+def formatted_ai_float(value: Any, unit: str = "", precision: int = 4) -> str:
+    if value is None:
+        return "Not available"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not np.isfinite(numeric):
+        return "Not available"
+    suffix = f" {display_unit_label(unit)}" if unit else ""
+    return f"{numeric:.{precision}g}{suffix}"
+
+
+def ai_current_metric_value(
+    current_a: Optional[float],
+    display_unit: str,
+    current_source: str,
+    electrode_area_cm2: float,
+    unit_confidence: str,
+    precision: int = 4,
+) -> str:
+    if pending_current_metric(unit_confidence):
+        return "Pending unit confirmation"
+    if current_a is None:
+        return "Not detected"
+    display_value = current_to_display(
+        np.array([current_a]),
+        display_unit,
+        current_source,
+        electrode_area_cm2,
+    )[0]
+    return formatted_ai_float(display_value, display_unit, precision)
+
+
+def metric_status_record(
+    value: str,
+    unit: str,
+    status: str,
+    reason: str = "",
+) -> dict[str, str]:
+    record = {
+        "value": value,
+        "unit": display_unit_label(unit) if unit else "",
+        "status": status,
+    }
+    if reason:
+        record["reason"] = reason
+    return record
+
+
+def metadata_status_record(
+    value: Any = None,
+    unit: str = "",
+    status: str = "missing",
+    source: str = "not found in uploaded file",
+) -> dict[str, str]:
+    text = str(value or "").strip()
+    if not text or text in {"Not available", "Not detected", "None"}:
+        text = ""
+    return {
+        "value": text,
+        "unit": display_unit_label(unit) if unit else "",
+        "status": status,
+        "source": source,
+    }
+
+
+def metadata_value_is_available(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and text not in {"Not available", "Not detected", "None"}
+
+
+def strip_reference_source_label(value: Any) -> str:
+    text = str(value or "").strip()
+    return re.sub(r"\s*\((?:from metadata|default|confirmed|user-selected)\)\s*$", "", text)
+
+
+def metadata_lookup(metadata: Optional[dict[str, str]], aliases: set[str]) -> Optional[str]:
+    if not metadata:
+        return None
+    for key, value in metadata.items():
+        compact_key = re.sub(r"[^a-z0-9]+", "", str(key).lower())
+        compact_value = str(value or "").strip()
+        if not compact_value:
+            continue
+        if compact_key in aliases or any(alias in compact_key for alias in aliases):
+            return compact_value
+    return None
+
+
+def available_metadata_from_context(
+    *,
+    metadata: Optional[dict[str, str]] = None,
+    scan_rate: Any = None,
+    electrode_area: Any = None,
+    reference_electrode: Any = None,
+    reference_electrode_source: str = "",
+) -> dict[str, Any]:
+    available: dict[str, Any] = {}
+    scan_rate_text = str(scan_rate or "").strip()
+    if scan_rate_text and scan_rate_text != "Not available":
+        available["scan_rate"] = scan_rate_text
+
+    area_text = str(electrode_area or "").strip()
+    if area_text and area_text not in {"Not detected", "Not available"}:
+        available["electrode_area"] = area_text
+
+    reference_text = strip_reference_source_label(reference_electrode)
+    if reference_text and reference_electrode_source not in {"default", "not available"}:
+        available["reference_electrode"] = reference_text
+
+    metadata = metadata or {}
+    field_aliases = {
+        "electrolyte": {"electrolyte", "solution"},
+        "concentration": {"concentration", "molarity", "molality"},
+        "working_electrode": {"workingelectrode", "working", "we"},
+        "counter_electrode": {"counterelectrode", "counter", "ce", "auxiliaryelectrode"},
+        "instrument": {"instrument", "potentiostat"},
+    }
+    for field, aliases in field_aliases.items():
+        value = metadata_lookup(metadata, aliases)
+        if value:
+            available[field] = value
+
+    metadata_reference = reference_electrode_from_metadata(metadata)
+    if metadata_reference:
+        available["reference_electrode"] = metadata_reference
+    metadata_area = electrode_area_metadata_summary(metadata)
+    if metadata_area:
+        available["electrode_area"] = metadata_area
+    metadata_scan_rate = scan_rate_from_metadata(metadata)
+    if metadata_scan_rate is not None:
+        available["scan_rate"] = scan_rate_summary_from_value(metadata_scan_rate)
+
+    return available
+
+
+def metadata_status_from_context(
+    *,
+    metadata: Optional[dict[str, str]] = None,
+    scan_rate: Any = None,
+    scan_rate_source: str = "",
+    electrode_area: Any = None,
+    electrode_area_source: str = "",
+    reference_electrode: Any = None,
+    reference_electrode_source: str = "",
+    cycle_count: Any = None,
+    cycle_assignment_uncertain: bool = False,
+    scan_mode: Any = None,
+) -> dict[str, dict[str, str]]:
+    metadata = metadata or {}
+    status: dict[str, dict[str, str]] = {
+        "scan_rate": metadata_status_record(unit="mV/s"),
+        "electrode_area": metadata_status_record(unit="cm²"),
+        "reference_electrode": metadata_status_record(),
+        "electrolyte": metadata_status_record(),
+        "concentration": metadata_status_record(),
+        "working_electrode": metadata_status_record(),
+        "counter_electrode": metadata_status_record(),
+        "cycle_count": metadata_status_record(status="not_applicable", source="not applicable for this technique"),
+        "scan_mode": metadata_status_record(status="not_applicable", source="not applicable for this technique"),
+    }
+
+    metadata_scan_rate = scan_rate_from_metadata(metadata)
+    if metadata_scan_rate is not None:
+        status["scan_rate"] = metadata_status_record(
+            scan_rate_summary_from_value(metadata_scan_rate),
+            "mV/s",
+            "detected",
+            "parsed from file metadata",
+        )
+    elif metadata_value_is_available(scan_rate):
+        source = str(scan_rate_source or "").lower()
+        if "metadata" in source:
+            scan_status = "detected"
+            scan_source = "parsed from file metadata"
+        elif "manual" in source or "user" in source:
+            scan_status = "manual"
+            scan_source = "manual user entry"
+        else:
+            scan_status = "inferred"
+            scan_source = "inferred from time and potential columns"
+        status["scan_rate"] = metadata_status_record(scan_rate, "mV/s", scan_status, scan_source)
+
+    metadata_area = electrode_area_metadata_summary(metadata)
+    if metadata_area:
+        status["electrode_area"] = metadata_status_record(
+            metadata_area,
+            "cm²",
+            "detected",
+            "parsed from file metadata",
+        )
+    elif metadata_value_is_available(electrode_area):
+        area_source = str(electrode_area_source or "").lower()
+        if "metadata" in area_source:
+            status["electrode_area"] = metadata_status_record(
+                electrode_area,
+                "cm²",
+                "detected",
+                "parsed from file metadata",
+            )
+        elif "manual" in area_source or "user" in area_source:
+            status["electrode_area"] = metadata_status_record(
+                electrode_area,
+                "cm²",
+                "manual",
+                "manual user entry",
+            )
+        else:
+            status["electrode_area"] = metadata_status_record(
+                electrode_area,
+                "cm²",
+                "inferred",
+                "provided by app context",
+            )
+
+    metadata_reference = reference_electrode_from_metadata(metadata)
+    if metadata_reference:
+        status["reference_electrode"] = metadata_status_record(
+            metadata_reference,
+            "",
+            "detected",
+            "parsed from file metadata",
+        )
+    elif metadata_value_is_available(reference_electrode):
+        reference_value = strip_reference_source_label(reference_electrode)
+        source = str(reference_electrode_source or "").lower()
+        if "metadata" in source:
+            status["reference_electrode"] = metadata_status_record(
+                reference_value,
+                "",
+                "detected",
+                "parsed from file metadata",
+            )
+        elif "default" in source:
+            status["reference_electrode"] = metadata_status_record(
+                reference_value,
+                "",
+                "defaulted",
+                "application default",
+            )
+        elif "manual" in source or "user" in source or "confirmed" in source:
+            status["reference_electrode"] = metadata_status_record(
+                reference_value,
+                "",
+                "manual",
+                "manual user entry",
+            )
+
+    field_aliases = {
+        "electrolyte": {"electrolyte", "solution"},
+        "concentration": {"concentration", "molarity", "molality"},
+        "working_electrode": {"workingelectrode", "working", "we"},
+        "counter_electrode": {"counterelectrode", "counter", "ce", "auxiliaryelectrode"},
+    }
+    for field, aliases in field_aliases.items():
+        value = metadata_lookup(metadata, aliases)
+        if value:
+            status[field] = metadata_status_record(value, "", "detected", "parsed from file metadata")
+
+    if metadata_value_is_available(cycle_count):
+        cycle_status = "inferred" if cycle_assignment_uncertain else "detected"
+        cycle_source = (
+            "inferred from potential turning points"
+            if cycle_assignment_uncertain
+            else "detected from cycle column or parsed numeric data"
+        )
+        status["cycle_count"] = metadata_status_record(cycle_count, "", cycle_status, cycle_source)
+
+    if metadata_value_is_available(scan_mode):
+        status["scan_mode"] = metadata_status_record(
+            scan_mode,
+            "",
+            "inferred",
+            "inferred from potential direction",
+        )
+
+    return status
+
+
+def missing_metadata_fields(
+    available_metadata: dict[str, Any],
+    required_fields: Optional[list[str]] = None,
+) -> list[str]:
+    fields = required_fields or [
+        "scan_rate",
+        "reference_electrode",
+        "electrode_area",
+        "electrolyte",
+        "concentration",
+        "working_electrode",
+        "counter_electrode",
+        "instrument",
+    ]
+    return [field for field in fields if field not in available_metadata]
+
+
+def cv_metric_validity(
+    metrics: dict[str, Optional[float]],
+    *,
+    display_current_unit: str,
+    current_source: str,
+    electrode_area_cm2: float,
+    unit_confidence: str,
+    cv_behavior: Optional[CVBehaviorResult],
+    pair_metric_review: Optional[str],
+    pair_metrics_valid: bool,
+) -> dict[str, dict[str, str]]:
+    behavior = cv_behavior.behavior if cv_behavior is not None else "unknown"
+    pair_reason = pair_metric_review or ""
+    epa = metrics.get("epa_V")
+    epc = metrics.get("epc_V")
+    ipa = metrics.get("ipa_A")
+    ipc = metrics.get("ipc_A")
+    delta_ep = metrics.get("delta_ep_V")
+    formal_potential = (epa + epc) / 2 if epa is not None and epc is not None else None
+    current_pending = pending_current_metric(unit_confidence)
+
+    validity = {
+        "Epa": metric_status_record(
+            formatted_ai_float(epa, "V") if epa is not None else "Not detected",
+            "V",
+            "valid" if epa is not None else "not_detected",
+            "" if epa is not None else "No reliable oxidation peak was selected.",
+        ),
+        "Ipa": metric_status_record(
+            ai_current_metric_value(ipa, display_current_unit, current_source, electrode_area_cm2, unit_confidence),
+            display_current_unit,
+            "pending_unit_confirmation" if current_pending else ("valid" if ipa is not None else "not_detected"),
+            "Current unit must be confirmed before interpreting peak current."
+            if current_pending
+            else ("" if ipa is not None else "No reliable oxidation peak current was selected."),
+        ),
+        "Epc": metric_status_record(
+            formatted_ai_float(epc, "V") if epc is not None else "Not detected",
+            "V",
+            "valid" if epc is not None else "not_detected",
+            "" if epc is not None else "No reliable reduction peak was selected.",
+        ),
+        "Ipc": metric_status_record(
+            ai_current_metric_value(ipc, display_current_unit, current_source, electrode_area_cm2, unit_confidence),
+            display_current_unit,
+            "pending_unit_confirmation" if current_pending else ("valid" if ipc is not None else "not_detected"),
+            "Current unit must be confirmed before interpreting peak current."
+            if current_pending
+            else ("" if ipc is not None else "No reliable reduction peak current was selected."),
+        ),
+    }
+
+    if pair_metrics_valid and delta_ep is not None:
+        validity["\u0394Ep"] = metric_status_record(formatted_ai_float(delta_ep * 1000, "mV"), "mV", "valid")
+    else:
+        pair_status = "not_applicable" if behavior.startswith("irreversible") else "invalid"
+        validity["\u0394Ep"] = metric_status_record(
+            "Not applicable" if pair_status == "not_applicable" else "Invalid",
+            "mV",
+            pair_status,
+            pair_reason or "A reliable reversible Epa/Epc pair was not selected.",
+        )
+
+    if pair_metrics_valid and formal_potential is not None:
+        validity["E\u00b0\u2032"] = metric_status_record(formatted_ai_float(formal_potential, "V"), "V", "valid")
+    else:
+        pair_status = "not_applicable" if behavior.startswith("irreversible") else "invalid"
+        validity["E\u00b0\u2032"] = metric_status_record(
+            "Not applicable" if pair_status == "not_applicable" else "Invalid",
+            "V",
+            pair_status,
+            pair_reason or "A reliable reversible Epa/Epc pair was not selected.",
+        )
+
+    ratio = metrics.get("ipa_ipc_ratio")
+    if current_pending:
+        validity["|Ipa/Ipc|"] = metric_status_record(
+            "Pending unit confirmation",
+            "",
+            "pending_unit_confirmation",
+            "Current unit must be confirmed before interpreting current-dependent metrics.",
+        )
+    elif pair_metrics_valid and ratio is not None:
+        validity["|Ipa/Ipc|"] = metric_status_record(formatted_ai_float(ratio, ""), "", "valid")
+    else:
+        pair_status = "not_applicable" if behavior.startswith("irreversible") else "invalid"
+        validity["|Ipa/Ipc|"] = metric_status_record(
+            "Not meaningful" if pair_status == "not_applicable" else "Invalid",
+            "",
+            pair_status,
+            pair_reason or "A reliable reversible Epa/Epc pair was not selected.",
+        )
+
+    return validity
+
+
+def cv_metric_status(
+    metric_validity: dict[str, dict[str, str]],
+) -> dict[str, dict[str, str]]:
+    not_applicable = metric_status_record(
+        "Not applicable",
+        "",
+        "not_applicable",
+        "This metric applies to LSV onset analysis, not CV peak analysis.",
+    )
+    return {
+        "Epa": metric_validity.get("Epa", metric_status_record("Not detected", "V", "not_detected")),
+        "Ipa": metric_validity.get("Ipa", metric_status_record("Not detected", "", "not_detected")),
+        "Epc": metric_validity.get("Epc", metric_status_record("Not detected", "V", "not_detected")),
+        "Ipc": metric_validity.get("Ipc", metric_status_record("Not detected", "", "not_detected")),
+        "delta_Ep": metric_validity.get("ΔEp", metric_status_record("Not applicable", "mV", "not_applicable")),
+        "E0_prime": metric_validity.get("E°′", metric_status_record("Not applicable", "V", "not_applicable")),
+        "peak_current_ratio": metric_validity.get(
+            "|Ipa/Ipc|",
+            metric_status_record("Not applicable", "", "not_applicable"),
+        ),
+        "onset_potential": not_applicable,
+        "threshold": not_applicable,
+        "max_current": not_applicable,
+        "max_current_density": not_applicable,
+    }
+
+
+def lsv_metric_status_from_summary(summary: dict[str, Any], key: str) -> str:
+    value = str(summary.get(key, "") or "")
+    if "unit unconfirmed" in value.lower() or "Pending unit confirmation" in value:
+        return "pending_unit_confirmation"
+    if value in {"", "Not available", "Not detected"}:
+        return "not_detected" if key == "onset_potential" else "not_applicable"
+    if summary.get("status") not in {"Passed", "Review needed"} and key == "onset_potential":
+        return "not_detected"
+    return "valid"
+
+
+def lsv_metric_validity(summary: dict[str, Any]) -> dict[str, dict[str, str]]:
+    summary_text = " ".join(str(value).lower() for value in summary.values())
+    unit_review = (
+        str(summary.get("unit_status", "")).lower() == "unconfirmed"
+        or "unit unconfirmed" in summary_text
+        or "pending unit confirmation" in summary_text
+    )
+    onset_value = str(summary.get("onset_potential") or "Not detected")
+    onset_status = lsv_metric_status_from_summary(summary, "onset_potential")
+    if unit_review and onset_status == "valid":
+        onset_status = "pending_unit_confirmation"
+    onset_reason = ""
+    if onset_status == "pending_unit_confirmation":
+        onset_reason = "Onset uses a current/current-density threshold whose unit is not confirmed."
+    elif onset_status == "not_detected":
+        onset_reason = summary.get("review_note", "No reliable sustained threshold crossing was detected.")
+
+    threshold_value = str(summary.get("threshold") or summary.get("threshold_magnitude") or "Not available")
+    threshold_status = "pending_unit_confirmation" if unit_review else ("valid" if threshold_value != "Not available" else "not_applicable")
+    threshold_reason = "Threshold unit is not confirmed." if unit_review else ""
+
+    primary_label = str(summary.get("primary_current_label") or "Max anodic current/current density")
+    primary_value = str(summary.get("primary_current_value") or "Not available")
+    primary_status = "pending_unit_confirmation" if unit_review else ("valid" if primary_value != "Not available" else "not_applicable")
+    primary_reason = "Current/current-density unit must be confirmed before interpreting this metric." if unit_review else ""
+
+    metric_key = primary_label.lower().replace(" ", "_").replace("/", "_")
+    return {
+        "onset potential": metric_status_record(onset_value, "V", onset_status, onset_reason),
+        "threshold": metric_status_record(threshold_value, "", threshold_status, threshold_reason),
+        metric_key: metric_status_record(primary_value, "", primary_status, primary_reason),
+    }
+
+
+def lsv_metric_status(
+    summary: dict[str, Any],
+    metric_validity: dict[str, dict[str, str]],
+) -> dict[str, dict[str, str]]:
+    not_applicable_cv = metric_status_record(
+        "Not applicable",
+        "",
+        "not_applicable",
+        "This metric applies to CV peak analysis, not LSV onset analysis.",
+    )
+    primary_label = str(summary.get("primary_current_label") or "")
+    primary_key = primary_label.lower().replace(" ", "_").replace("/", "_")
+    primary_record = metric_validity.get(
+        primary_key,
+        metric_status_record("Not available", "", "not_applicable", "No direction-relevant current metric was available."),
+    )
+    if "density" in primary_label.lower():
+        max_current = metric_status_record(
+            "Not applicable",
+            "",
+            "not_applicable",
+            "The uploaded/analyzed LSV quantity is current density.",
+        )
+        max_current_density = primary_record
+    else:
+        max_current = primary_record
+        max_current_density = metric_status_record(
+            "Not applicable",
+            "",
+            "not_applicable",
+            "Current-density display requires current-density input or electrode-area normalization.",
+        )
+    return {
+        "Epa": not_applicable_cv,
+        "Ipa": not_applicable_cv,
+        "Epc": not_applicable_cv,
+        "Ipc": not_applicable_cv,
+        "delta_Ep": not_applicable_cv,
+        "E0_prime": not_applicable_cv,
+        "peak_current_ratio": not_applicable_cv,
+        "onset_potential": metric_validity.get(
+            "onset potential",
+            metric_status_record("Not detected", "V", "not_detected"),
+        ),
+        "threshold": metric_validity.get("threshold", metric_status_record("Not available", "", "not_applicable")),
+        "max_current": max_current,
+        "max_current_density": max_current_density,
+    }
+
+
+def build_cv_ai_interpretation_payload(
+    *,
+    filename: str,
+    quick_interpretation: str,
+    cv_behavior: Optional[CVBehaviorResult],
+    metrics: dict[str, Optional[float]],
+    oxidation_peak: Optional[Peak],
+    reduction_peak: Optional[Peak],
+    display_current_unit: str,
+    current_source: str,
+    electrode_area_cm2: float,
+    analysis_status: str,
+    parser_confidence: str,
+    unit_confidence: str,
+    peak_detection_confidence: str,
+    warnings: Optional[list[str]] = None,
+    scan_info: Optional[dict[str, Any]] = None,
+    metadata: Optional[dict[str, str]] = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    behavior = cv_behavior.behavior if cv_behavior is not None else "unknown"
+    behavior_label = cv_behavior.label if cv_behavior is not None else "Unknown"
+    epa = metrics.get("epa_V")
+    epc = metrics.get("epc_V")
+    delta_ep = metrics.get("delta_ep_V")
+    formal_potential = (epa + epc) / 2 if epa is not None and epc is not None else None
+    pair_metric_review = cv_pair_metrics_review_reason(
+        metrics,
+        cv_behavior.pair_confidence if cv_behavior is not None else None,
+    )
+
+    pair_metrics_valid = (
+        pair_metric_review is None
+        and behavior not in {"irreversible_oxidation_only", "irreversible_reduction_only", "no_reliable_peaks"}
+    )
+    if not pair_metrics_valid:
+        delta_ep_display = "Invalid" if pair_metric_review and pair_metric_review.startswith("Invalid") else "Not applicable"
+        formal_potential_display = delta_ep_display
+        ratio_display = "Not meaningful" if behavior.startswith("irreversible") else delta_ep_display
+    else:
+        delta_ep_display = formatted_ai_float((delta_ep or 0.0) * 1000 if delta_ep is not None else None, "mV")
+        formal_potential_display = formatted_ai_float(formal_potential, "V")
+        ratio_display = formatted_ai_float(metrics.get("ipa_ipc_ratio"), "")
+
+    selected_peaks = []
+    if oxidation_peak is not None:
+        selected_peaks.append(
+            {
+                "role": "Epa",
+                "potential": formatted_ai_float(oxidation_peak.potential, "V"),
+                "current": ai_current_metric_value(
+                    metrics.get("ipa_A"),
+                    display_current_unit,
+                    current_source,
+                    electrode_area_cm2,
+                    unit_confidence,
+                ),
+                "scan": scan_direction_label(oxidation_peak.segment_direction),
+                "confidence": oxidation_peak.confidence,
+            }
+        )
+    if reduction_peak is not None:
+        selected_peaks.append(
+            {
+                "role": "Epc",
+                "potential": formatted_ai_float(reduction_peak.potential, "V"),
+                "current": ai_current_metric_value(
+                    metrics.get("ipc_A"),
+                    display_current_unit,
+                    current_source,
+                    electrode_area_cm2,
+                    unit_confidence,
+                ),
+                "scan": scan_direction_label(reduction_peak.segment_direction),
+                "confidence": reduction_peak.confidence,
+            }
+        )
+
+    oxidation_peak_confidence = peak_confidence_display(
+        oxidation_peak,
+        cv_behavior.rejected_oxidation_peak if cv_behavior is not None else None,
+    )
+    reduction_peak_confidence = peak_confidence_display(
+        reduction_peak,
+        cv_behavior.rejected_reduction_peak if cv_behavior is not None else None,
+    )
+    anodic_peak_wording = ""
+    pair_metrics_statement = ""
+    recommended_next_steps_guidance = ""
+    if behavior == "irreversible_oxidation_only":
+        if oxidation_peak is not None and str(oxidation_peak.confidence).lower() == "high":
+            anodic_peak_wording = "Describe Epa as a reliable anodic oxidation peak."
+        else:
+            anodic_peak_wording = (
+                f"Describe Epa as a selected candidate anodic peak with "
+                f"{format_confidence_label(oxidation_peak.confidence if oxidation_peak else oxidation_peak_confidence)} confidence."
+            )
+        pair_metrics_statement = (
+            "The anodic oxidation feature may be useful, but reversible-pair metrics are not applicable "
+            "because no reliable cathodic return peak exists."
+        )
+        recommended_next_steps_guidance = (
+            "Recommended next steps should include confirming the reference electrode, confirming scan rate, "
+            "repeating under controlled conditions if reversibility is the goal, and considering a wider "
+            "potential window or reverse-scan behavior only when scientifically appropriate."
+        )
+    elif behavior == "irreversible_reduction_only":
+        pair_metrics_statement = (
+            "The cathodic reduction feature may be useful, but reversible-pair metrics are not applicable "
+            "because no reliable anodic return peak exists."
+        )
+
+    payload_warnings = compact_text_list((warnings or []) + (cv_behavior.messages if cv_behavior else []))
+    if pair_metric_review:
+        payload_warnings.append(pair_metric_review)
+
+    scan_info = scan_info or {}
+    available_metadata = available_metadata_from_context(
+        metadata=metadata,
+        scan_rate=scan_info.get("scan_rate"),
+        electrode_area=f"{electrode_area_cm2:g} cm\u00b2" if current_source == "Current density" else None,
+        reference_electrode=scan_info.get("reference_electrode"),
+        reference_electrode_source=str(scan_info.get("reference_electrode_source") or ""),
+    )
+    required_metadata = ["scan_rate", "reference_electrode"]
+    if current_source == "Current density":
+        required_metadata.append("electrode_area")
+    missing_metadata = missing_metadata_fields(available_metadata, required_metadata)
+    unit_confirmation_required = pending_current_metric(unit_confidence)
+    scan_rate_available = "scan_rate" in available_metadata
+    requires_review = analysis_status != "Passed" or bool(payload_warnings) or unit_confirmation_required
+    metric_validity = cv_metric_validity(
+        metrics,
+        display_current_unit=display_current_unit,
+        current_source=current_source,
+        electrode_area_cm2=electrode_area_cm2,
+        unit_confidence=unit_confidence,
+        cv_behavior=cv_behavior,
+        pair_metric_review=pair_metric_review,
+        pair_metrics_valid=pair_metrics_valid,
+    )
+    metadata_status = metadata_status_from_context(
+        metadata=metadata,
+        scan_rate=scan_info.get("scan_rate"),
+        scan_rate_source=str(scan_info.get("scan_rate_source") or ""),
+        electrode_area=f"{electrode_area_cm2:g} cm²" if current_source == "Current density" else None,
+        electrode_area_source="manual" if current_source == "Current density" else "",
+        reference_electrode=scan_info.get("reference_electrode"),
+        reference_electrode_source=str(scan_info.get("reference_electrode_source") or ""),
+        cycle_count=scan_info.get("cycle_count"),
+        cycle_assignment_uncertain=bool(scan_info.get("cycle_assignment_uncertain", False)),
+        scan_mode=scan_info.get("scan_mode"),
+    )
+    metric_status = cv_metric_status(metric_validity)
+    metadata_completeness = metadata_completeness_status_from_fields(missing_metadata, metadata_status)
+    unit_status = unit_status_label(unit_confidence, unit_confirmation_required)
+    invalid_reversible_pair = bool(pair_metric_review and pair_metric_review.startswith("Invalid"))
+    candidate_peak_language_required = behavior in {"noisy_ambiguous", "no_reliable_peaks"} or invalid_reversible_pair
+    interpretation_guidance = {
+        "peak_wording": (
+            anodic_peak_wording
+            if anodic_peak_wording
+            else (
+            "Use candidate extrema/candidate peaks wording. Do not call the selected oxidation/reduction "
+            "features valid peaks for reversible-pair analysis."
+            if candidate_peak_language_required
+            else "Selected primary peaks can be described as Epa/Epc only when metric status and pair confidence support it."
+            )
+        ),
+        "pair_metrics_statement": (
+            pair_metrics_statement
+            if pair_metrics_statement
+            else (
+            "Candidate peaks were detected, but the selected pair is not valid for reversible-pair metrics."
+            if invalid_reversible_pair
+            else ""
+            )
+        ),
+        "recommended_next_steps": recommended_next_steps_guidance,
+    }
+
+    return {
+        "payload_version": "voltscope_ai_interpretation_v1",
+        "technique": "CV",
+        "filename": filename,
+        "analysis_status": analysis_status,
+        "overall_quality": analysis_status,
+        "cv_behavior": behavior_label,
+        "cv_behavior_code": behavior,
+        "behavior_classification": behavior,
+        "quick_interpretation": quick_interpretation,
+        "key_metrics": {
+            "Epa": formatted_ai_float(epa, "V"),
+            "Ipa": ai_current_metric_value(
+                metrics.get("ipa_A"),
+                display_current_unit,
+                current_source,
+                electrode_area_cm2,
+                unit_confidence,
+            ),
+            "Epc": formatted_ai_float(epc, "V") if epc is not None else "Not detected",
+            "Ipc": ai_current_metric_value(
+                metrics.get("ipc_A"),
+                display_current_unit,
+                current_source,
+                electrode_area_cm2,
+                unit_confidence,
+            ),
+            "\u0394Ep": delta_ep_display,
+            "E\u00b0\u2032": formal_potential_display,
+            "|Ipa/Ipc|": ratio_display,
+        },
+        "metric_validity": metric_validity,
+        "metric_status": metric_status,
+        "interpretation_guidance": interpretation_guidance,
+        "selected_peaks": selected_peaks,
+        "available_metadata": available_metadata,
+        "missing_metadata": missing_metadata,
+        "metadata_status": metadata_status,
+        "status_summary": {
+            "analysis_status": analysis_status,
+            "metadata_status": metadata_completeness,
+            "unit_status": unit_status,
+            "ai_interpretation_status": "not_generated",
+        },
+        "flags": {
+            "technique": "CV",
+            "analysis_status": analysis_status,
+            "overall_quality": analysis_status,
+            "unit_confidence": unit_confidence,
+            "unit_status": unit_status,
+            "parser_confidence": parser_confidence,
+            "peak_detection_confidence": peak_detection_confidence,
+            "metadata_completeness": metadata_completeness,
+            "oxidation_peak_confidence": oxidation_peak_confidence,
+            "reduction_peak_confidence": reduction_peak_confidence,
+            "cathodic_return_peak_confidence": reduction_peak_confidence if behavior == "irreversible_oxidation_only" else "",
+            "anodic_return_peak_confidence": oxidation_peak_confidence if behavior == "irreversible_reduction_only" else "",
+            "pair_confidence": cv_behavior.pair_confidence if cv_behavior is not None else "Not available",
+            "reversible_pair_confidence": cv_behavior.pair_confidence if cv_behavior is not None else "Not available",
+            "behavior_classification": behavior,
+            "reversible_pair_metrics_valid": pair_metrics_valid,
+            "candidate_peak_language_required": candidate_peak_language_required,
+            "requires_review": requires_review,
+            "unit_confirmation_required": unit_confirmation_required,
+            "scan_rate_available": scan_rate_available,
+            "reference_electrode_source": str(scan_info.get("reference_electrode_source") or "not_available"),
+        },
+        "confidence": {
+            "parser": parser_confidence,
+            "unit": unit_confidence,
+            "peak_detection": peak_detection_confidence,
+            "oxidation_peak": oxidation_peak_confidence,
+            "reduction_peak": reduction_peak_confidence,
+            "cathodic_return_peak": reduction_peak_confidence if behavior == "irreversible_oxidation_only" else "Not applicable",
+            "anodic_return_peak": oxidation_peak_confidence if behavior == "irreversible_reduction_only" else "Not applicable",
+            "pair": cv_behavior.pair_confidence if cv_behavior is not None else "Not available",
+            "reversible_pair": cv_behavior.pair_confidence if cv_behavior is not None else "Not available",
+        },
+        "context": {
+            "current_source": current_source,
+            "display_current_unit": display_unit_label(display_current_unit),
+            "electrode_area_cm2": electrode_area_cm2 if current_source == "Current density" else None,
+            **scan_info,
+        },
+        "warnings": payload_warnings,
+        "experiment_notes": notes.strip(),
+    }
+
+
+def build_lsv_ai_interpretation_payload(
+    *,
+    filename: str,
+    quick_interpretation: str,
+    summary: Optional[dict[str, Any]],
+    warnings: Optional[list[str]] = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    summary = summary or {}
+    summary_text = " ".join(str(value).lower() for value in summary.values())
+    unit_confirmation_required = (
+        str(summary.get("unit_status", "")).lower() == "unconfirmed"
+        or "unit unconfirmed" in summary_text
+        or "pending unit confirmation" in summary_text
+    )
+    reference_source = str(summary.get("reference_electrode_source") or "not_available")
+    available_metadata = available_metadata_from_context(
+        scan_rate=summary.get("scan_rate"),
+        electrode_area=summary.get("electrode_area_metadata") or summary.get("electrode_area"),
+        reference_electrode=summary.get("reference_electrode"),
+        reference_electrode_source=reference_source,
+    )
+    required_metadata = ["scan_rate", "reference_electrode"]
+    if str(summary.get("primary_current_label", "")).lower().find("density") >= 0:
+        required_metadata.append("electrode_area")
+    summary_missing = str(summary.get("missing_metadata") or "").strip()
+    if summary_missing and summary_missing != "None":
+        missing_metadata = [
+            part.strip().replace("confirmed ", "").replace(" ", "_")
+            for part in summary_missing.split(",")
+            if part.strip()
+        ]
+    else:
+        missing_metadata = missing_metadata_fields(available_metadata, required_metadata)
+    metric_validity = lsv_metric_validity(summary)
+    metadata_status = metadata_status_from_context(
+        scan_rate=summary.get("scan_rate"),
+        scan_rate_source=str(summary.get("scan_rate_source") or ""),
+        electrode_area=summary.get("electrode_area_metadata") or summary.get("electrode_area"),
+        electrode_area_source="metadata" if metadata_value_is_available(summary.get("electrode_area_metadata")) else "",
+        reference_electrode=summary.get("reference_electrode"),
+        reference_electrode_source=reference_source,
+    )
+    metric_status = lsv_metric_status(summary, metric_validity)
+    metadata_completeness = metadata_completeness_status_from_fields(missing_metadata, metadata_status)
+    unit_status = unit_status_label("Low" if unit_confirmation_required else "Confirmed", unit_confirmation_required)
+    requires_review = (
+        str(summary.get("status") or "") != "Passed"
+        or unit_confirmation_required
+        or str(summary.get("metadata_completeness") or "") == "Review recommended"
+    )
+    compact_summary = {
+        key: value
+        for key, value in summary.items()
+        if key
+        in {
+            "status",
+            "metadata_completeness",
+            "missing_metadata",
+            "onset_label",
+            "onset_potential",
+            "onset_reliability",
+            "threshold",
+            "threshold_magnitude",
+            "signed_threshold",
+            "threshold_source",
+            "threshold_rule",
+            "direction",
+            "primary_current_label",
+            "primary_current_value",
+            "primary_potential_label",
+            "primary_potential_value",
+            "min_label",
+            "min_value",
+            "potential_range",
+            "scan_rate",
+            "scan_rate_source",
+            "reference_electrode",
+            "reference_electrode_source",
+            "electrode_area",
+            "electrode_area_metadata",
+            "normalization_status",
+            "normalization_note",
+            "method_note",
+            "onset_detection_signal",
+            "review_note",
+            "scan_rate_note",
+        }
+    }
+    interpretation_guidance = {
+        "onset_wording": "Describe LSV onset as an operational threshold-crossing onset estimated using the selected threshold rule.",
+        "report_with": (
+            "Report onset alongside threshold value, reference electrode, scan rate, electrode area, smoothing/onset "
+            "detection signal, and normalization status when available."
+        ),
+        "normalization_status": summary.get("normalization_status") or summary.get("normalization_note") or "",
+        "suggested_lab_notebook_note": (
+            f"LSV showed a {str(summary.get('direction') or '').lower()} onset at "
+            f"{summary.get('onset_potential', 'not detected')} using a {summary.get('threshold', 'selected')} "
+            f"threshold. Scan rate was {summary.get('scan_rate', 'not available')}, electrode area was "
+            f"{summary.get('electrode_area_metadata') or summary.get('electrode_area') or 'not available'}. "
+            "Onset was detected from a sustained threshold crossing."
+            if summary.get("status") == "Passed"
+            else ""
+        ),
+    }
+    return {
+        "payload_version": "voltscope_ai_interpretation_v1",
+        "technique": "LSV",
+        "filename": filename,
+        "analysis_status": summary.get("status", "Not available"),
+        "overall_quality": summary.get("status", "Not available"),
+        "quick_interpretation": quick_interpretation,
+        "key_metrics": compact_summary,
+        "metric_validity": metric_validity,
+        "metric_status": metric_status,
+        "interpretation_guidance": interpretation_guidance,
+        "available_metadata": available_metadata,
+        "missing_metadata": missing_metadata,
+        "metadata_status": metadata_status,
+        "status_summary": {
+            "analysis_status": summary.get("status", "Not available"),
+            "metadata_status": metadata_completeness,
+            "unit_status": unit_status,
+            "ai_interpretation_status": "not_generated",
+        },
+        "flags": {
+            "technique": "LSV",
+            "analysis_status": summary.get("status", "Not available"),
+            "overall_quality": summary.get("status", "Not available"),
+            "unit_confidence": "Low" if unit_confirmation_required else "High",
+            "unit_status": unit_status,
+            "parser_confidence": "High",
+            "peak_detection_confidence": "Not applicable",
+            "pair_confidence": "Not applicable",
+            "metadata_completeness": metadata_completeness,
+            "behavior_classification": str(summary.get("direction") or "LSV"),
+            "requires_review": requires_review,
+            "unit_confirmation_required": unit_confirmation_required,
+            "scan_rate_available": "scan_rate" in available_metadata,
+            "reference_electrode_source": reference_source,
+        },
+        "warnings": compact_text_list(
+            (warnings or [])
+            + [
+                summary.get("review_note", ""),
+                summary.get("scan_rate_note", ""),
+                f"Missing metadata: {summary.get('missing_metadata')}"
+                if summary.get("missing_metadata") not in {None, "", "None"}
+                else "",
+            ]
+        ),
+        "experiment_notes": notes.strip(),
+    }
+
+
+def build_ai_interpretation_prompt(payload: dict[str, Any]) -> str:
+    safe_payload = to_jsonable(payload)
+    payload_json = json.dumps(safe_payload, indent=2, sort_keys=True, ensure_ascii=False)
+    return (
+        "You are VoltScope AI, an electrochemistry interpretation assistant.\n\n"
+        "Use only the supplied JSON payload. Do not invent values, file contents, experimental details, "
+        "mechanisms, metadata, or certainty that are not present. The payload is intentionally structured: "
+        "`metadata_status` gives provenance for each metadata field, `available_metadata` contains only "
+        "metadata actually available, `missing_metadata` contains fields that are truly absent, "
+        "`metric_status` and `metric_validity` give the status of each important metric, and `flags` "
+        "summarizes parser/unit/analysis quality. `status_summary` separates computational analysis status "
+        "from metadata completeness and unit status.\n\n"
+        "Strict grounding rules:\n"
+        "1. Only use values provided in the payload.\n"
+        "2. Never infer missing metadata or invent metadata. Do not say a value was measured or provided if "
+        "`metadata_status` marks it as inferred, defaulted, or manual.\n"
+        "3. If `metadata_status.status` is missing, mention the field as missing only when relevant. If it is "
+        "inferred, say it was inferred and mention `source`. If it is defaulted, say it was defaulted and "
+        "should be confirmed. If it is manual, identify it as user-provided/manual.\n"
+        "4. If a metric status is invalid, not_applicable, pending_unit_confirmation, or not_detected, do not "
+        "interpret that metric as a valid quantitative result.\n"
+        "5. Treat `analysis_status: Passed` as a valid computation only for the metrics marked valid. If "
+        "`status_summary.metadata_status` is Incomplete, do not imply the computation failed; instead state "
+        "that deeper literature comparison or publication-ready interpretation needs the missing metadata.\n"
+        "6. For reversible-like CVs, interpret Epa, Epc, Ipa, Ipc, ΔEp, E°′/E°, and |Ipa/Ipc| only when their "
+        "metric status is valid. Describe the behavior as reversible-like or consistent with reversible-like "
+        "behavior, not definitively reversible.\n"
+        "7. For noisy or ambiguous CVs, emphasize uncertainty, candidate-peak review, smoothing, and baseline "
+        "correction before quantitative interpretation. If `flags.candidate_peak_language_required` is true, "
+        "describe selected features as candidate extrema or candidate peaks, not valid oxidation/reduction peaks. "
+        "Only call Epa/Epc valid when pair confidence is high and reversible-pair metric statuses are valid. "
+        "If `interpretation_guidance.pair_metrics_statement` is provided, include that exact idea in the "
+        "`summary` section.\n"
+        "8. For irreversible, oxidation-only, or reduction-only CVs, do not discuss ΔEp, E°′/E°, or |Ipa/Ipc| "
+        "as meaningful reversible-pair metrics. For oxidation-only CVs, distinguish the anodic oxidation "
+        "feature from reversible-pair analysis: the anodic peak may be useful as an oxidation feature, but "
+        "pair metrics are not applicable when no reliable cathodic return peak exists. Do not use generic "
+        "`valid anodic peak` wording unless the oxidation peak confidence is high; otherwise use wording like "
+        "`selected candidate anodic peak with medium-high confidence`. Recommended next steps should include "
+        "confirming reference electrode and scan rate, repeating under controlled conditions if evaluating "
+        "reversibility, and considering a wider potential window or reverse-scan behavior only when scientifically "
+        "appropriate.\n"
+        "9. For clean reversible-like CVs, discuss reversibility cautiously. You may mention that ideal "
+        "one-electron reversible ΔEp is about 59 mV at room temperature only as contextual background.\n"
+        "10. For clean CVs with no metadata rows, clearly separate valid CV metrics from missing experimental "
+        "metadata. If scan rate is inferred from time/potential columns, say so. If electrode area, electrolyte, "
+        "concentration, working electrode, or counter electrode are missing, explain that current-density "
+        "normalization or deeper mechanistic interpretation is limited unless those values are supplied.\n"
+        "11. For LSV, focus on the operational threshold-crossing onset potential, threshold value/rule, "
+        "reference electrode, scan rate, electrode area, smoothing/onset-detection signal, and normalization "
+        "status. Say `onset was estimated using the selected threshold rule`; do not call it the true onset "
+        "potential. When metadata are available, use them explicitly, for example `onset potential = 0.397 V "
+        "vs SCE`. For passed LSVs, the suggested lab notebook note should concisely include onset potential, "
+        "threshold, scan rate, electrode area, and that onset was detected from a sustained threshold crossing.\n"
+        "12. For unit-unconfirmed LSVs, clearly state that current/current-density dependent metrics may be "
+        "scaled incorrectly until the unit is confirmed.\n"
+        "13. Always include a short Suggested lab notebook note.\n\n"
+        "Never overstate conclusions. Do not claim diffusion coefficients, rate constants, concentration, "
+        "mechanism, or electrode material effects unless those inputs are present in the payload. Use wording "
+        "such as suggests, is consistent with, and should be interpreted cautiously where appropriate. Clearly "
+        "separate measured/computed VoltScope metrics from scientific interpretation. Always remind the user "
+        "that the interpretation should be reviewed by the researcher.\n\n"
+        "Return a JSON object with exactly these keys when possible:\n"
+        "- summary\n"
+        "- key_interpretation\n"
+        "- data_quality_and_limitations\n"
+        "- recommended_next_steps\n"
+        "- suggested_lab_notebook_note\n"
+        "- confidence\n"
+        "- requires_researcher_review\n\n"
+        "Each value should be concise researcher-facing text, except requires_researcher_review should be a "
+        "boolean when possible. If JSON output is not possible, use these plain-text section headings: "
+        "Summary; Key electrochemical interpretation; Data quality and limitations; Recommended next steps; "
+        "Suggested lab notebook note.\n\n"
+        "Keep it practical, scientifically cautious, and grounded in the metrics provided.\n\n"
+        f"Payload:\n{payload_json}"
+    )
+
+
+def ai_interpretation_signature(payload: dict[str, Any]) -> str:
+    serialized = json.dumps(to_jsonable(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def ai_analysis_settings_signature(payload: dict[str, Any]) -> str:
+    settings_payload = {
+        "technique": payload.get("technique"),
+        "filename": payload.get("filename"),
+        "flags": payload.get("flags"),
+        "context": payload.get("context"),
+        "status_summary": payload.get("status_summary"),
+        "metadata_status": payload.get("metadata_status"),
+        "metric_status": payload.get("metric_status"),
+        "warnings": payload.get("warnings"),
+    }
+    serialized = json.dumps(to_jsonable(settings_payload), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def ai_interpretation_is_stale(saved_state: Optional[dict[str, Any]], payload: dict[str, Any]) -> bool:
+    if not saved_state:
+        return False
+    return saved_state.get("signature") != ai_interpretation_signature(payload)
+
+
+def parse_ai_interpretation_sections(content: str) -> tuple[dict[str, Any], bool]:
+    text = str(content or "").strip()
+    if not text:
+        return {}, False
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {}, False
+    if not isinstance(parsed, dict):
+        return {}, False
+    section_keys = {
+        "summary",
+        "key_interpretation",
+        "data_quality_and_limitations",
+        "recommended_next_steps",
+        "suggested_lab_notebook_note",
+        "confidence",
+        "requires_researcher_review",
+    }
+    if not any(key in parsed for key in section_keys):
+        return {}, False
+    return parsed, True
+
+
+def interpretation_limitations_from_payload(payload: dict[str, Any]) -> list[str]:
+    metadata_status = payload.get("metadata_status") if isinstance(payload.get("metadata_status"), dict) else {}
+    flags = payload.get("flags") if isinstance(payload.get("flags"), dict) else {}
+    missing_metadata = set(payload.get("missing_metadata") or [])
+    metric_status = payload.get("metric_status") if isinstance(payload.get("metric_status"), dict) else {}
+    behavior = str(flags.get("behavior_classification") or payload.get("behavior_classification") or "").lower()
+    technique = str(payload.get("technique") or flags.get("technique") or "").upper()
+    limitations: list[str] = []
+
+    reference_status = metadata_status.get("reference_electrode", {}) if isinstance(metadata_status, dict) else {}
+    if reference_status.get("status") == "missing" or "reference_electrode" in missing_metadata:
+        limitations.append(
+            "Reference electrode missing: absolute potentials cannot be compared directly with literature values."
+        )
+    elif "confirmed_reference_electrode" in missing_metadata:
+        limitations.append(
+            "Reference electrode is defaulted or unconfirmed: confirm before comparing absolute potentials."
+        )
+    elif reference_status.get("status") == "defaulted":
+        limitations.append(
+            "Reference electrode defaulted: confirm before comparing absolute potentials."
+        )
+
+    area_status = metadata_status.get("electrode_area", {}) if isinstance(metadata_status, dict) else {}
+    if area_status.get("status") == "missing" or "electrode_area" in missing_metadata:
+        limitations.append(
+            "Electrode area missing: current-density comparisons are limited."
+        )
+
+    if flags.get("unit_confirmation_required"):
+        limitations.append("Unit confirmation required: current-dependent metrics may be scaled incorrectly.")
+    if flags.get("requires_review"):
+        if behavior == "noisy_ambiguous":
+            limitations.append(
+                "Analysis requires review: noisy or ambiguous peak selection should be checked before quantitative use."
+            )
+        elif behavior == "irreversible_oxidation_only":
+            limitations.append(
+                "Irreversible oxidation-only trace: no reliable cathodic return peak was detected, so reversible-pair metrics are not applicable."
+            )
+        elif behavior == "irreversible_reduction_only":
+            limitations.append(
+                "Irreversible reduction-only trace: no reliable anodic return peak was detected, so reversible-pair metrics are not applicable."
+            )
+        else:
+            limitations.append(
+                "Analysis requires review: verify selected peaks, units, and warnings before relying on quantitative interpretation."
+            )
+
+    invalid_pair_metrics = [
+        label
+        for label in ("delta_Ep", "E0_prime", "peak_current_ratio")
+        if isinstance(metric_status.get(label), dict)
+        and metric_status[label].get("status") in {"invalid", "not_applicable", "pending_unit_confirmation", "not_detected"}
+    ]
+    if technique == "CV" and invalid_pair_metrics and behavior in {"noisy_ambiguous", "irreversible_oxidation_only", "irreversible_reduction_only"}:
+        limitations.append(
+            "Reversible-pair metrics are limited or not applicable for this trace; use the metric status fields before interpreting ΔEp, E°′, or |Ipa/Ipc|."
+        )
+
+    scan_status = metadata_status.get("scan_rate", {}) if isinstance(metadata_status, dict) else {}
+    if scan_status.get("status") == "missing" or "scan_rate" in missing_metadata:
+        limitations.append(
+            "Scan rate missing: scan-rate-dependent interpretation is qualitative until scan rate is added or confirmed."
+        )
+
+    limitations.append(
+        "AI uses computed metrics only; raw arrays are not sent."
+    )
+    return compact_text_list(limitations)
+
+
+def render_interpretation_limitations(payload: dict[str, Any]) -> None:
+    limitations = interpretation_limitations_from_payload(payload)
+    if not limitations:
+        return
+    items = "".join(f"<li>{escape_html(item)}</li>" for item in limitations)
+    st.markdown(
+        f"""
+        <div class="interpretation-panel">
+            <h4>Interpretation limitations</h4>
+            <ul>{items}</ul>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_ai_interpretation_metadata(saved_state: dict[str, Any], *, stale: bool) -> None:
+    if not saved_state:
+        return
+    status_text = "Stale AI interpretation" if stale else "Current interpretation"
+    payload_hash = str(saved_state.get("payload_hash") or saved_state.get("signature") or "")
+    settings_hash = str(saved_state.get("analysis_settings_hash") or "")
+    metadata_items = [
+        f"Status: {status_text}",
+        f"Generated: {saved_state.get('generated_at', 'Not available')}",
+        f"Model: {saved_state.get('model', 'Not available')}",
+        f"Payload version: {saved_state.get('payload_version', 'Not available')}",
+    ]
+    if payload_hash:
+        metadata_items.append(f"Payload hash: {payload_hash[:12]}")
+    if settings_hash:
+        metadata_items.append(f"Settings hash: {settings_hash[:12]}")
+    st.caption(" · ".join(metadata_items))
+
+
+def researcher_review_label(value: Any) -> str:
+    normalized = str(value).strip().lower()
+    if value is True or normalized in {"true", "required", "yes", "1"}:
+        return "Researcher review: Required before quantitative use"
+    return "Researcher review: Recommended"
+
+
+def render_structured_ai_interpretation(sections: dict[str, Any]) -> None:
+    section_labels = [
+        ("summary", "Summary"),
+        ("key_interpretation", "Key electrochemical interpretation"),
+        ("data_quality_and_limitations", "Data quality and limitations"),
+        ("recommended_next_steps", "Recommended next steps"),
+        ("suggested_lab_notebook_note", "Suggested lab notebook note"),
+    ]
+    for key, label in section_labels:
+        value = sections.get(key)
+        if value in {None, ""}:
+            continue
+        if isinstance(value, list):
+            body = "<ul>" + "".join(f"<li>{escape_html(item)}</li>" for item in value) + "</ul>"
+        else:
+            body = f"<p>{escape_html(value)}</p>"
+        st.markdown(
+            f"""
+            <div class="interpretation-panel">
+                <h4>{escape_html(label)}</h4>
+                {body}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    footer_parts = []
+    if sections.get("confidence"):
+        footer_parts.append(f"AI confidence: {sections.get('confidence')}")
+    if "requires_researcher_review" in sections:
+        footer_parts.append(researcher_review_label(sections.get("requires_researcher_review")))
+    if footer_parts:
+        st.caption(" · ".join(str(part) for part in footer_parts))
+
+
+_AI_INTERPRETATION_BACKEND: Any = None
+
+
+def load_ai_interpretation_backend() -> Any:
+    global _AI_INTERPRETATION_BACKEND
+    if _AI_INTERPRETATION_BACKEND is not None:
+        return _AI_INTERPRETATION_BACKEND
+
+    module_path = Path(__file__).with_name("ai_interpretation.py")
+    spec = importlib.util.spec_from_file_location("voltscope_ai_interpretation", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load AI interpretation backend from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _AI_INTERPRETATION_BACKEND = module
+    return module
+
+
+def generate_detailed_ai_interpretation(
+    payload: dict[str, Any],
+    environ: Optional[dict[str, str]] = None,
+    timeout_s: int = 45,
+) -> AIInterpretationResponse:
+    prompt = build_ai_interpretation_prompt(payload)
+    try:
+        backend = load_ai_interpretation_backend()
+        streamlit_secrets = None if environ is not None else st.secrets
+        result = backend.request_openai_interpretation(
+            prompt,
+            streamlit_secrets=streamlit_secrets,
+            environ=environ,
+            timeout_s=timeout_s,
+        )
+    except Exception as exc:
+        return AIInterpretationResponse(
+            content="",
+            error=f"AI interpretation request failed: {exc}",
+            configured=True,
+            model="Not available",
+        )
+
+    return AIInterpretationResponse(
+        content=str(getattr(result, "content", "") or ""),
+        error=str(getattr(result, "error", "") or ""),
+        configured=bool(getattr(result, "configured", False)),
+        model=str(getattr(result, "model", "") or "Not available"),
+    )
+
+
+def ai_interpretation_store(
+    project_workspace: Optional[dict[str, Any]],
+    experiment_id: Optional[str],
+) -> Optional[dict[str, Any]]:
+    if project_workspace is None or not experiment_id:
+        return None
+    experiment = project_workspace.get("experiments", {}).get(experiment_id)
+    if not isinstance(experiment, dict):
+        return None
+    return experiment.setdefault("ai_interpretations", {})
+
+
+def render_interpretation_panel(
+    text: str,
+    key: str,
+    ai_payload: Optional[dict[str, Any]] = None,
+    project_workspace: Optional[dict[str, Any]] = None,
+    experiment_id: Optional[str] = None,
+    interpretation_id: Optional[str] = None,
+) -> None:
     st.markdown(
         f"""
         <div class="interpretation-panel">
@@ -8847,14 +10652,103 @@ def render_interpretation_panel(text: str, key: str) -> None:
         """,
         unsafe_allow_html=True,
     )
-    st.button("Generate detailed AI interpretation", disabled=True, key=key)
+    if ai_payload is None:
+        st.button("Generate detailed AI interpretation", disabled=True, key=key)
+        return
+
+    with st.expander("AI interpretation payload", expanded=False):
+        st.caption("Raw uploaded arrays are excluded. This is the exact computed payload sent to the AI backend.")
+        st.json(to_jsonable(ai_payload))
+
+    interpretation_id = interpretation_id or key
+    signature = ai_interpretation_signature(ai_payload)
+    store = ai_interpretation_store(project_workspace, experiment_id)
+    session_key = f"ai_interpretation_state::{interpretation_id}"
+    if store is not None:
+        saved_state = store.get(interpretation_id, {})
+    else:
+        saved_state = st.session_state.get(session_key, {})
+
+    stale = ai_interpretation_is_stale(saved_state, ai_payload)
+    has_previous = bool(saved_state.get("content") or saved_state.get("error"))
+    if stale:
+        button_label = "Regenerate interpretation using current metrics"
+    else:
+        button_label = "Regenerate interpretation" if has_previous else "Generate detailed AI interpretation"
+
+    render_interpretation_limitations(ai_payload)
+
+    if stale:
+        st.warning(
+            "This interpretation may be stale because analysis settings, selected peaks, units, metadata, "
+            "or processing options changed after it was generated. Regenerate the interpretation to update it."
+        )
+    elif has_previous:
+        st.caption("Current interpretation")
+
+    if st.button(button_label, key=key):
+        response = generate_detailed_ai_interpretation(ai_payload)
+        sections, structured = parse_ai_interpretation_sections(response.content)
+        saved_state = {
+            "signature": signature,
+            "payload_hash": signature,
+            "analysis_settings_hash": ai_analysis_settings_signature(ai_payload),
+            "payload_version": ai_payload.get("payload_version", "Not available"),
+            "generated_at": now_timestamp(),
+            "content": response.content,
+            "structured_sections": sections if structured else {},
+            "structured_response": structured,
+            "error": response.error,
+            "backend_configured": response.configured,
+            "model": response.model,
+            "payload": to_jsonable(ai_payload),
+        }
+        if store is not None:
+            store[interpretation_id] = saved_state
+            if project_workspace is not None and experiment_id:
+                project_workspace["experiments"][experiment_id]["updated_at"] = now_timestamp()
+            save_project_workspaces()
+        else:
+            st.session_state[session_key] = saved_state
+        stale = False
+
+    if saved_state.get("content"):
+        st.markdown("#### Stale AI interpretation" if stale else "#### Detailed AI interpretation")
+        render_ai_interpretation_metadata(saved_state, stale=stale)
+        sections = saved_state.get("structured_sections") or {}
+        if sections:
+            render_structured_ai_interpretation(sections)
+        else:
+            parsed_sections, structured = parse_ai_interpretation_sections(str(saved_state["content"]))
+            if structured:
+                render_structured_ai_interpretation(parsed_sections)
+            else:
+                st.markdown(str(saved_state["content"]))
+    elif saved_state.get("error"):
+        render_ai_interpretation_metadata(saved_state, stale=stale)
+        st.info(str(saved_state["error"]))
+
+    st.caption(
+        "AI interpretation uses only computed VoltScope metrics, warnings, metadata flags, and experiment notes. "
+        "It does not inspect raw uploaded data and should be reviewed by the researcher."
+    )
 
 
 def cv_interpretation_text(
     cv_behavior: Optional[CVBehaviorResult],
     metrics: dict[str, Optional[float]],
     unit_confidence: str,
+    metadata_caution: bool = False,
 ) -> str:
+    def with_metadata_caution(message: str) -> str:
+        if not metadata_caution:
+            return message
+        return (
+            message
+            + " Because some experimental metadata are missing, treat mechanistic interpretation as qualitative "
+            "unless conditions are confirmed."
+        )
+
     behavior = cv_behavior.behavior if cv_behavior is not None else "reversible_like"
     label = cv_behavior.label if cv_behavior is not None else "reversible-like"
     if pending_current_metric(unit_confidence):
@@ -8865,8 +10759,9 @@ def cv_interpretation_text(
     if behavior == "irreversible_oxidation_only":
         return (
             "This CV appears oxidation-dominant or irreversible under the selected peak settings. "
-            "A reliable cathodic return peak was not detected, so \u0394Ep, E\u00b0\u2032, and |Ipa/Ipc| "
-            "should not be treated as reversible-pair metrics."
+            "The anodic oxidation peak can be used as an oxidation feature, but a reliable cathodic return "
+            "peak was not detected, so \u0394Ep, E\u00b0\u2032, and |Ipa/Ipc| are not applicable as reversible-pair "
+            "metrics."
         )
     if behavior == "irreversible_reduction_only":
         return (
@@ -8880,6 +10775,16 @@ def cv_interpretation_text(
             "couple, so pair assignment should be reviewed before interpretation."
         )
     if behavior in {"noisy_ambiguous", "no_reliable_peaks"}:
+        pair_metric_review = cv_pair_metrics_review_reason(
+            metrics,
+            cv_behavior.pair_confidence if cv_behavior is not None else None,
+        )
+        if pair_metric_review and pair_metric_review.startswith("Invalid"):
+            return (
+                "Candidate peaks were detected, but the selected pair is not valid for reversible-pair metrics. "
+                "This CV is flagged as noisy or ambiguous, so review candidate peaks, smoothing, and baseline "
+                "correction before using peak currents quantitatively."
+            )
         return (
             "This CV is flagged as noisy or ambiguous. Peak selection may be sensitive to noise or baseline shape, "
             "so review candidate peaks, smoothing, and baseline correction before using peak currents quantitatively."
@@ -8897,12 +10802,14 @@ def cv_interpretation_text(
             )
         else:
             delta_context = "The peak separation should be interpreted alongside the experimental conditions."
-        return (
+        return with_metadata_caution(
             f"This CV appears {label}. The peak current ratio is {ratio:.4g}, and the peak separation "
             f"is {delta_ep_mv:.4g} mV. {delta_context} Interpret \u0394Ep alongside scan rate, electrolyte "
             "conditions, uncompensated resistance, and electrode preparation."
         )
-    return "The selected CV peaks are shown above. Review the peak table and candidate peaks before final interpretation."
+    return with_metadata_caution(
+        "The selected CV peaks are shown above. Review the peak table and candidate peaks before final interpretation."
+    )
 
 
 def lsv_interpretation_text(summary: Optional[dict[str, str]]) -> str:
@@ -8914,6 +10821,27 @@ def lsv_interpretation_text(summary: Optional[dict[str, str]]) -> str:
     direction = str(summary.get("direction", "LSV")).lower()
     reference = summary.get("reference_electrode", "the selected reference electrode")
     threshold = summary.get("threshold_magnitude") or summary.get("threshold", "the selected threshold")
+    scan_rate = summary.get("scan_rate", "Not available")
+    electrode_area = summary.get("electrode_area_metadata") or summary.get("electrode_area") or "Not detected"
+    normalization_status = str(summary.get("normalization_status") or summary.get("normalization_note") or "").strip()
+    smoothing_context = summary.get("onset_detection_signal", "Not available")
+    metadata_incomplete = summary.get("metadata_completeness") in {"Incomplete", "Review recommended"}
+    missing_metadata = str(summary.get("missing_metadata") or "")
+    metadata_note = ""
+    if metadata_incomplete:
+        missing_parts = []
+        if "scan rate" in missing_metadata:
+            missing_parts.append("scan rate is unavailable")
+        if "confirmed reference electrode" in missing_metadata:
+            missing_parts.append("the reference electrode is currently defaulted")
+        if "electrode area" in missing_metadata:
+            missing_parts.append("electrode area metadata is missing")
+        if missing_parts:
+            metadata_note = (
+                " The onset calculation passed, but "
+                + " and ".join(missing_parts)
+                + ", so add or confirm metadata before treating the record as publication-ready."
+            )
     if "unit unconfirmed" in " ".join(str(value).lower() for value in summary.values()):
         return (
             "This LSV was parsed, but current/current-density units require confirmation. "
@@ -8923,14 +10851,18 @@ def lsv_interpretation_text(summary: Optional[dict[str, str]]) -> str:
         return summary.get("review_note") or "No reliable sustained threshold crossing was detected."
     if direction == "cathodic":
         return (
-            f"This LSV shows a cathodic onset at {onset}. The onset was estimated from a sustained "
-            f"threshold crossing. Interpret this value alongside the selected threshold, reference electrode "
-            f"({reference}), and scan conditions."
+            f"This LSV shows a cathodic onset at {onset} with a threshold of {threshold}. "
+            "The onset was estimated using the selected threshold rule from a sustained threshold crossing. "
+            f"Report it with the reference electrode ({reference}), scan rate ({scan_rate}), electrode area "
+            f"({electrode_area}), onset-detection signal ({smoothing_context}), and normalization status"
+            f"{': ' + normalization_status if normalization_status else ''}.{metadata_note}"
         )
     return (
-        f"This LSV shows an anodic onset at {onset}. The onset was estimated from the selected threshold "
-        f"crossing ({threshold}). Interpret this value alongside the threshold rule, reference electrode "
-        f"({reference}), smoothing settings, and whether the uploaded signal is current or current density."
+        f"This LSV shows an anodic onset at {onset} with a threshold of {threshold}. "
+        "The onset was estimated using the selected threshold rule from a sustained threshold crossing. "
+        f"Report it with the reference electrode ({reference}), scan rate ({scan_rate}), electrode area "
+        f"({electrode_area}), onset-detection signal ({smoothing_context}), and normalization status"
+        f"{': ' + normalization_status if normalization_status else ''}.{metadata_note}"
     )
 
 
@@ -8966,6 +10898,7 @@ def render_unit_review_panel(
                 <span class="status-badge status-review-needed">Review needed</span>
             </div>
             <p>{escape_html(explanation)}</p>
+            <p>Select the correct unit below, then apply it to scale current-dependent metrics.</p>
             <div class="analysis-grid">
                 <div class="analysis-metric">
                     <span>Suggested unit</span>
@@ -9058,6 +10991,7 @@ def render_parser_summary(
         ("Parser cleanup severity", "parser_cleanup_severity"),
         ("Unit conversion", "unit_conversion"),
         ("Scan rate estimate", "scan_rate_estimate"),
+        ("Scan rate source", "scan_rate_source"),
         ("Scan rate note", "scan_rate_note"),
         ("Cycle count", "cycle_count"),
     ]
@@ -9435,7 +11369,7 @@ def render_project_dashboard(project_name: str, project_workspace: dict[str, Any
         render_project_experiment_cards(project_name, project_workspace)
 
 def main() -> None:
-    st.set_page_config(page_title="VoltScope AI MVP", layout="wide")
+    st.set_page_config(page_title="VoltScope AI", layout="wide")
     apply_app_theme()
     unit_notice = st.session_state.pop("unit_confirmation_notice", None)
     if unit_notice:
@@ -10545,6 +12479,7 @@ def main() -> None:
             current_source,
             selected_potential_v,
             detailed_parser_details["scan_rate_estimate"],
+            str(detailed_parser_details.get("scan_rate_source") or ""),
             detailed_parser_details["cycle_count"],
             selected_cycle_suffix,
             cycle_assignment_uncertain,
@@ -10557,6 +12492,7 @@ def main() -> None:
             peaks,
             cv_behavior,
         )
+        render_metadata_status_notice(cv_metadata_summary_from_parser_details(detailed_parser_details, current_source))
         recommended_messages = list(quality_messages)
         if current_scale_review_needed and not current_unit_review_needed:
             recommended_messages.append(
@@ -10809,13 +12745,60 @@ def main() -> None:
                 key=f"download_cv_plot::{active_project_name}::{experiment_id}::{selected_filename}",
                 on_click="ignore",
             )
+        cv_metadata_caution_needed = any(
+            [
+                detailed_parser_details.get("reference_electrode_metadata") == "Not detected",
+                detailed_parser_details.get("electrode_area_metadata") == "Not detected",
+                detailed_parser_details.get("scan_rate_estimate") == "Not available",
+            ]
+        )
+        cv_quick_interpretation = cv_interpretation_text(
+            cv_behavior,
+            metrics,
+            str(detailed_parser_details.get("current_unit_confidence") or "High"),
+            cv_metadata_caution_needed,
+        )
+        cv_ai_warnings = compact_text_list(
+            quality_messages
+            + [
+                current_scale_warning,
+                "Cycle assignment was inferred from potential turning points and may be approximate."
+                if cycle_assignment_uncertain
+                else "",
+            ]
+        )
         render_interpretation_panel(
-            cv_interpretation_text(
-                cv_behavior,
-                metrics,
-                str(detailed_parser_details.get("current_unit_confidence") or "High"),
-            ),
+            cv_quick_interpretation,
             key=f"cv_ai_interpretation_placeholder::{active_project_name}::{experiment_id}",
+            ai_payload=build_cv_ai_interpretation_payload(
+                filename=selected_filename,
+                quick_interpretation=cv_quick_interpretation,
+                cv_behavior=cv_behavior,
+                metrics=metrics,
+                oxidation_peak=selected_oxidation_peak,
+                reduction_peak=selected_reduction_peak,
+                display_current_unit=current_display_unit,
+                current_source=current_source,
+                electrode_area_cm2=electrode_area_cm2,
+                analysis_status=cv_overall_status_for_quality,
+                parser_confidence=parser_confidence,
+                unit_confidence=str(detailed_parser_details.get("current_unit_confidence") or "High"),
+                peak_detection_confidence=cv_behavior.pair_confidence,
+                warnings=cv_ai_warnings,
+                scan_info={
+                    "scan_mode": cv_scan_mode_label,
+                    "scan_rate": detailed_parser_details.get("scan_rate_estimate"),
+                    "scan_rate_source": detailed_parser_details.get("scan_rate_source"),
+                    "cycle_count": detailed_parser_details.get("cycle_count"),
+                    "analyzed_cycle": selected_cycle_summary_label,
+                    "cycle_assignment_uncertain": cycle_assignment_uncertain,
+                },
+                metadata=detailed_dataset.metadata,
+                notes=str(experiment.get("notes", "")),
+            ),
+            project_workspace=project_workspace,
+            experiment_id=experiment_id,
+            interpretation_id=f"cv::{selected_filename}",
         )
 
     with esw_expander:
@@ -10894,6 +12877,11 @@ def main() -> None:
                 peak_metric_df,
                 current_display_unit,
                 baseline_current is not None,
+                review_needed=(
+                    cv_overall_status_for_quality != "Passed"
+                    or cv_behavior.behavior in {"noisy_ambiguous", "no_reliable_peaks"}
+                    or cv_pair_metrics_review_reason(metrics, cv_behavior.pair_confidence) is not None
+                ),
             )
             if current_unit_review_needed and not selected_peak_display_df.empty:
                 current_columns = [
@@ -10961,5 +12949,22 @@ def main() -> None:
     render_experiment_notes(active_project_name, project_workspace, experiment_id)
 
 
+def running_under_streamlit() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+    except Exception:
+        return False
+    logger = logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context")
+    previous_level = logger.level
+    logger.setLevel(logging.ERROR)
+    try:
+        return get_script_run_ctx() is not None
+    finally:
+        logger.setLevel(previous_level)
+
+
 if __name__ == "__main__":
-    main()
+    if running_under_streamlit():
+        main()
+    else:
+        print("Run VoltScope AI with: streamlit run app/streamlit_app.py")
