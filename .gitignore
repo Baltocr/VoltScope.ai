@@ -13,6 +13,8 @@ ENV/
 .env
 .envrc
 .streamlit/secrets.toml
+MVP 1/.streamlit/secrets.toml
+MVP 1/voltscope_project_workspaces.json
 
 # macOS
 .DS_Store
